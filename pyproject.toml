@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rems"
+version = "0.1.0"
+description = "Recursive Evolutionary Memory System"
+readme = "readme.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+dependencies = [
+    "openai>=1.0",
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    "sqlalchemy>=2.0",
+    "qdrant-client>=1.7",
+    "sentence-transformers>=2.2",
+    "opencc-python-reimplemented>=0.1.7",
+    "fastapi>=0.100",
+    "uvicorn>=0.20",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-asyncio>=0.21",
+    "ruff>=0.1",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = ["_archive", ".git", "outputs", "node_modules"]
+markers = [
+    "live_llm: exercises real REMS_LLM API and local embeddings (set REMS_RUN_LIVE_METABOLISM_TEST=1).",
+]

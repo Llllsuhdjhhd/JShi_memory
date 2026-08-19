@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+.env
+rems.db
+chroma_data/
+.pytest_cache/
+.ruff_cache/
+*.so
+.venv/
+venv/
+
+# --- Simulation Data ---
+tests/scenarios/*/outputs/
+tests/integration/outputs/
+test_chroma/
+memory_samples/
