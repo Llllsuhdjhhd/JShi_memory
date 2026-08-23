@@ -15,6 +15,7 @@ from ..config import REMSConfig
 from ..models.event import Event, EventRoleEntry
 from ..models.metabolism import Shadow, UnclosedEvent
 from ..models.role import Role
+from ..port import MemoryInput
 from ..services.event_service import EventService
 from ..skills.boundary_detection import BoundaryDetectionSkill, BoundaryResult
 from ..skills.shadow_compaction import ShadowCompactionSkill
@@ -131,6 +132,7 @@ class MetabolismService:
         known_roles_hint: list[Role] | None = None,
         pre_role_entries: list[EventRoleEntry] | None = None,
         ingest_session: Any | None = None,
+        memory: MemoryInput | None = None,
     ) -> list[Event]:
         """Ingest *raw_input*, return list of newly sealed events (may be empty).
 
@@ -164,6 +166,7 @@ class MetabolismService:
                 input_id=input_id,
                 known_roles_hint=known_roles_hint,
                 pre_role_entries=pre_role_entries,
+                memory=memory,
             )
 
         # 边界检测仅负责事件切分；摘要/角色等衍生字段由 EventEnrichment 在 seal 时生成。
@@ -203,6 +206,7 @@ class MetabolismService:
             input_id=input_id,
             known_roles_hint=known_roles_hint,
             pre_role_entries=pre_role_entries,
+            memory=memory,
         )
 
     # ------------------------------------------------------------------
@@ -216,6 +220,7 @@ class MetabolismService:
         input_id: str | None = None,
         known_roles_hint: list[Role] | None = None,
         pre_role_entries: list[EventRoleEntry] | None = None,
+        memory: MemoryInput | None = None,
     ) -> list[Event]:
         """Apply LLM boundary result and refresh shadow / unclosed library.
 
@@ -268,10 +273,13 @@ class MetabolismService:
 
             event = self._event_svc.seal_event(
                 content,
-                input_id=input_id,
-                known_roles=known_roles_hint,
-                pre_role_entries=pre_role_entries,
                 split_prefix_event_ids=inherited_prefix_chain or None,
+                **self._seal_memory_kwargs(
+                    memory,
+                    input_id=input_id,
+                    known_roles_hint=known_roles_hint,
+                    pre_role_entries=pre_role_entries,
+                ),
             )
             sealed.append(event)
 
@@ -314,6 +322,7 @@ class MetabolismService:
             prefix_event_id = split_id_to_prefix_event_id.get(nu.split_id) if nu.split_id else None
             ue = UnclosedEvent(
                 id=f"UC-{secrets.token_hex(4)}",
+                subject_id=memory.subject_id if memory is not None else "",
                 content_fragments=[nu.content],
                 logical_gaps=nu.logical_gaps,
                 split_prefix_event_ids=[prefix_event_id] if prefix_event_id else [],
@@ -324,7 +333,11 @@ class MetabolismService:
         # 更新残影记录（为保持一致性，每次代谢后同步更新）
         final_unclosed = self._repo.get_unclosed_events()
         new_shadow_content = "\n".join(ue.merged_content for ue in final_unclosed)
-        self._repo.update_shadow(Shadow(content=new_shadow_content, updated_at=datetime.now()))
+        self._repo.update_shadow(Shadow(
+            content=new_shadow_content,
+            updated_at=datetime.now(),
+            subject_id=memory.subject_id if memory is not None else "",
+        ))
 
         self._maybe_shadow_compact(final_unclosed)
         self._check_physical_redline()
@@ -342,6 +355,7 @@ class MetabolismService:
         input_id: str | None = None,
         known_roles_hint: list[Role] | None = None,
         pre_role_entries: list[EventRoleEntry] | None = None,
+        memory: MemoryInput | None = None,
     ) -> list[Event]:
         """Manual trigger (/save, /mem) or length-based fallback: seal everything immediately.
 
@@ -355,9 +369,12 @@ class MetabolismService:
             event = self._event_svc.seal_event(
                 combined,
                 is_suspicious=is_suspicious,
-                input_id=input_id,
-                known_roles=known_roles_hint,
-                pre_role_entries=pre_role_entries,
+                **self._seal_memory_kwargs(
+                    memory,
+                    input_id=input_id,
+                    known_roles_hint=known_roles_hint,
+                    pre_role_entries=pre_role_entries,
+                ),
             )
             sealed.append(event)
 
@@ -366,10 +383,13 @@ class MetabolismService:
                 event = self._event_svc.seal_event(
                     ue.merged_content,
                     is_suspicious=is_suspicious,
-                    input_id=input_id,
-                    known_roles=known_roles_hint,
-                    pre_role_entries=pre_role_entries,
                     split_prefix_event_ids=list(ue.split_prefix_event_ids or []) or None,
+                    **self._seal_memory_kwargs(
+                        memory,
+                        input_id=input_id,
+                        known_roles_hint=known_roles_hint,
+                        pre_role_entries=pre_role_entries,
+                    ),
                 )
                 # 反向链：force_save 也要登记 successor。
                 if ue.split_prefix_event_ids and self._event_repo is not None:
@@ -386,6 +406,30 @@ class MetabolismService:
 
         self._repo.update_shadow(Shadow(content="", updated_at=datetime.now()))
         return sealed
+
+    @staticmethod
+    def _seal_memory_kwargs(
+        memory: MemoryInput | None,
+        *,
+        input_id: str | None,
+        known_roles_hint: list[Role] | None,
+        pre_role_entries: list[EventRoleEntry] | None,
+    ) -> dict:
+        """记忆路径（memory 非 None）传主体/对象/来源/时间/origin；旧路径传角色提示。"""
+        if memory is not None:
+            return {
+                "input_id": memory.input_id,
+                "subject_id": memory.subject_id,
+                "objects": memory.objects,
+                "source_ids": memory.source_ids,
+                "occurred_at": memory.occurred_at,
+                "origin": memory.origin,
+            }
+        return {
+            "input_id": input_id,
+            "known_roles": known_roles_hint,
+            "pre_role_entries": pre_role_entries,
+        }
 
     # ------------------------------------------------------------------
     def _maybe_shadow_compact(self, unclosed: list[UnclosedEvent]) -> None:

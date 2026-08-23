@@ -6,16 +6,17 @@ from typing import Optional
 
 from ..models.event import EmotionalModel, Event, EventRoleEntry, EventStatus
 from ..models.metabolism import Shadow, UnclosedEvent
+from ..models.object_entry import ObjectMemoryEntry
 from ..models.role import Role, WhitePaintingEntry
 from datetime import datetime
 
 from .database import (
-    AbstractedSubsetRecord,
     Database,
     EventRecord,
-    RecallLogRecord,
+    ObjectMemoryEntryRecord,
     RoleRecord,
     ShadowRecord,
+    StoredMarkRecord,
     UnclosedEventRecord,
     WhitePaintingRecord,
 )
@@ -33,7 +34,10 @@ class EventRepository:
         with self._db.session() as s:
             record = EventRecord(
                 event_id=event.event_id,
+                subject_id=getattr(event, "subject_id", "") or "",
                 create_time=event.create_time,
+                occurred_at=event.occurred_at,
+                source_ids=list(event.source_ids or []),
                 content_raw=event.content_raw,
                 summaries=event.summaries,
                 summary_lengths=event.summary_lengths,
@@ -54,7 +58,10 @@ class EventRepository:
                 split_successor_event_ids=list(event.split_successor_event_ids or []),
                 split_prefix_event_ids=list(event.split_prefix_event_ids or []),
                 ptsd_immune=bool(getattr(event, "ptsd_immune", False)),
-                origin=getattr(event, "origin", "normal") or "normal",
+                origin=getattr(event, "origin", None) or "external",
+                location=getattr(event, "location", None),
+                emotion=event.emotion.model_dump(mode="json") if event.emotion is not None else None,
+                forgetting_factor=float(getattr(event, "forgetting_factor", 1.0) or 1.0),
                 recall_metadata={
                     "keywords": list(getattr(event, "keywords", None) or []),
                     "location": getattr(event, "location", None),
@@ -228,13 +235,25 @@ class EventRepository:
                 r.is_tombstoned = is_tombstoned
             s.commit()
 
+    def update_forgetting_factor(self, event_id: str, factor: float) -> None:
+        """记忆单元级遗忘因子更新（回忆命中的记忆恢复，design/1010）。"""
+        with self._db.session() as s:
+            r = s.get(EventRecord, event_id)
+            if r is None:
+                return
+            r.forgetting_factor = float(factor)
+            s.commit()
+
     # ------------------------------------------------------------------
     @staticmethod
     def _to_model(r: EventRecord) -> Event:
         role_list = [EventRoleEntry(**rd) for rd in (r.role_list or [])]
         return Event(
             event_id=r.event_id,
+            subject_id=getattr(r, "subject_id", "") or "",
             create_time=r.create_time,
+            occurred_at=getattr(r, "occurred_at", None),
+            source_ids=list(getattr(r, "source_ids", None) or []),
             content_raw=r.content_raw,
             summaries=r.summaries or {},
             summary_lengths=r.summary_lengths or {},
@@ -255,9 +274,11 @@ class EventRepository:
             split_successor_event_ids=list(getattr(r, "split_successor_event_ids", None) or []),
             split_prefix_event_ids=list(getattr(r, "split_prefix_event_ids", None) or []),
             ptsd_immune=bool(getattr(r, "ptsd_immune", False)),
-            origin=getattr(r, "origin", "normal") or "normal",
+            origin="external" if (getattr(r, "origin", None) or "") in ("", "normal") else r.origin,
             keywords=list((getattr(r, "recall_metadata", None) or {}).get("keywords") or []),
-            location=(getattr(r, "recall_metadata", None) or {}).get("location"),
+            location=getattr(r, "location", None) or (getattr(r, "recall_metadata", None) or {}).get("location"),
+            emotion=EmotionalModel(**r.emotion) if (getattr(r, "emotion", None) or None) else None,
+            forgetting_factor=float(getattr(r, "forgetting_factor", 1.0) or 1.0),
         )
 
 
@@ -458,7 +479,11 @@ class MetabolismRepository:
             record = s.query(ShadowRecord).first()
             if not record:
                 return Shadow()
-            return Shadow(content=record.content, updated_at=record.updated_at)
+            return Shadow(
+                content=record.content,
+                updated_at=record.updated_at,
+                subject_id=getattr(record, "subject_id", "") or "",
+            )
 
     def update_shadow(self, shadow: Shadow) -> None:
         with self._db.session() as s:
@@ -466,14 +491,20 @@ class MetabolismRepository:
             if record:
                 record.content = shadow.content
                 record.updated_at = shadow.updated_at
+                record.subject_id = shadow.subject_id
             else:
-                s.add(ShadowRecord(content=shadow.content, updated_at=shadow.updated_at))
+                s.add(ShadowRecord(
+                    content=shadow.content,
+                    updated_at=shadow.updated_at,
+                    subject_id=shadow.subject_id,
+                ))
             s.commit()
 
     def save_unclosed_event(self, event: UnclosedEvent) -> None:
         with self._db.session() as s:
             record = UnclosedEventRecord(
                 id=event.id,
+                subject_id=event.subject_id,
                 content_fragments=event.content_fragments,
                 identified_roles=event.identified_roles,
                 logical_gaps=event.logical_gaps,
@@ -504,6 +535,7 @@ class MetabolismRepository:
     def _to_model(r: UnclosedEventRecord) -> UnclosedEvent:
         return UnclosedEvent(
             id=r.id,
+            subject_id=getattr(r, "subject_id", "") or "",
             content_fragments=r.content_fragments or [],
             identified_roles=r.identified_roles or [],
             logical_gaps=r.logical_gaps,
@@ -516,94 +548,97 @@ class MetabolismRepository:
 
 
 # =====================================================================
-# Recall log & abstracted-subset bookkeeping (白皮书 §3.2)
+# Object memory timeline（design/410/810；无情感，只存摘要轨迹）
 # =====================================================================
 
-
-def _subset_fingerprint(event_ids: "list[str] | set[str]") -> str:
-    """Deterministic subset id: sort then join with '|' for DB dedupe."""
-    return "|".join(sorted(set(event_ids)))
-
-
-class RecallLogRepository:
-    """Persistence for per-recall event_id sets used by the frequent-subset miner."""
+class ObjectTimelineRepository:
+    """对象记忆时间线条目：object_id + name + 一句摘要 + 时间。"""
 
     def __init__(self, db: Database):
         self._db = db
 
-    def append(self, recall_id: str, event_ids: list[str]) -> None:
-        if not event_ids:
-            return
+    def append(self, entry: ObjectMemoryEntry) -> None:
         with self._db.session() as s:
-            s.merge(RecallLogRecord(
-                recall_id=recall_id,
-                created_at=datetime.now(),
-                event_ids=list(event_ids),
+            s.add(ObjectMemoryEntryRecord(
+                subject_id=entry.subject_id,
+                object_id=entry.object_id,
+                name=entry.name,
+                event_id=entry.event_id,
+                summary=entry.summary,
+                create_time=entry.create_time,
             ))
             s.commit()
 
-    def list_all(self) -> list[tuple[str, list[str]]]:
-        """Return ``[(recall_id, event_ids), ...]`` in insertion (time) order."""
+    def list_by_object(
+        self, subject_id: str, object_id: str, *, limit: int | None = None
+    ) -> list[ObjectMemoryEntry]:
         with self._db.session() as s:
-            rows = s.query(RecallLogRecord).order_by(RecallLogRecord.created_at).all()
-            return [(r.recall_id, list(r.event_ids or [])) for r in rows]
+            q = s.query(ObjectMemoryEntryRecord).filter(
+                ObjectMemoryEntryRecord.subject_id == subject_id,
+                ObjectMemoryEntryRecord.object_id == object_id,
+            ).order_by(ObjectMemoryEntryRecord.create_time)
+            if limit is not None:
+                q = q.limit(limit)
+            return [self._to_model(r) for r in q.all()]
 
-    def list_recent_transactions(self, k: int) -> list[tuple[frozenset[str], datetime]]:
-        """Return recent recall transactions with timestamps for decayed support."""
+    def list_by_event(self, event_id: str) -> list[ObjectMemoryEntry]:
         with self._db.session() as s:
             rows = (
-                s.query(RecallLogRecord)
-                .order_by(RecallLogRecord.created_at.desc())
-                .limit(max(1, k))
+                s.query(ObjectMemoryEntryRecord)
+                .filter(ObjectMemoryEntryRecord.event_id == event_id)
+                .order_by(ObjectMemoryEntryRecord.create_time)
                 .all()
             )
-            rows.reverse()
-            return [(frozenset(r.event_ids or []), r.created_at) for r in rows if r.event_ids]
+            return [self._to_model(r) for r in rows]
 
-    def replace_subset(self, subset: set[str], abstract_event_id: str) -> int:
-        """For every recall log row whose id set ⊇ *subset*, remove *subset* and add *abstract_event_id*.
-
-        Returns the number of rows rewritten. Called right after an abstract event is synthesised
-        so the miner keeps working in the new namespace ("用抽象事件 id 代替原来的子集").
-        """
-        if not subset:
-            return 0
-        rewritten = 0
-        with self._db.session() as s:
-            rows = s.query(RecallLogRecord).all()
-            for r in rows:
-                ids = set(r.event_ids or [])
-                if not subset.issubset(ids):
-                    continue
-                new_ids = (ids - subset) | {abstract_event_id}
-                # Preserve deterministic ordering for stable mining.
-                r.event_ids = sorted(new_ids)
-                rewritten += 1
-            s.commit()
-        return rewritten
+    @staticmethod
+    def _to_model(r: ObjectMemoryEntryRecord) -> ObjectMemoryEntry:
+        return ObjectMemoryEntry(
+            subject_id=getattr(r, "subject_id", "") or "",
+            object_id=r.object_id,
+            name=r.name,
+            event_id=r.event_id,
+            summary=r.summary,
+            create_time=r.create_time,
+        )
 
 
-class AbstractedSubsetRepository:
-    """Persisted fingerprints of subsets that already fired an abstract event.
+# =====================================================================
+# stored_marks 台账（design/210/810；30 侧推进游标用，纯台账）
+# =====================================================================
 
-    Provides an idempotency guarantee against duplicate synthesis even in the
-    rare case where the miner revisits a subset after restart.
-    """
+class StoredMarksRepository:
+    """input_id → 本轮封存事件 id 列表。"""
 
     def __init__(self, db: Database):
         self._db = db
 
-    def is_fired(self, event_ids: "list[str] | set[str]") -> bool:
-        fp = _subset_fingerprint(event_ids)
+    def save(self, subject_id: str, input_id: str, event_ids: list[str]) -> None:
         with self._db.session() as s:
-            return s.get(AbstractedSubsetRecord, fp) is not None
-
-    def mark_fired(self, event_ids: "list[str] | set[str]", abstract_event_id: str) -> None:
-        fp = _subset_fingerprint(event_ids)
-        with self._db.session() as s:
-            s.merge(AbstractedSubsetRecord(
-                fingerprint=fp,
-                abstract_event_id=abstract_event_id,
+            s.merge(StoredMarkRecord(
+                subject_id=subject_id,
+                input_id=input_id,
+                event_ids=list(event_ids),
                 created_at=datetime.now(),
             ))
             s.commit()
+
+    def get(self, input_id: str) -> list[str] | None:
+        with self._db.session() as s:
+            r = s.get(StoredMarkRecord, input_id)
+            return list(r.event_ids or []) if r else None
+
+    def list_all(self, subject_id: str | None = None) -> list[dict]:
+        with self._db.session() as s:
+            q = s.query(StoredMarkRecord)
+            if subject_id:
+                q = q.filter(StoredMarkRecord.subject_id == subject_id)
+            return [
+                {
+                    "subject_id": getattr(r, "subject_id", "") or "",
+                    "input_id": r.input_id,
+                    "event_ids": list(r.event_ids or []),
+                    "created_at": r.created_at,
+                }
+                for r in q.order_by(StoredMarkRecord.created_at).all()
+            ]

@@ -34,7 +34,10 @@ class EventRecord(Base):
     # 与 models.event.Event 字段一一对应，JSON 列存 summaries、role_list、source_events 等。
 
     event_id = Column(String, primary_key=True)
+    subject_id = Column(String, default="")
     create_time = Column(DateTime, nullable=False)
+    occurred_at = Column(DateTime, nullable=True)
+    source_ids = Column(JSON, default=list)
     content_raw = Column(Text, nullable=False)
     summaries = Column(JSON, default=dict)
     summary_lengths = Column(JSON, default=dict)
@@ -57,7 +60,10 @@ class EventRecord(Base):
     split_successor_event_ids = Column(JSON, default=list)
     split_prefix_event_ids = Column(JSON, default=list)
     ptsd_immune = Column(Boolean, default=False)
-    origin = Column(String, default="normal")
+    origin = Column(String, default="external")
+    location = Column(String, nullable=True)
+    emotion = Column(JSON, nullable=True)
+    forgetting_factor = Column(Float, default=1.0)
     recall_metadata = Column(JSON, default=dict)
 
 
@@ -91,6 +97,7 @@ class WhitePaintingRecord(Base):
     __tablename__ = "white_painting_entries"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    subject_id = Column(String, default="")
     role_id = Column(String, ForeignKey("roles.role_id"), nullable=False, index=True)
     event_id = Column(String, ForeignKey("events.event_id"), nullable=False)
     role_summary = Column(Text, nullable=False)
@@ -113,6 +120,7 @@ class ShadowRecord(Base):
     __tablename__ = "shadow"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    subject_id = Column(String, default="")
     content = Column(Text, nullable=False, default="")
     updated_at = Column(DateTime, nullable=False)
 
@@ -121,6 +129,7 @@ class UnclosedEventRecord(Base):
     __tablename__ = "unclosed_events"
 
     id = Column(String, primary_key=True)
+    subject_id = Column(String, default="")
     content_fragments = Column(JSON, default=list)
     identified_roles = Column(JSON, default=list)
     logical_gaps = Column(Text, nullable=True)
@@ -133,34 +142,28 @@ class UnclosedEventRecord(Base):
     oversized = Column(Boolean, default=False)
 
 
-# ------------------------------------------------------------------
-# Recall log & abstraction bookkeeping (白皮书 §3.2 频繁极大子集挖掘)
-# ------------------------------------------------------------------
+class ObjectMemoryEntryRecord(Base):
+    """对象记忆时间线（替代 roles + white_painting_entries；无情感，见 design/410/810）。"""
 
-class RecallLogRecord(Base):
-    """每一次成功组装的回忆块登记为一条记录，``event_ids`` 为当次回忆块中 **basic 事件** 的有序去重 id 列表。
+    __tablename__ = "object_memory_entries"
 
-    抽象事件合成时会把已吸收子集 S 替换为新抽象事件 id（"用抽象事件 id 代替原来的子集"），
-    使后续更高阶抽象在同一命名空间继续演进（白皮书 §3.2）。
-    """
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    subject_id = Column(String, default="", index=True)
+    object_id = Column(String, nullable=False, index=True)
+    name = Column(String, nullable=True)  # 呈现用（与输入映射表一致，便于阅读，如回忆时）
+    event_id = Column(String, ForeignKey("events.event_id"), nullable=False)
+    summary = Column(Text, nullable=False)
+    create_time = Column(DateTime, nullable=False)
 
-    __tablename__ = "recall_log"
 
-    recall_id = Column(String, primary_key=True)
-    created_at = Column(DateTime, nullable=False)
+class StoredMarkRecord(Base):
+    """stored_marks 台账：input_id → 本轮封存事件 id 列表（30 推进游标与台账用，见 design/210/810）。"""
+
+    __tablename__ = "stored_marks"
+
+    subject_id = Column(String, default="", index=True)
+    input_id = Column(String, primary_key=True)
     event_ids = Column(JSON, default=list)
-
-
-class AbstractedSubsetRecord(Base):
-    """已经触发过抽象事件的子集指纹，避免同一极大子集被重复合成。
-
-    ``fingerprint`` 为事件 id 升序后的 ``"|"`` 拼接；``abstract_event_id`` 指向合成出的抽象事件。
-    """
-
-    __tablename__ = "abstracted_subsets"
-
-    fingerprint = Column(String, primary_key=True)
-    abstract_event_id = Column(String, nullable=False)
     created_at = Column(DateTime, nullable=False)
 
 
@@ -212,10 +215,26 @@ class Database:
                 ("ptsd_immune", "BOOLEAN DEFAULT 0"),
                 ("origin", "TEXT DEFAULT 'normal'"),
                 ("recall_metadata", "TEXT DEFAULT '{}'"),
+                ("subject_id", "TEXT DEFAULT ''"),
+                ("occurred_at", "DATETIME"),
+                ("source_ids", "TEXT DEFAULT '[]'"),
+                ("emotion", "TEXT"),
+                ("location", "TEXT"),
+                ("forgetting_factor", "FLOAT DEFAULT 1.0"),
             ],
             "unclosed_events": [
                 ("split_prefix_event_ids", "TEXT DEFAULT '[]'"),
                 ("oversized", "BOOLEAN DEFAULT 0"),
+                ("subject_id", "TEXT DEFAULT ''"),
+            ],
+            "shadow": [
+                ("subject_id", "TEXT DEFAULT ''"),
+            ],
+            "roles": [
+                ("subject_id", "TEXT DEFAULT ''"),
+            ],
+            "white_painting_entries": [
+                ("subject_id", "TEXT DEFAULT ''"),
             ],
         }
 

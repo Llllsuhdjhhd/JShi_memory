@@ -17,7 +17,6 @@ from .evaluation import (
 )
 from .summary_generation import SummaryGenerationSkill
 from .role_extraction import RoleExtractionSkill
-from .inductive_evolution import InductiveEvolutionSkill
 
 __all__ = [
     "BoundaryDetectionSkill",
@@ -31,6 +30,5 @@ __all__ = [
     "SkillRemediator",
     "SummaryGenerationSkill",
     "RoleExtractionSkill",
-    "InductiveEvolutionSkill",
     "run_skill_with_eval",
 ]

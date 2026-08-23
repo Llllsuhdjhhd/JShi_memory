@@ -11,6 +11,7 @@ from .event import (
     generate_event_id,
 )
 from .role import Role, WhitePaintingEntry, generate_role_id
+from .object_entry import ObjectMemoryEntry
 from .metabolism import (
     Shadow,
     UnclosedEvent,
@@ -30,6 +31,7 @@ __all__ = [
     "generate_event_id",
     "Role",
     "WhitePaintingEntry",
+    "ObjectMemoryEntry",
     "generate_role_id",
     "Shadow",
     "UnclosedEvent",

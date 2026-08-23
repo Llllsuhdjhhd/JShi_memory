@@ -89,12 +89,5 @@ class FakeEmbeddingFunction:
 
 @pytest.fixture
 def vector_store(config, db):
-    from rems.embedding.tri_band import TriBandEncoder
-    from rems.storage.repository import EventRepository, RoleRepository
-    from rems.storage.vector_store import VectorStore
-
-    event_repo = EventRepository(db)
-    role_repo = RoleRepository(db)
-    vs = VectorStore(config)
-    vs.set_tri_band(TriBandEncoder(config, event_repo=event_repo, role_repo=role_repo))
-    return vs
+    # 新架构不再使用旧向量库（design/810：向量占位；回忆索引走 recall_pipeline）。
+    return None

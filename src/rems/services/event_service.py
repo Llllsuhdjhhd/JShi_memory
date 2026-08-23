@@ -10,14 +10,19 @@ from typing import Optional
 from ..config import REMSConfig
 from ..llm.provider import LLMProvider
 from ..llm.prompts import DECORATION_SYSTEM, DECORATION_USER
-from ..models.event import CompressionBudget, Event, EventRoleEntry, EventStatus
+from ..models.event import (
+    CompressionBudget,
+    EmotionalModel,
+    Event,
+    EventRoleEntry,
+    EventStatus,
+    Importance,
+)
+from ..models.object_entry import ObjectMemoryEntry
 from ..models.role import Role
 from ..skills.event_enrichment import EnrichmentResult, EventEnrichmentSkill
 from ..skills.role_extraction import ExtractedRole, RoleExtractionSkill
-from ..storage.repository import EventRepository
-from ..storage.tier1_store import Tier1Store
-from ..storage.vector_store import VectorStore
-from ..retrieval.bm25_index import EventBm25Index
+from ..storage.repository import EventRepository, ObjectTimelineRepository
 from ..strategies.event_weight import EventWeightDeriver
 from .emotion_service import EMAEvolver
 from .role_service import RoleService
@@ -39,13 +44,12 @@ class EventService:
         config: REMSConfig,
         llm: LLMProvider,
         event_repo: EventRepository,
-        vector_store: VectorStore,
+        vector_store: object | None,
         enrichment_skill: EventEnrichmentSkill,
         role_service: RoleService | None = None,
         emotion_evolver: EMAEvolver | None = None,
-        tier1_store: Tier1Store | None = None,
         event_weight: EventWeightDeriver | None = None,
-        bm25_index: EventBm25Index | None = None,
+        object_timeline_repo: ObjectTimelineRepository | None = None,
     ):
         self._config = config
         self._llm = llm
@@ -54,9 +58,8 @@ class EventService:
         self._enrichment_skill = enrichment_skill
         self._role_service = role_service
         self._emotion_evolver = emotion_evolver
-        self._tier1 = tier1_store
         self._event_weight = event_weight
-        self._bm25_index = bm25_index
+        self._object_timeline_repo = object_timeline_repo
 
     # ------------------------------------------------------------------
     def seal_event(
@@ -70,6 +73,11 @@ class EventService:
         known_roles: list[Role] | None = None,
         pre_role_entries: list[EventRoleEntry] | None = None,
         split_prefix_event_ids: list[str] | None = None,
+        subject_id: str = "",
+        objects: dict[str, str] | None = None,
+        source_ids: tuple[str, ...] = (),
+        occurred_at: datetime | None = None,
+        origin: str | None = None,
     ) -> Event:
         """Create, enrich, persist and index a new basic event.
 
@@ -124,12 +132,33 @@ class EventService:
             skip_roles=external_roles_provided,
             names_only=use_names_only,
             known_roles=known_roles,
+            memory_objects=objects,
         )
 
         from ..skills.role_extraction import RoleExtractionSkill
         resolved_role_entries = list(role_entries or [])
 
-        if use_names_only:
+        memory_mode = objects is not None
+        if memory_mode:
+            # 记忆路径（design/410/610）：角色列表 = 主体恒在 + 对象映射表；
+            # 不抽取、不建档、不建角色系统；对象无情感。
+            subject_emotion = enrichment.emotion or EmotionalModel()
+            resolved_role_entries = [
+                EventRoleEntry(
+                    role_id=subject_id or "subject",
+                    is_subject=True,
+                    importance=Importance.S,
+                    emotional_model=subject_emotion,
+                )
+            ]
+            seen_oids: set[str] = set()
+            for oid in objects.values():
+                if oid and oid not in seen_oids:
+                    seen_oids.add(oid)
+                    resolved_role_entries.append(
+                        EventRoleEntry(role_id=oid, importance=Importance.C)
+                    )
+        elif use_names_only:
             # 池：role_id → 富信息 EventRoleEntry（含 snapshot + 8 维情绪）。
             pool_by_id: dict[str, EventRoleEntry] = {pe.role_id: pe for pe in (pre_role_entries or [])}
             # 名字 / 别名 → role_id 字符串匹配表。names_only 路径下 LLM 只输出名字数组，
@@ -208,6 +237,9 @@ class EventService:
 
         event = Event(
             content_raw=content_raw,
+            subject_id=subject_id,
+            source_ids=list(source_ids or ()),
+            occurred_at=occurred_at,
             summaries=enrichment.summaries,
             summary_lengths=enrichment.summary_lengths,
             actual_max_level=enrichment.actual_max_level,
@@ -219,7 +251,28 @@ class EventService:
             split_prefix_event_ids=list(split_prefix_event_ids or []),
             keywords=list(getattr(enrichment, "keywords", None) or []),
             location=getattr(enrichment, "location", None),
+            emotion=enrichment.emotion,
+            origin=origin or "external",
         )
+
+        if memory_mode and self._object_timeline_repo is not None:
+            # 对象时间线：每个对象一句话快照（无情感），供 410/回忆使用。
+            for name, summary in enrichment.object_snapshots.items():
+                oid = objects.get(name)
+                if not oid:
+                    continue
+                self._object_timeline_repo.append(
+                    ObjectMemoryEntry(
+                        subject_id=subject_id,
+                        object_id=oid,
+                        name=name,
+                        event_id=event.event_id,
+                        summary=summary,
+                        create_time=event.create_time,
+                    )
+                )
+        if memory_mode and event.emotion is not None:
+            event.activation_energy = min(max(event.emotion.arousal, 0.0), 1.0)
 
         # EMA 动态演化 + activation_energy 计算（白皮书 2.5）。
         # 必须在 save 之前，让 ORM 落盘时带上"历史心境调和后的情感"和激活能量。
@@ -235,13 +288,9 @@ class EventService:
             event.ptsd_immune = True
 
         self._event_repo.save(event)
-        self._index_event(event)
-        if self._bm25_index is not None:
-            self._bm25_index.upsert(event)
-        if self._tier1 is not None and self._event_weight is not None:
-            w_i = self._event_weight.derive_wi(event)
-            asf = self._tier1.get_asf(event.event_id)
-            self._tier1.upsert_tier1(event.event_id, w_i=w_i, asf_i=asf)
+        if not memory_mode and self._vector is not None:
+            # 旧路径兼容：仅当显式注入了旧向量库才索引（新架构索引走 recall_pipeline，design/1010）。
+            self._index_event(event)
 
         logger.info(
             "Sealed event %s (%d chars, %d roles, ratio=%.4f)",

@@ -9,7 +9,6 @@
         * 前缀被 seal_event 持久化，tail UC 带 ``split_prefix_event_ids``；
         * tail UC 下一轮闭环时，新事件继承前缀链，并反向把自己追加到前缀事件的 successor；
         * oversized UC（模型 + 修复都失败）不走 force-seal，而是落库为 oversized=True。
-    - ``RecallService._expand_split_prefixes`` 命中 tail 事件时把前缀事件硬性拉进回忆块。
 """
 
 from __future__ import annotations
@@ -21,7 +20,6 @@ from rems.models.event import Event
 from rems.models.metabolism import UnclosedEvent
 from rems.services.event_service import EventService
 from rems.services.metabolism_service import MetabolismService
-from rems.services.recall_service import RecallService
 from rems.skills.boundary_detection import (
     BoundaryDetectionSkill,
     BoundaryResult,
@@ -37,7 +35,6 @@ from rems.skills.boundary_split import (
 from rems.skills.event_enrichment import EventEnrichmentSkill
 from rems.skills.role_extraction import RoleExtractionSkill
 from rems.storage.database import Database
-from rems.embedding.tri_band import TriBandEncoder
 from rems.storage.repository import EventRepository, MetabolismRepository, RoleRepository
 
 from ..conftest import FakeLLM
@@ -406,58 +403,3 @@ class TestMetabolismServiceSplitFlow:
         assert len(ues) == 1
         assert ues[0].oversized
         assert ues[0].total_length > force_threshold
-
-
-# =====================================================================
-# Recall: expand split_prefix chain
-# =====================================================================
-
-class TestRecallExpandsSplitPrefix:
-    def test_prefix_is_pulled_in_when_tail_event_is_recalled(self, config, db, vector_store):
-        event_repo = EventRepository(db)
-        role_repo = RoleRepository(db)
-        tri_band = TriBandEncoder(config, event_repo=event_repo, role_repo=role_repo)
-        svc = RecallService(config, event_repo, role_repo, vector_store, tri_band=tri_band)
-
-        # 前缀事件（仅靠 split_prefix_event_ids 拉进，不直接命中检索）
-        prefix = Event(content_raw="武松在景阳冈下连喝十八碗酒", summaries={"L1": "喝酒"})
-        event_repo.save(prefix)
-        vector_store.upsert_event_vectors(prefix)
-
-        # 尾部事件（直接被检索命中），声明前缀链。
-        tail = Event(
-            content_raw="武松过冈遇虎，打死猛虎。",
-            summaries={"L1": "打虎收尾"},
-            split_prefix_event_ids=[prefix.event_id],
-        )
-        event_repo.save(tail)
-        vector_store.upsert_event_vectors(tail)
-
-        block = svc.build_recall_block("景阳冈打虎")
-        ids = [it.event_id for it in block.items]
-        # 前缀必须出现；尾部也在；前缀在尾部之前。
-        assert prefix.event_id in ids
-        assert tail.event_id in ids
-        assert ids.index(prefix.event_id) < ids.index(tail.event_id)
-
-    def test_prefix_not_duplicated_when_already_recalled(self, config, db, vector_store):
-        event_repo = EventRepository(db)
-        role_repo = RoleRepository(db)
-        tri_band = TriBandEncoder(config, event_repo=event_repo, role_repo=role_repo)
-        svc = RecallService(config, event_repo, role_repo, vector_store, tri_band=tri_band)
-
-        prefix = Event(content_raw="prefix event text", summaries={"L1": "prefix"})
-        event_repo.save(prefix)
-        vector_store.upsert_event_vectors(prefix)
-
-        tail = Event(
-            content_raw="tail event text",
-            summaries={"L1": "tail"},
-            split_prefix_event_ids=[prefix.event_id],
-        )
-        event_repo.save(tail)
-        vector_store.upsert_event_vectors(tail)
-
-        block = svc.build_recall_block("prefix tail")
-        ids = [it.event_id for it in block.items]
-        assert ids.count(prefix.event_id) == 1

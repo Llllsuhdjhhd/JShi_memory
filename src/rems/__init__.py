@@ -5,4 +5,21 @@
 代谢（残影/未完成事件）、回忆与再巩固、信念修正（墓碑）及多场景输出管线。
 """
 
+from .port import (
+    BackendIngestResult,
+    MemoryBackendPort,
+    MemoryBatch,
+    MemoryInput,
+    RecalledFragment,
+)
+
 __version__ = "0.1.0"
+
+__all__ = [
+    "BackendIngestResult",
+    "MemoryBackendPort",
+    "MemoryBatch",
+    "MemoryInput",
+    "RecalledFragment",
+    "__version__",
+]

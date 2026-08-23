@@ -12,29 +12,16 @@ from rems.skills.event_enrichment import EventEnrichmentSkill
 from rems.skills.role_extraction import RoleExtractionSkill
 from rems.storage.database import Database
 from rems.storage.repository import EventRepository
-from rems.embedding.tri_band import TriBandEncoder
-from rems.storage.repository import EventRepository, RoleRepository
-from rems.storage.vector_store import VectorStore
 
 from tests.conftest import FakeLLM
-
-
-def _make_vector_store(config: REMSConfig, db: Database) -> VectorStore:
-    event_repo = EventRepository(db)
-    role_repo = RoleRepository(db)
-    vector_store = VectorStore(config)
-    tri_band = TriBandEncoder(config, event_repo=event_repo, role_repo=role_repo)
-    vector_store.set_tri_band(tri_band)
-    return vector_store
 
 
 @pytest.fixture()
 def event_service(config: REMSConfig, db: Database, fake_llm: FakeLLM, tmp_dir):
     event_repo = EventRepository(db)
-    vector_store = _make_vector_store(config, db)
     role_skill = RoleExtractionSkill(fake_llm, config)
     enrichment_skill = EventEnrichmentSkill(fake_llm, config, role_fallback=role_skill)
-    return EventService(config, fake_llm, event_repo, vector_store, enrichment_skill)
+    return EventService(config, fake_llm, event_repo, None, enrichment_skill)
     
 
 

@@ -133,6 +133,9 @@ class REMSConfig(BaseSettings):
     context_window: int = 88000
     chars_per_token: float = 1.5
 
+    # 记忆主体（匠石）：恒为单个主体值；30 侧在 MemoryBatch 提供（design/210）。
+    subject_id: str = ""
+
     llm: LLMConfig = Field(default_factory=LLMConfig)
     embedding: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)

@@ -14,8 +14,7 @@ class TestPipelineConstruction:
         assert pipeline.event_service is not None
         assert pipeline.role_service is not None
         assert pipeline.metabolism_service is not None
-        assert pipeline.recall_service is not None
-        assert pipeline.abstraction_service is not None
+        assert pipeline.recall_pipeline is not None
 
 
 class TestQueryRole:

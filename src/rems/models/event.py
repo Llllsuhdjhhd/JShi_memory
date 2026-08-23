@@ -144,6 +144,7 @@ class CompressionBudget(BaseModel):
 class EventRoleEntry(BaseModel):
     # 单个角色在一次事件中的瞬时记录（之后会被写入角色白描时间线）。
     role_id: str
+    is_subject: bool = False  # True = 匠石（主体）；情感只属于主体（design/410）
     importance: Importance = Importance.C
     role_snapshot: RoleSnapshot = Field(default_factory=RoleSnapshot)
     emotional_model: EmotionalModel = Field(default_factory=EmotionalModel)
@@ -154,8 +155,11 @@ class EventRoleEntry(BaseModel):
 
 class Event(BaseModel):
     event_id: str = Field(default_factory=generate_event_id)
+    subject_id: str = ""  # 记忆单元归属主体（匠石）；由 ingest_batch 注入（design/810）
     create_time: datetime = Field(default_factory=datetime.now)
     input_id: Optional[str] = None  # 记录产生此事件的原始输入/对话轮次唯一标识
+    source_ids: list[str] = Field(default_factory=list)  # 来源链（design/210）
+    occurred_at: Optional[datetime] = None  # 经历发生时间；空 = 摄入时刻（design/210/810）
     content_raw: str  # L0：基本事件为已闭环事实原文；抽象事件为自子事件归纳的合成描述（白皮书 1.1.2、3.1）。
 
     summaries: dict[str, str] = Field(default_factory=dict)  # L1~Ln 递归摘要（白皮书 1.1.3）。
@@ -198,8 +202,14 @@ class Event(BaseModel):
 
     # §4.7.3 情感极值免死金牌：禁止摘要降级与 ASF 遮蔽。
     ptsd_immune: bool = False
-    # 事件来源：normal / dream 等（§4.7.2 梦境演化不写 recall_log）。
-    origin: str = "normal"
+    # 事件来源：external | internal | dream（字符串，保留扩展；legacy normal 视为 external）。
+    origin: str = "external"
+
+    # 事件级主体情感（匠石在事件中的情感；对象无情感，见 design/410）。
+    emotion: Optional[EmotionalModel] = None
+
+    # 记忆单元级遗忘因子（情感 arousal 初始化，随时间衰减；回忆命中强化，见 design/610/1010）。
+    forgetting_factor: float = 1.0
 
     # Optional recall metadata (BM25 / literary profile); persisted as recall_metadata JSON.
     keywords: list[str] = Field(default_factory=list)

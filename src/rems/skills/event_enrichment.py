@@ -17,6 +17,7 @@ from ..config import REMSConfig
 from ..llm.provider import LLMProvider
 from ..llm.prompts import (
     ENRICHMENT_FULL_USER,
+    ENRICHMENT_MEMORY_USER,
     ENRICHMENT_SUMMARY_AND_NAMES_USER,
     ENRICHMENT_SUMMARY_ONLY_USER,
     build_enrichment_system_message,
@@ -47,6 +48,9 @@ class EnrichmentResult(BaseModel):
     roles: list[ExtractedRole] = Field(default_factory=list)
     keywords: list[str] = Field(default_factory=list)
     location: str | None = None
+    # memory 模式（design/610）：事件级主体情感 + 对象一句话快照（name → summary）。
+    emotion: EmotionalModel | None = None
+    object_snapshots: dict[str, str] = Field(default_factory=dict)
 
 
 class EventEnrichmentSkill:
@@ -79,7 +83,14 @@ class EventEnrichmentSkill:
         budget: "CompressionBudget | None" = None,
         skip_roles: bool = False,
         names_only: bool = False,
+        memory_objects: dict[str, str] | None = None,
     ) -> EnrichmentResult:
+        memory_mode = memory_objects is not None
+        if memory_mode:
+            # memory 路径：不抽角色；对象与情感由专门 prompt 产出。
+            skip_roles = True
+            names_only = False
+
         # skip_roles 优先：完全不出 roles 字段。
         if skip_roles:
             names_only = False
@@ -97,7 +108,17 @@ class EventEnrichmentSkill:
             for r in (known_roles or [])
         )
 
-        if skip_roles:
+        if memory_mode:
+            object_list = "\n".join(
+                f"- {name}（{oid}）" for name, oid in memory_objects.items()
+            ) or "（无对象，主体记忆）"
+            user_msg = ENRICHMENT_MEMORY_USER.format(
+                content_raw=content_raw,
+                object_list=object_list,
+                summary_budget_table=summary_budget_text,
+            )
+            mode = "memory"
+        elif skip_roles:
             user_msg = ENRICHMENT_SUMMARY_ONLY_USER.format(
                 content_raw=content_raw,
                 summary_budget_table=summary_budget_text,
@@ -141,7 +162,7 @@ class EventEnrichmentSkill:
         actual_max_level = len(summaries)
 
         roles: list[ExtractedRole] = []
-        if not skip_roles:
+        if not skip_roles and not memory_mode:
             roles = self._parse_roles(data.get("roles"), names_only=names_only)
             # 兜底：解析失败但配置了 fallback 时，单独再调一次（保留旧行为以增强健壮性）。
             # names_only 模式下也允许兜底——但兜底拿回的是完整 ExtractedRole（含 snapshot/情感），
@@ -153,9 +174,33 @@ class EventEnrichmentSkill:
                 except Exception as e:
                     logger.warning("Fallback role extraction failed: %s", e)
 
+        emotion: EmotionalModel | None = None
+        object_snapshots: dict[str, str] = {}
+        if memory_mode:
+            raw_emo = data.get("emotion") or {}
+            if isinstance(raw_emo, dict):
+                emotion_init: dict[str, float] = {}
+                for k, v in raw_emo.items():
+                    if k in BasicEmotionVector.model_fields:
+                        try:
+                            emotion_init[k] = float(v)
+                        except (TypeError, ValueError):
+                            emotion_init[k] = 0.0
+                if emotion_init:
+                    emotion = EmotionalModel.from_emotion(BasicEmotionVector(**emotion_init))
+            raw_objs = data.get("objects")
+            if isinstance(raw_objs, list):
+                for od in raw_objs:
+                    if not isinstance(od, dict):
+                        continue
+                    name = (od.get("name") or "").strip()
+                    summary = (od.get("summary") or "").strip()
+                    if name and summary:
+                        object_snapshots[name] = summary
+
         keywords: list[str] = []
         location: str | None = None
-        if self._config.recall_enrichment_metadata_enabled:
+        if memory_mode or self._config.recall_enrichment_metadata_enabled:
             raw_kw = data.get("keywords")
             if isinstance(raw_kw, list):
                 keywords = [str(x).strip() for x in raw_kw if str(x).strip()]
@@ -170,6 +215,8 @@ class EventEnrichmentSkill:
             roles=roles,
             keywords=keywords,
             location=location,
+            emotion=emotion,
+            object_snapshots=object_snapshots,
         )
 
     @staticmethod

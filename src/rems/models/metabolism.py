@@ -17,6 +17,7 @@ class Shadow(BaseModel):
     """
 
     content: str = ""
+    subject_id: str = ""  # 归属匠石（design/810；单主体，恒同值）
     updated_at: datetime = Field(default_factory=datetime.now)
 
     @property
@@ -42,6 +43,7 @@ class UnclosedEvent(BaseModel):
     """
 
     id: str
+    subject_id: str = ""  # 归属匠石（design/810；单主体，恒同值）
     content_fragments: list[str] = Field(default_factory=list)
     identified_roles: list[str] = Field(default_factory=list)
     logical_gaps: Optional[str] = None

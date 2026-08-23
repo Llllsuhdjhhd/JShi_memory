@@ -331,6 +331,64 @@ ENRICHMENT_FULL_USER = """\
 """
 
 
+ENRICHMENT_MEMORY_INTRO = """\
+你是匠石记忆后端的事件充实（Event Enrichment）组件。给定**已闭环**经历原文，**单次输出**：
+摘要层级（A）、主体（匠石/"我"）事件级情感（B）、对象一句话快照（C）。**不抽取角色**——对象由输入映射表给定。
+
+"""
+
+
+ENRICHMENT_MEMORY_OBJECT_RULES = """\
+B. **emotion（事件级主体情感）**：给出匠石（主体"我"）在本事件中的 8 维情绪（各 0-1）。情感只属于主体，对象无情感。
+C. **objects（对象一句话快照）**：对【对象名单】中的**每个**对象，用一句话概括其在本事件中的状态 / 参与 / 相关情况；
+   即使该对象未说话或未在原文中出现，也依据上下文给出简短描述；无法判断时写"（未提及）"。
+   不要新增对象名单之外的对象，不要遗漏名单中的对象。
+D. **location（可选）**：事件发生地点；无法判断时为 null。
+
+输出严格 JSON。"""
+
+
+ENRICHMENT_MEMORY_USER = """\
+## 事件原文
+{content_raw}
+
+## 对象名单（来自输入映射表；每个都要给一句话快照）
+{object_list}
+
+## 摘要字预算
+{summary_budget_table}
+
+## 任务
+1. 生成 `summaries`（L1 起；递归压缩与熔断规则见系统提示 **A**）。
+2. 生成 `emotion`（主体 8 维情绪）。
+3. 生成 `objects`（每个对象一句话快照）。
+4. 生成 `location`（可选，null 表示未知）。
+
+## 输出 JSON
+```json
+{{
+  "summaries": {{
+    "L1": "…",
+    "L2": "…"
+  }},
+  "emotion": {{
+    "anger": 0.0,
+    "fear": 0.0,
+    "joy": 0.0,
+    "sadness": 0.0,
+    "surprise": 0.0,
+    "disgust": 0.0,
+    "trust": 0.0,
+    "anticipation": 0.0
+  }},
+  "objects": [
+    {{"name": "对象名", "summary": "一句话快照"}}
+  ],
+  "location": "地点或 null"
+}}
+```"""
+
+
 def build_enrichment_system_message(
     config: "REMSConfig",
     *,
@@ -345,6 +403,7 @@ def build_enrichment_system_message(
                            的「全局富信息池」，事件级 enrich 不再让 LLM 重做 snapshot/情感；
       - ``"summary_only"``：仅摘要（抽象事件封存、`skip_roles=True`、或外部已传入 ``role_entries``）。
                            系统提示中的摘要 **A** 节与 full / names_only **同源**（``ENRICHMENT_SUMMARY_A_RULES``）。
+      - ``"memory"``      ：摘要 + 主体事件级情感 + 对象一句话快照（记忆写入路径，design/610）。
 
     ``fuse_compact_threshold`` 由 ``fuse_min_chars`` 派生（×0.7 取下整，至少为 1），写入摘要 A 节熔断条件（2）。
     """
@@ -376,8 +435,21 @@ def build_enrichment_system_message(
             + "\n\n"
             + ENRICHMENT_SUMMARY_ONLY_SYSTEM_SUFFIX
         )
+    elif mode == "memory":
+        body = (
+            ENRICHMENT_MEMORY_INTRO
+            + ENRICHMENT_SUMMARY_A_RULES.format(
+                fuse_min_chars=fuse_min_chars,
+                fuse_compact_threshold=fuse_compact_threshold,
+            )
+            + "\n\n"
+            + ENRICHMENT_MEMORY_OBJECT_RULES
+        )
     else:
-        raise ValueError(f"Unknown enrichment mode: {mode!r} (expected full/names_only/summary_only)")
+        raise ValueError(
+            f"Unknown enrichment mode: {mode!r} "
+            "(expected full/names_only/summary_only/memory)"
+        )
     return base + body
 
 
