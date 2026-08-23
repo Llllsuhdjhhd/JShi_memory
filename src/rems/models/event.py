@@ -157,7 +157,7 @@ class Event(BaseModel):
     event_id: str = Field(default_factory=generate_event_id)
     subject_id: str = ""  # 记忆单元归属主体（匠石）；由 ingest_batch 注入（design/810）
     create_time: datetime = Field(default_factory=datetime.now)
-    input_id: Optional[str] = None  # 记录产生此事件的原始输入/对话轮次唯一标识
+    input_id: Optional[str] = None  # 记录产生此事件的经历段 segment_id（30 侧；design/210）
     source_ids: list[str] = Field(default_factory=list)  # 来源链（design/210）
     occurred_at: Optional[datetime] = None  # 经历发生时间；空 = 摄入时刻（design/210/810）
     content_raw: str  # L0：基本事件为已闭环事实原文；抽象事件为自子事件归纳的合成描述（白皮书 1.1.2、3.1）。

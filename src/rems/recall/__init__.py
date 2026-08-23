@@ -4,7 +4,7 @@
 完全按 1010 新方案实现：BGE-M3（或本地小模型）嵌入 + 多路召回 + RRF + 可选精排。
 """
 
-from .pipeline import RecallPipeline
+from .pipeline import RecallPipeline, retrieval_text
 from .providers import (
     BgeReranker,
     EmbeddingProvider,
@@ -26,4 +26,5 @@ __all__ = [
     "RecallVectorStore",
     "RerankerProvider",
     "SentenceTransformerEmbedding",
+    "retrieval_text",
 ]

@@ -608,7 +608,7 @@ class ObjectTimelineRepository:
 # =====================================================================
 
 class StoredMarksRepository:
-    """input_id → 本轮封存事件 id 列表。"""
+    """segment_id（经历段 id）→ 本轮封存事件 id 列表。"""
 
     def __init__(self, db: Database):
         self._db = db

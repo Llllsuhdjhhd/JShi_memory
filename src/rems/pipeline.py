@@ -170,15 +170,15 @@ class REMSPipeline:
         单条失败进 ``errors``，不污染其他 input 与历史；``stored_marks`` 封存几个填几个。
         """
         result = BackendIngestResult(subject_id=batch.subject_id)
-        for inp in batch.inputs:
+        for inp in batch.experiences:
             if not (inp.text or "").strip():
-                result.errors.append(f"input {inp.input_id or '?'}: empty text")
+                result.errors.append(f"segment {inp.segment_id or '?'}: empty text")
                 continue
             try:
                 sealed = self.metabolism_service.process_input(inp.text, memory=inp)
             except Exception as exc:  # noqa: BLE001
-                logger.warning("ingest_batch input %s failed: %s", inp.input_id, exc)
-                result.errors.append(f"input {inp.input_id}: {exc}")
+                logger.warning("ingest_batch segment %s failed: %s", inp.segment_id, exc)
+                result.errors.append(f"segment {inp.segment_id}: {exc}")
                 continue
             for ev in sealed:
                 result.sealed_event_ids.append(ev.event_id)
@@ -195,15 +195,15 @@ class REMSPipeline:
                     except Exception as exc:  # noqa: BLE001
                         logger.warning("index_event %s failed: %s", ev.event_id, exc)
                         result.errors.append(f"index {ev.event_id}: {exc}")
-            if sealed and inp.input_id:
+            if sealed and inp.segment_id:
                 ids = [e.event_id for e in sealed]
-                result.stored_marks[inp.input_id] = ids
+                result.stored_marks[inp.segment_id] = ids
                 if self.stored_marks_repo is not None:
                     try:
-                        self.stored_marks_repo.save(batch.subject_id, inp.input_id, ids)
+                        self.stored_marks_repo.save(batch.subject_id, inp.segment_id, ids)
                     except Exception as exc:  # noqa: BLE001
-                        logger.warning("stored_marks save failed for %s: %s", inp.input_id, exc)
-                        result.errors.append(f"stored_marks {inp.input_id}: {exc}")
+                        logger.warning("stored_marks save failed for %s: %s", inp.segment_id, exc)
+                        result.errors.append(f"stored_marks {inp.segment_id}: {exc}")
         result.unclosed_count = len(self.meta_repo.get_unclosed_events())
         return result
 

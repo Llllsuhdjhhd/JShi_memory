@@ -9,7 +9,7 @@ from .port import (
     BackendIngestResult,
     MemoryBackendPort,
     MemoryBatch,
-    MemoryInput,
+    MemoryExperience,
     RecalledFragment,
 )
 
@@ -19,7 +19,7 @@ __all__ = [
     "BackendIngestResult",
     "MemoryBackendPort",
     "MemoryBatch",
-    "MemoryInput",
+    "MemoryExperience",
     "RecalledFragment",
     "__version__",
 ]

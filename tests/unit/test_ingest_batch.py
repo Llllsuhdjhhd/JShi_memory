@@ -5,7 +5,7 @@
 - content_raw == 输入 text（原文保全）；
 - 角色列表 = 主体恒在 + 对象映射表（不抽取）；
 - 事件级主体情感、origin / source_ids 落库；
-- stored_marks：input_id → 封存事件 id 列表；
+- stored_marks：segment_id → 封存事件 id 列表；
 - 对象时间线条目（无情感）。
 """
 
@@ -15,7 +15,7 @@ import pytest
 
 from rems.config import REMSConfig
 from rems.pipeline import REMSPipeline
-from rems.port import MemoryBatch, MemoryInput
+from rems.port import MemoryBatch, MemoryExperience
 from rems.services.event_service import EventService
 from rems.services.metabolism_service import MetabolismService
 from rems.skills.boundary_detection import BoundaryDetectionSkill
@@ -72,12 +72,12 @@ class TestIngestBatch:
 
         batch = MemoryBatch(
             subject_id="jshi-1",
-            inputs=(MemoryInput(
+            experiences=(MemoryExperience(
                 subject_id="jshi-1",
                 text="今天看到美丽的落日",
                 objects={"阿明": "OBJ-AMING"},
                 source_ids=("FACT-1",),
-                input_id="seg-001",
+                segment_id="seg-001",
                 origin="external",
             ),),
         )
@@ -123,10 +123,10 @@ class TestIngestBatch:
 
         batch = MemoryBatch(
             subject_id="jshi-1",
-            inputs=(MemoryInput(
+            experiences=(MemoryExperience(
                 subject_id="jshi-1",
                 text="内心平静",
-                input_id="seg-002",
+                segment_id="seg-002",
             ),),
         )
         result = pipeline.ingest_batch(batch)
@@ -145,7 +145,7 @@ class TestIngestBatch:
         pipeline, *_ = memory_pipeline
         batch = MemoryBatch(
             subject_id="jshi-1",
-            inputs=(MemoryInput(subject_id="jshi-1", text="   "),),
+            experiences=(MemoryExperience(subject_id="jshi-1", text="   "),),
         )
         result = pipeline.ingest_batch(batch)
         assert result.sealed_event_ids == []
@@ -167,9 +167,9 @@ class TestIngestBatch:
         })
         batch = MemoryBatch(
             subject_id="jshi-1",
-            inputs=(
-                MemoryInput(subject_id="jshi-1", text=""),
-                MemoryInput(subject_id="jshi-1", text="正常输入", input_id="seg-003"),
+            experiences=(
+                MemoryExperience(subject_id="jshi-1", text=""),
+                MemoryExperience(subject_id="jshi-1", text="正常输入", segment_id="seg-003"),
             ),
         )
         result = pipeline.ingest_batch(batch)

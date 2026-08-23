@@ -15,7 +15,7 @@ from ..config import REMSConfig
 from ..models.event import Event, EventRoleEntry
 from ..models.metabolism import Shadow, UnclosedEvent
 from ..models.role import Role
-from ..port import MemoryInput
+from ..port import MemoryExperience
 from ..services.event_service import EventService
 from ..skills.boundary_detection import BoundaryDetectionSkill, BoundaryResult
 from ..skills.shadow_compaction import ShadowCompactionSkill
@@ -132,7 +132,7 @@ class MetabolismService:
         known_roles_hint: list[Role] | None = None,
         pre_role_entries: list[EventRoleEntry] | None = None,
         ingest_session: Any | None = None,
-        memory: MemoryInput | None = None,
+        memory: MemoryExperience | None = None,
     ) -> list[Event]:
         """Ingest *raw_input*, return list of newly sealed events (may be empty).
 
@@ -220,7 +220,7 @@ class MetabolismService:
         input_id: str | None = None,
         known_roles_hint: list[Role] | None = None,
         pre_role_entries: list[EventRoleEntry] | None = None,
-        memory: MemoryInput | None = None,
+        memory: MemoryExperience | None = None,
     ) -> list[Event]:
         """Apply LLM boundary result and refresh shadow / unclosed library.
 
@@ -355,7 +355,7 @@ class MetabolismService:
         input_id: str | None = None,
         known_roles_hint: list[Role] | None = None,
         pre_role_entries: list[EventRoleEntry] | None = None,
-        memory: MemoryInput | None = None,
+        memory: MemoryExperience | None = None,
     ) -> list[Event]:
         """Manual trigger (/save, /mem) or length-based fallback: seal everything immediately.
 
@@ -409,7 +409,7 @@ class MetabolismService:
 
     @staticmethod
     def _seal_memory_kwargs(
-        memory: MemoryInput | None,
+        memory: MemoryExperience | None,
         *,
         input_id: str | None,
         known_roles_hint: list[Role] | None,
@@ -418,7 +418,7 @@ class MetabolismService:
         """记忆路径（memory 非 None）传主体/对象/来源/时间/origin；旧路径传角色提示。"""
         if memory is not None:
             return {
-                "input_id": memory.input_id,
+                "input_id": memory.segment_id,
                 "subject_id": memory.subject_id,
                 "objects": memory.objects,
                 "source_ids": memory.source_ids,

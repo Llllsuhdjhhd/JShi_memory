@@ -5,7 +5,7 @@ from typing import Iterator
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-from ..port import BackendIngestResult, MemoryBatch, MemoryInput
+from ..port import BackendIngestResult, MemoryBatch, MemoryExperience
 from .app import get_pipeline
 
 router = APIRouter(tags=["rems"])
@@ -15,7 +15,7 @@ router = APIRouter(tags=["rems"])
 
 class IngestRequest(BaseModel):
     subject_id: str
-    inputs: list[MemoryInput] = Field(default_factory=list)
+    experiences: list[MemoryExperience] = Field(default_factory=list)
 
 
 class RecallRequest(BaseModel):
@@ -56,7 +56,7 @@ class EventOut(BaseModel):
 def ingest(req: IngestRequest):
     pipeline = get_pipeline()
     return pipeline.ingest_batch(
-        MemoryBatch(subject_id=req.subject_id, inputs=tuple(req.inputs))
+        MemoryBatch(subject_id=req.subject_id, experiences=tuple(req.experiences))
     )
 
 

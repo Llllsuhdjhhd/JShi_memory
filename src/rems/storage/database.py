@@ -157,12 +157,12 @@ class ObjectMemoryEntryRecord(Base):
 
 
 class StoredMarkRecord(Base):
-    """stored_marks 台账：input_id → 本轮封存事件 id 列表（30 推进游标与台账用，见 design/210/810）。"""
+    """stored_marks 台账：segment_id（经历段 id）→ 本轮封存事件 id 列表（30 推进游标与台账用，见 design/210/810）。"""
 
     __tablename__ = "stored_marks"
 
     subject_id = Column(String, default="", index=True)
-    input_id = Column(String, primary_key=True)
+    input_id = Column(String, primary_key=True)  # 存经历段 segment_id（列名保留兼容）
     event_ids = Column(JSON, default=list)
     created_at = Column(DateTime, nullable=False)
 

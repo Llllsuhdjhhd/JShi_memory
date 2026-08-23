@@ -17,8 +17,8 @@ from typing import Protocol, runtime_checkable
 from pydantic import BaseModel, Field
 
 
-class MemoryInput(BaseModel):
-    """一段经历输入：统一所有记忆类型的载体。
+class MemoryExperience(BaseModel):
+    """一段经历：统一所有记忆类型的载体。
 
     - ``text`` 是原文，不归一化、不改写、不切分（输入层）；内部代谢切分是后端内部流程；
     - ``objects`` 为对象映射表（名字 / 称呼 → 01 object_id），覆盖一段经历涉及的对象，
@@ -39,7 +39,7 @@ class MemoryInput(BaseModel):
     occurred_at: datetime | None = Field(
         default=None, description="经历发生时间；空 = 摄入时刻"
     )
-    input_id: str | None = Field(
+    segment_id: str | None = Field(
         default=None, description="30 侧经历段 id，用于 stored_marks 回填"
     )
     origin: str = Field(default="external", description="external | internal | dream")
@@ -49,7 +49,7 @@ class MemoryBatch(BaseModel):
     """一次写入请求：一条或多条经历（有序：对话 / 经历先后顺序）。"""
 
     subject_id: str = Field(..., description="实例作用域（恒为当前匠石实例）")
-    inputs: tuple[MemoryInput, ...] = Field(default_factory=tuple)
+    experiences: tuple[MemoryExperience, ...] = Field(default_factory=tuple)
 
 
 class BackendIngestResult(BaseModel):
@@ -58,7 +58,7 @@ class BackendIngestResult(BaseModel):
     subject_id: str
     stored_marks: dict[str, list[str]] = Field(
         default_factory=dict,
-        description="input_id → 本轮封存事件 id 列表（封存几个填几个；30 推进游标与台账用）",
+        description="segment_id → 本轮封存事件 id 列表（封存几个填几个；30 推进游标与台账用）",
     )
     sealed_event_ids: list[str] = Field(default_factory=list)
     role_ids: list[str] = Field(
@@ -127,6 +127,6 @@ __all__ = [
     "BackendIngestResult",
     "MemoryBackendPort",
     "MemoryBatch",
-    "MemoryInput",
+    "MemoryExperience",
     "RecalledFragment",
 ]

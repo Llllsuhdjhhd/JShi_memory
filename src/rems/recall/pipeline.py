@@ -20,6 +20,17 @@ _EMOTION_LEXICON = {
 }
 
 
+def retrieval_text(event: Event) -> str:
+    """事件检索文本：L1 摘要（或原文）+ 对象 id + 地点（design/1010 §2.4）。"""
+    parts = [event.summaries.get("L1") or event.content_raw]
+    names = [r.role_id for r in event.role_list if not r.is_subject]
+    if names:
+        parts.append("对象:" + " ".join(names))
+    if event.location:
+        parts.append("地点:" + event.location)
+    return "\n".join(parts)
+
+
 class RecallPipeline:
     """查询理解 → 多路召回（语义 / 词法 / 对象 / 时间 / 锚点）→ RRF + 调制 → 精排 → 档位选择。"""
 
@@ -165,13 +176,7 @@ class RecallPipeline:
         ]
 
     def _retrieval_text(self, ev: Event) -> str:
-        parts = [ev.summaries.get("L1") or ev.content_raw]
-        names = [r.role_id for r in ev.role_list if not r.is_subject]
-        if names:
-            parts.append("对象:" + " ".join(names))
-        if ev.location:
-            parts.append("地点:" + ev.location)
-        return "\n".join(parts)
+        return retrieval_text(ev)
 
     def _semantic_route(
         self, subject_id: str, query: str, *, object_id: str | None
