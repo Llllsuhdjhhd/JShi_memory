@@ -20,4 +20,5 @@ def format_indexed_text(sentences: list[str]) -> str:
 
 def decode_indices(sentences: list[str], indices: list[int]) -> str:
     """Reconstruct text from a list of sentence indices (1-based)."""
-    return "".join(sentences[i-1] for i in indices if 0 < i <= len(sentences))
+    # 句子之间用换行分隔，避免多句/多说话人粘连（如“…测试。deepseek: …”）
+    return "\n".join(sentences[i-1] for i in indices if 0 < i <= len(sentences))

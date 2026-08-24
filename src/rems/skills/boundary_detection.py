@@ -154,7 +154,9 @@ class BoundaryDetectionSkill:
                 {"role": "user", "content": user_msg},
             ],
         )
-        return self.parse_response(data, ctx["sentences"])
+        return self.parse_response(
+            data, ctx["sentences"], shadow_count=ctx["shadow_count"],
+        )
 
     @staticmethod
     def build_index_context(
@@ -190,14 +192,21 @@ class BoundaryDetectionSkill:
             "shadow_count": shadow_count,
         }
 
-    def parse_response(self, data: dict, sentences: list[str]) -> BoundaryResult:
+    def parse_response(
+        self, data: dict, sentences: list[str], shadow_count: int = 0,
+    ) -> BoundaryResult:
         completed: list[CompletedFragment] = []
         for item in data.get("completed_events", []):
             if not isinstance(item, dict):
                 continue
             indices = item.get("content_raw_indices", [])
+            continuation_of = item.get("continuation_of")
+            # 续写去重：命中 continuation_of 时，旧残影内容由后端合并 UC 自动补上；
+            # 这里剥掉落在旧残影区间内的句子索引，避免 ue.merged_content + 片段重复。
+            if continuation_of and shadow_count > 0:
+                indices = [i for i in indices if i > shadow_count]
             extracted_raw = decode_indices(sentences, indices)
-            if not extracted_raw:
+            if not extracted_raw and not continuation_of:
                 continue
 
             split_id = item.get("split_id")
@@ -211,7 +220,7 @@ class BoundaryDetectionSkill:
 
             completed.append(CompletedFragment(
                 content_raw=extracted_raw,
-                continuation_of=item.get("continuation_of"),
+                continuation_of=continuation_of,
                 is_split_prefix=is_split_prefix,
                 split_id=split_id,
             ))

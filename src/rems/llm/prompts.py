@@ -348,6 +348,25 @@ D. **location（可选）**：事件发生地点；无法判断时为 null。
 输出严格 JSON。"""
 
 
+ENRICHMENT_MEMORY_EMOTION_EXAMPLES = """\
+**情感量化示例（主体 = 匠石/"我"；仅依据本条事件原文推断，不引入事件外信息）**：
+
+示例一（与老友重逢）：
+原文："十年后在街角偶遇老友阿明，他鬓角已白，开口仍是当年的语气。我们站在风里聊了很久，他说这些年一直在找我的消息。"
+情绪：{"joy": 0.8, "surprise": 0.6, "sadness": 0.4, "trust": 0.7, "anger": 0.0, "fear": 0.1, "disgust": 0.0, "anticipation": 0.3}
+说明：joy 0.8 来自重逢与熟悉语气；surprise 0.6 来自意外相遇；sadness 0.4 来自岁月流逝的感慨；trust 0.7 来自老友的坦诚；fear 0.1 / anticipation 0.3 为情绪底色。
+
+示例二（努力被否）：
+原文："我花了三个通宵改完的方案，评审会上被一句话否掉。散会后我独自坐在空会议室里，盯着那叠打印稿，一个字也不想说。"
+情绪：{"sadness": 0.7, "anger": 0.5, "disgust": 0.4, "trust": 0.2, "joy": 0.0, "fear": 0.2, "surprise": 0.3, "anticipation": 0.1}
+说明：sadness 0.7 来自努力被否；anger 0.5 来自被轻率对待；disgust 0.4 来自对结果的不甘；trust 0.2 反映信任受损；surprise 0.3 来自否定来得突然；anticipation 0.1 说明对后续期待很低。
+
+示例三（独立完成大事）：
+原文："系统上线那一刻，看着监控面板的数字一路平稳，我长长舒了口气。这一年的积累终于没有白费。"
+情绪：{"joy": 0.8, "trust": 0.6, "anticipation": 0.7, "sadness": 0.1, "anger": 0.0, "fear": 0.1, "surprise": 0.2, "disgust": 0.0}
+说明：joy 0.8 来自成果达成；trust 0.6 来自对系统与自身积累的信心；anticipation 0.7 来自对后续的期待；surprise 0.2 来自结果略超预期；sadness 0.1 / fear 0.1 为底色。"""
+
+
 ENRICHMENT_MEMORY_USER = """\
 ## 事件原文
 {content_raw}
@@ -444,6 +463,8 @@ def build_enrichment_system_message(
             )
             + "\n\n"
             + ENRICHMENT_MEMORY_OBJECT_RULES
+            + "\n\n"
+            + ENRICHMENT_MEMORY_EMOTION_EXAMPLES
         )
     else:
         raise ValueError(

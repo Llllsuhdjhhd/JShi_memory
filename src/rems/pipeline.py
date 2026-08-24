@@ -13,7 +13,7 @@ import logging
 from .config import REMSConfig
 from .llm.provider import LLMProvider
 from .models.event import Event
-from .port import BackendIngestResult, MemoryBatch, RecalledFragment
+from .port import BackendIngestResult, MemoryBatch, MemoryExperience, RecalledFragment
 from .recall import (
     BgeReranker,
     HashEmbedding,
@@ -22,6 +22,7 @@ from .recall import (
     RecallPipeline,
     SentenceTransformerEmbedding,
 )
+from .utils.text import segment_sentences
 from .services.belief_revision_service import BeliefRevisionService
 from .services.emotion_service import EMAEvolver
 from .services.event_service import EventService
@@ -165,21 +166,44 @@ class REMSPipeline:
     # ------------------------------------------------------------------
 
     def ingest_batch(self, batch: MemoryBatch) -> BackendIngestResult:
-        """记忆写入：逐 input 走代谢封存，写对象时间线 / stored_marks / 向量索引。
-
-        单条失败进 ``errors``，不污染其他 input 与历史；``stored_marks`` 封存几个填几个。
+        """记忆写入：整批合并为一段输入走一次代谢（与 rems3 整批语义对齐），
+        再按事件内容归属回各 segment 写 stored_marks / 对象时间线 / 向量索引。
+        空文本段按契约报错并跳过；单批失败进 ``errors``。
         """
         result = BackendIngestResult(subject_id=batch.subject_id)
+
+        valid: list[MemoryExperience] = []
         for inp in batch.experiences:
             if not (inp.text or "").strip():
                 result.errors.append(f"segment {inp.segment_id or '?'}: empty text")
                 continue
+            valid.append(inp)
+
+        if valid:
+            # 整批合并：轮次之间空行分隔，保留“匠石:”/“deepseek:”前缀
+            combined_text = "\n\n".join(e.text for e in valid)
+            merged_objects: dict[str, str] = {}
+            merged_sources: list[str] = []
+            for e in valid:
+                merged_objects.update(e.objects)
+                merged_sources.extend(e.source_ids)
+            memory = MemoryExperience(
+                subject_id=batch.subject_id,
+                text=combined_text,
+                objects=merged_objects,
+                source_ids=tuple(merged_sources),
+                segment_id="+".join(e.segment_id for e in valid),
+                origin=valid[0].origin,
+            )
             try:
-                sealed = self.metabolism_service.process_input(inp.text, memory=inp)
+                sealed = self.metabolism_service.process_input(
+                    combined_text, memory=memory,
+                )
             except Exception as exc:  # noqa: BLE001
-                logger.warning("ingest_batch segment %s failed: %s", inp.segment_id, exc)
-                result.errors.append(f"segment {inp.segment_id}: {exc}")
-                continue
+                logger.warning("ingest_batch failed: %s", exc)
+                result.errors.append(f"batch ingest: {exc}")
+                sealed = []
+
             for ev in sealed:
                 result.sealed_event_ids.append(ev.event_id)
                 for re_ in ev.role_list:
@@ -195,15 +219,43 @@ class REMSPipeline:
                     except Exception as exc:  # noqa: BLE001
                         logger.warning("index_event %s failed: %s", ev.event_id, exc)
                         result.errors.append(f"index {ev.event_id}: {exc}")
-            if sealed and inp.segment_id:
-                ids = [e.event_id for e in sealed]
-                result.stored_marks[inp.segment_id] = ids
-                if self.stored_marks_repo is not None:
+
+            # stored_marks：按事件内容归属回各 segment（一个事件可命中多个 segment；
+            # 段被部分封存时按句子级重叠判定，避免漏归属）
+            def _norm(s: str) -> str:
+                return "".join(s.split())
+
+            def _segment_hits(segment_text: str, event_content: str) -> bool:
+                norm_event = _norm(event_content)
+                if _norm(segment_text) in norm_event:
+                    return True
+                return any(
+                    _norm(s) and _norm(s) in norm_event
+                    for s in segment_sentences(segment_text)
+                )
+
+            for ev in sealed:
+                hits = [
+                    e.segment_id for e in valid
+                    if _segment_hits(e.text, ev.content_raw)
+                ]
+                for seg in hits:
+                    result.stored_marks.setdefault(seg, []).append(ev.event_id)
+                if not hits:
+                    result.stored_marks.setdefault(
+                        "+".join(e.segment_id for e in valid), [],
+                    ).append(ev.event_id)
+
+            if self.stored_marks_repo is not None:
+                for seg, ids in result.stored_marks.items():
                     try:
-                        self.stored_marks_repo.save(batch.subject_id, inp.segment_id, ids)
+                        self.stored_marks_repo.save(batch.subject_id, seg, ids)
                     except Exception as exc:  # noqa: BLE001
-                        logger.warning("stored_marks save failed for %s: %s", inp.segment_id, exc)
-                        result.errors.append(f"stored_marks {inp.segment_id}: {exc}")
+                        logger.warning(
+                            "stored_marks save failed for %s: %s", seg, exc,
+                        )
+                        result.errors.append(f"stored_marks {seg}: {exc}")
+
         result.unclosed_count = len(self.meta_repo.get_unclosed_events())
         return result
 
