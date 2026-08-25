@@ -51,6 +51,8 @@ class EnrichmentResult(BaseModel):
     # memory 模式（design/610）：事件级主体情感 + 对象一句话快照（name → summary）。
     emotion: EmotionalModel | None = None
     object_snapshots: dict[str, str] = Field(default_factory=dict)
+    # 匠石对对象的分级白描（design/610）：name → {l1_mention, l2_interaction, l3_decision}。
+    object_white_paintings: dict[str, RoleSnapshot] = Field(default_factory=dict)
 
 
 class EventEnrichmentSkill:
@@ -176,6 +178,7 @@ class EventEnrichmentSkill:
 
         emotion: EmotionalModel | None = None
         object_snapshots: dict[str, str] = {}
+        object_white_paintings: dict[str, RoleSnapshot] = {}
         if memory_mode:
             raw_emo = data.get("emotion") or {}
             if isinstance(raw_emo, dict):
@@ -194,9 +197,21 @@ class EventEnrichmentSkill:
                     if not isinstance(od, dict):
                         continue
                     name = (od.get("name") or "").strip()
-                    summary = (od.get("summary") or "").strip()
-                    if name and summary:
-                        object_snapshots[name] = summary
+                    if not name:
+                        continue
+                    l1 = (od.get("l1_mention") or "").strip() or None
+                    l2 = (od.get("l2_interaction") or "").strip() or None
+                    l3 = (od.get("l3_decision") or "").strip() or None
+                    if l1 is None:  # 兼容旧格式 summary → 作为 L1
+                        l1 = (od.get("summary") or "").strip() or None
+                    if l1 or l2 or l3:
+                        object_white_paintings[name] = RoleSnapshot(
+                            l1_mention=l1,
+                            l2_interaction=l2,
+                            l3_decision=l3,
+                        )
+                    if l1:
+                        object_snapshots[name] = l1
 
         keywords: list[str] = []
         location: str | None = None
@@ -217,6 +232,7 @@ class EventEnrichmentSkill:
             location=location,
             emotion=emotion,
             object_snapshots=object_snapshots,
+            object_white_paintings=object_white_paintings,
         )
 
     @staticmethod

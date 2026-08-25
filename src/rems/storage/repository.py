@@ -358,8 +358,12 @@ class RoleRepository:
             importance_val = entry.importance.value if hasattr(entry.importance, "value") else str(entry.importance)
             record = WhitePaintingRecord(
                 role_id=role_id,
+                subject_id=entry.subject_id,
                 event_id=entry.event_id,
                 role_summary=entry.role_summary,
+                l1_mention=entry.l1_mention,
+                l2_interaction=entry.l2_interaction,
+                l3_decision=entry.l3_decision,
                 emotional_model=entry.emotional_model.model_dump(mode="json"),
                 importance=importance_val,
                 create_time=entry.create_time,
@@ -453,8 +457,12 @@ class RoleRepository:
     def _to_wp_entry(e: WhitePaintingRecord) -> WhitePaintingEntry:
         em = EmotionalModel(**(e.emotional_model or {}))
         return WhitePaintingEntry(
+            subject_id=getattr(e, "subject_id", "") or "",
             event_id=e.event_id,
             role_summary=e.role_summary,
+            l1_mention=getattr(e, "l1_mention", None),
+            l2_interaction=getattr(e, "l2_interaction", None),
+            l3_decision=getattr(e, "l3_decision", None),
             emotional_model=em,
             importance=e.importance,
             create_time=e.create_time,

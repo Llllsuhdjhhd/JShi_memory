@@ -8,7 +8,7 @@ from typing import Optional
 # 角色服务：注册、白描追加、基于 arousal 的白描摘要权重（白皮书第 2 章）。
 
 from ..config import REMSConfig, UserMode
-from ..models.event import Event, EventRoleEntry, Importance
+from ..models.event import EmotionalModel, Event, EventRoleEntry, Importance, RoleSnapshot
 from ..models.role import Role, WhitePaintingEntry, generate_role_id
 from ..skills.role_extraction import ExtractedRole, RoleExtractionSkill
 from ..storage.repository import RoleRepository
@@ -109,6 +109,38 @@ class RoleService:
                     metadata={"forgetting_factor": base_forgetting}
                 )
             logger.debug("WP appended for %s from event %s (AE=%.2f)", role.role_id, event.event_id, memory_weight)
+
+    def append_object_white_painting(
+        self,
+        object_id: str,
+        subject_id: str,
+        event: Event,
+        snapshot: RoleSnapshot,
+    ) -> None:
+        """记忆路径白描：对象来自输入映射表，不建档、不注册角色。
+
+        白描 = 匠石（subject）对该对象的分级白描（l1/l2/l3），事件关联；
+        对象无情感、无等级（design/610 记忆契约）。
+        """
+        l1 = snapshot.l1_mention
+        l2 = snapshot.l2_interaction
+        l3 = snapshot.l3_decision
+        if not (l1 or l2 or l3):
+            return
+        summary = l2 or l1 or l3 or ""
+        wp = WhitePaintingEntry(
+            subject_id=subject_id,
+            event_id=event.event_id,
+            role_summary=summary,
+            l1_mention=l1,
+            l2_interaction=l2,
+            l3_decision=l3,
+            emotional_model=EmotionalModel(),
+            importance=Importance.C,
+            create_time=event.create_time,
+        )
+        self._repo.add_white_painting_entry(object_id, wp)
+        logger.debug("WP appended for object %s from event %s", object_id, event.event_id)
 
     # ------------------------------------------------------------------
     # Dynamic granularity routing — 收集端（白皮书 2.3）

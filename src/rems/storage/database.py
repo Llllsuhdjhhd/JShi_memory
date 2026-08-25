@@ -101,6 +101,10 @@ class WhitePaintingRecord(Base):
     role_id = Column(String, ForeignKey("roles.role_id"), nullable=False, index=True)
     event_id = Column(String, ForeignKey("events.event_id"), nullable=False)
     role_summary = Column(Text, nullable=False)
+    # 匠石视角分级白描（design/610）：L1 提及 / L2 互动 / L3 决策意图。
+    l1_mention = Column(Text, nullable=True)
+    l2_interaction = Column(Text, nullable=True)
+    l3_decision = Column(Text, nullable=True)
     emotional_model = Column(JSON, default=dict)
     importance = Column(String, default="C")
     create_time = Column(DateTime, nullable=False)
@@ -235,6 +239,9 @@ class Database:
             ],
             "white_painting_entries": [
                 ("subject_id", "TEXT DEFAULT ''"),
+                ("l1_mention", "TEXT"),
+                ("l2_interaction", "TEXT"),
+                ("l3_decision", "TEXT"),
             ],
         }
 

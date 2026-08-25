@@ -17,6 +17,7 @@ from ..models.event import (
     EventRoleEntry,
     EventStatus,
     Importance,
+    RoleSnapshot,
 )
 from ..models.object_entry import ObjectMemoryEntry
 from ..models.role import Role
@@ -152,11 +153,20 @@ class EventService:
                 )
             ]
             seen_oids: set[str] = set()
-            for oid in objects.values():
+            for name, oid in objects.items():
                 if oid and oid not in seen_oids:
                     seen_oids.add(oid)
                     resolved_role_entries.append(
-                        EventRoleEntry(role_id=oid, importance=Importance.C)
+                        EventRoleEntry(
+                            role_id=oid,
+                            importance=Importance.C,
+                            role_snapshot=(
+                                enrichment.object_white_paintings.get(name)
+                                or RoleSnapshot(
+                                    l1_mention=enrichment.object_snapshots.get(name),
+                                )
+                            ),
+                        )
                     )
         elif use_names_only:
             # 池：role_id → 富信息 EventRoleEntry（含 snapshot + 8 维情绪）。
@@ -255,22 +265,6 @@ class EventService:
             origin=origin or "external",
         )
 
-        if memory_mode and self._object_timeline_repo is not None:
-            # 对象时间线：每个对象一句话快照（无情感），供 410/回忆使用。
-            for name, summary in enrichment.object_snapshots.items():
-                oid = objects.get(name)
-                if not oid:
-                    continue
-                self._object_timeline_repo.append(
-                    ObjectMemoryEntry(
-                        subject_id=subject_id,
-                        object_id=oid,
-                        name=name,
-                        event_id=event.event_id,
-                        summary=summary,
-                        create_time=event.create_time,
-                    )
-                )
         if memory_mode and event.emotion is not None:
             event.activation_energy = min(max(event.emotion.arousal, 0.0), 1.0)
 
@@ -288,6 +282,20 @@ class EventService:
             event.ptsd_immune = True
 
         self._event_repo.save(event)
+        if memory_mode and self._role_service is not None:
+            # 匠石对对象的分级白描 → white_painting_entries（事件关联，无情感、无等级）
+            for name, oid in (objects or {}).items():
+                if not oid:
+                    continue
+                snap = enrichment.object_white_paintings.get(name) or RoleSnapshot(
+                    l1_mention=enrichment.object_snapshots.get(name),
+                )
+                self._role_service.append_object_white_painting(
+                    object_id=oid,
+                    subject_id=subject_id,
+                    event=event,
+                    snapshot=snap,
+                )
         if not memory_mode and self._vector is not None:
             # 旧路径兼容：仅当显式注入了旧向量库才索引（新架构索引走 recall_pipeline，design/1010）。
             self._index_event(event)

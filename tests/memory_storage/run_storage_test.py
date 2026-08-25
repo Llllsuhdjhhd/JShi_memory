@@ -10,7 +10,7 @@
 - deepseek 只取每一轮的最终总结性回复（有长有短都按原文计入），
   判定看回复性质而非"文件里最后一条"；中间过程不计入；
 - 累计对话正文达到阈值（默认 1000 字）才触发 ingest，否则提示等待下一轮；
-- 正式数据（事件 / 对象时间线 / stored_marks / 影子 / 未完成事件 / 向量索引）与
+- 正式数据（事件 / 白描 white_painting_entries / stored_marks / 影子 / 未完成事件 / 向量索引）与
   测试痕迹（LLM 请求、skill 调用）都落在同一 SQLite 库里，便于直接查看。
 
 用法
@@ -538,6 +538,10 @@ def _sum_enrichment(result: Any) -> dict[str, Any]:
         "actual_max_level": result.actual_max_level,
         "emotion": result.emotion.model_dump(mode="json") if result.emotion else None,
         "object_snapshots": result.object_snapshots,
+        "object_white_paintings": {
+            k: v.model_dump(mode="json")
+            for k, v in result.object_white_paintings.items()
+        },
         "location": result.location,
         "keywords": result.keywords,
     }
@@ -681,7 +685,7 @@ def build_report(
     llm_rows: list[dict[str, Any]],
     skill_rows: list[dict[str, Any]],
     sealed_events: list[dict[str, Any]],
-    obj_entries: list[dict[str, Any]],
+    wp_entries: list[dict[str, Any]],
     marks: dict[str, Any],
     shadow: Any,
     unclosed: list[dict[str, Any]],
@@ -774,11 +778,16 @@ def build_report(
                      f"occurred_at: {ev.get('occurred_at')}")
     lines.append("")
 
-    lines.append(f"### 对象时间线（{len(obj_entries)} 条）")
+    lines.append(f"### 白描 white_painting_entries（{len(wp_entries)} 条，匠石视角分级）")
     lines.append("")
-    for o in obj_entries:
-        lines.append(f"- {o.get('object_id')} ({o.get('name')})  event={o.get('event_id')}")
-        lines.append(f"  - summary: {o.get('summary')}")
+    for o in wp_entries:
+        lines.append(
+            f"- 对象 {o.get('role_id')}  event={o.get('event_id')}  "
+            f"subject={o.get('subject_id')}"
+        )
+        lines.append(f"  - L1 提及: {o.get('l1_mention')}")
+        lines.append(f"  - L2 互动: {o.get('l2_interaction')}")
+        lines.append(f"  - L3 决策: {o.get('l3_decision')}")
     lines.append("")
 
     lines.append("### stored_marks 台账")
@@ -890,14 +899,17 @@ def run_ingest(
 
     # 落库审计
     sealed_events: list[dict[str, Any]] = []
-    obj_entries: list[dict[str, Any]] = []
+    wp_entries: list[dict[str, Any]] = []
     for sid in result.sealed_event_ids:
         ev = pipeline.event_repo.get(sid)
         if ev is None:
             continue
         sealed_events.append(model_json(ev))
-        for entry in pipeline.object_timeline_repo.list_by_event(sid):
-            obj_entries.append(model_json(entry))
+        for re_ in ev.role_list:
+            if not re_.is_subject and re_.role_id:
+                wp = pipeline.role_repo.get_white_painting_by_event(re_.role_id, sid)
+                if wp:
+                    wp_entries.append(model_json(wp))
     marks = {
         exp.segment_id: pipeline.stored_marks_repo.get(exp.segment_id)
         for exp in experiences
@@ -934,7 +946,7 @@ def run_ingest(
 
     report = build_report(
         run_row, exp_rows, llm_rows, skill_rows, sealed_events,
-        obj_entries, marks, shadow, unclosed, counts, qdrant_n, result.errors,
+        wp_entries, marks, shadow, unclosed, counts, qdrant_n, result.errors,
     )
     report_dir = base / REPORT_DIR
     report_dir.mkdir(parents=True, exist_ok=True)
@@ -954,7 +966,7 @@ def run_ingest(
     print(f"输入          : {total_chars} 字 / {len(turns)} 轮")
     print(f"封存事件      : {len(result.sealed_event_ids)}")
     print(f"stored_marks  : {result.stored_marks}")
-    print(f"对象时间线    : {len(obj_entries)} 条")
+    print(f"白描条目      : {len(wp_entries)} 条")
     print(f"未完成事件    : {len(unclosed)}  |  影子 {shadow.length} 字")
     print(f"向量索引      : {qdrant_n} 点")
     print(f"错误          : {result.errors or '无'}")

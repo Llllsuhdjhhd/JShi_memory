@@ -18,12 +18,14 @@ from rems.pipeline import REMSPipeline
 from rems.port import MemoryBatch, MemoryExperience
 from rems.services.event_service import EventService
 from rems.services.metabolism_service import MetabolismService
+from rems.services.role_service import RoleService
 from rems.skills.boundary_detection import BoundaryDetectionSkill
 from rems.skills.event_enrichment import EventEnrichmentSkill
+from rems.skills.role_extraction import RoleExtractionSkill
 from rems.storage.repository import (
     EventRepository,
     MetabolismRepository,
-    ObjectTimelineRepository,
+    RoleRepository,
     StoredMarksRepository,
 )
 
@@ -34,31 +36,33 @@ from ..conftest import FakeLLM
 def memory_pipeline(config, db, fake_llm, vector_store):
     event_repo = EventRepository(db)
     meta_repo = MetabolismRepository(db)
-    obj_repo = ObjectTimelineRepository(db)
+    role_repo = RoleRepository(db)
     marks_repo = StoredMarksRepository(db)
     enrichment_skill = EventEnrichmentSkill(fake_llm, config)
+    role_skill = RoleExtractionSkill(fake_llm, config)
+    role_service = RoleService(config, role_repo, role_skill, llm=fake_llm)
     event_service = EventService(
         config, fake_llm, event_repo, vector_store,
-        enrichment_skill, object_timeline_repo=obj_repo,
+        enrichment_skill, role_service=role_service,
     )
     boundary_skill = BoundaryDetectionSkill(fake_llm, config)
     metabolism = MetabolismService(config, meta_repo, boundary_skill, event_service)
     pipeline = REMSPipeline(
         config=config, llm=fake_llm, db=db,
-        event_repo=event_repo, role_repo=None, meta_repo=meta_repo,
-        event_service=event_service, role_service=None,
+        event_repo=event_repo, role_repo=role_repo, meta_repo=meta_repo,
+        event_service=event_service, role_service=role_service,
         metabolism_service=metabolism,
         belief_revision_service=None,
-        object_timeline_repo=obj_repo, stored_marks_repo=marks_repo,
+        stored_marks_repo=marks_repo,
     )
-    return pipeline, event_repo, obj_repo, marks_repo
+    return pipeline, event_repo, role_repo, marks_repo
 
 
 class TestIngestBatch:
     def test_single_event_with_objects(
         self, memory_pipeline, fake_llm: FakeLLM
     ):
-        pipeline, event_repo, obj_repo, marks_repo = memory_pipeline
+        pipeline, event_repo, role_repo, marks_repo = memory_pipeline
         fake_llm.push_response({
             "completed_events": [{"content_raw_indices": [1], "continuation_of": None}],
             "new_unclosed_indices": [],
@@ -66,7 +70,12 @@ class TestIngestBatch:
         fake_llm.push_response({
             "summaries": {"L1": "匠石看到了美丽的落日。"},
             "emotion": {"joy": 0.8},
-            "objects": [{"name": "阿明", "summary": "阿明与匠石一起看落日。"}],
+            "objects": [{
+                "name": "阿明",
+                "l1_mention": "阿明与匠石一起看落日。",
+                "l2_interaction": "阿明陪匠石在海边看落日。",
+                "l3_decision": "阿明决定陪匠石看落日。",
+            }],
             "location": "海边",
         })
 
@@ -100,17 +109,23 @@ class TestIngestBatch:
         subjects = [r for r in ev.role_list if r.is_subject]
         assert len(subjects) == 1
         assert subjects[0].role_id == "jshi-1"
-        assert any(r.role_id == "OBJ-AMING" and not r.is_subject for r in ev.role_list)
+        obj_entry = next(r for r in ev.role_list if r.role_id == "OBJ-AMING" and not r.is_subject)
+        assert obj_entry.role_snapshot.l1_mention == "阿明与匠石一起看落日。"
+        assert obj_entry.role_snapshot.l2_interaction == "阿明陪匠石在海边看落日。"
+        assert obj_entry.role_snapshot.l3_decision == "阿明决定陪匠石看落日。"
 
-        entries = obj_repo.list_by_event(ev.event_id)
-        assert len(entries) == 1
-        assert entries[0].object_id == "OBJ-AMING"
-        assert entries[0].name == "阿明"
-        assert entries[0].subject_id == "jshi-1"
+        # 白描（white_painting_entries）：匠石对对象的分级白描，事件关联，无情感
+        wps = role_repo.get_white_painting("OBJ-AMING")
+        assert len(wps) == 1
+        assert wps[0].event_id == ev.event_id
+        assert wps[0].subject_id == "jshi-1"
+        assert wps[0].l1_mention == "阿明与匠石一起看落日。"
+        assert wps[0].l2_interaction == "阿明陪匠石在海边看落日。"
+        assert wps[0].role_summary == "阿明陪匠石在海边看落日。"
         assert marks_repo.get("seg-001") == [ev.event_id]
 
     def test_subject_memory_no_objects(self, memory_pipeline, fake_llm: FakeLLM):
-        pipeline, event_repo, obj_repo, _ = memory_pipeline
+        pipeline, event_repo, role_repo, _ = memory_pipeline
         fake_llm.push_response({
             "completed_events": [{"content_raw_indices": [1], "continuation_of": None}],
             "new_unclosed_indices": [],
@@ -137,7 +152,8 @@ class TestIngestBatch:
         assert ev is not None
         assert len(ev.role_list) == 1 and ev.role_list[0].is_subject
         assert ev.emotion is not None and ev.emotion.emotion.joy == pytest.approx(0.3)
-        assert obj_repo.list_by_event(ev.event_id) == []
+        # 主体不写对象白描
+        assert role_repo.get_white_painting("jshi-1") == []
         assert result.role_ids == []
         assert result.stored_marks == {"seg-002": result.sealed_event_ids}
 

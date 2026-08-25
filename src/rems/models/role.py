@@ -25,8 +25,13 @@ class WhitePaintingEntry(BaseModel):
     按 ``create_time`` 升序浏览即得行为与情感演变轨迹（白皮书 2.2）。``memory_weight`` 承载 arousal 映射后的抗遗忘强度。
     """
 
-    event_id: str  # 来源基本事件，便于溯源。
+    subject_id: str = ""  # 记忆主体（匠石）作用域。
+    event_id: str  # 来源基本事件，便于溯源（白描 ↔ 事件关系）。
     role_summary: str  # 该角色在此事件中的白描摘要（多取 L2 互动层）。
+    # 匠石视角的分级白描（design/610）：L1 提及 / L2 互动 / L3 决策意图。
+    l1_mention: str | None = None
+    l2_interaction: str | None = None
+    l3_decision: str | None = None
     emotional_model: EmotionalModel = Field(default_factory=EmotionalModel)
     importance: Importance = Importance.C
     create_time: datetime = Field(default_factory=datetime.now)

@@ -69,7 +69,7 @@
 - `storage/database.py`：表定义与迁移（删抽象表、加 subject_id / stored_marks / object_memory_entries / emotion / location）；
 - `storage/repository.py`：EventRepository 按 subject_id；对象时间线仓储；stored_marks 仓储；删除 recall_log / abstracted 仓储；
 - `storage/vector_store.py` / `qdrant_store.py`：占位（不调用）；
-- 删除 white_painting_entries 相关写入。
+- white_painting_entries：恢复写入——匠石对对象的分级白描（l1/l2/l3，事件关联，无情感、无等级）。
 
 ## 2. 原因
 
