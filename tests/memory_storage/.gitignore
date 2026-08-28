@@ -1,2 +1,5 @@
+memory_storage_test.db
+qdrant_test/
+run_reports/
 _selfcheck/
 _archive*/
