@@ -31,6 +31,15 @@ from .role_service import RoleService
 logger = logging.getLogger(__name__)
 
 
+def initial_forgetting_factor(activation_energy: float, gain: float = 2.0) -> float:
+    """Map event activation energy (0..1) to an initial forgetting factor.
+
+    Neutral activation 0.5 maps to 1.0; high arousal is harder to forget.
+    """
+    activation = min(max(float(activation_energy), 0.0), 1.0)
+    return 2.0 ** (gain * (activation - 0.5))
+
+
 class EventService:
     """Orchestrates the full lifecycle of a Basic Event:
 
@@ -275,6 +284,14 @@ class EventService:
                 self._emotion_evolver.evolve_event(event)
             except Exception:
                 logger.debug("EMA evolution skipped due to error", exc_info=True)
+
+        # design/1010：arousal → 初始记忆强度（遗忘因子）。
+        # 用 EMA 演化后的最终 activation_energy；中性 0.5 → 1.0。
+        if memory_mode:
+            event.forgetting_factor = initial_forgetting_factor(
+                event.activation_energy,
+                gain=self._config.recall_activation_gain,
+            )
 
         # §4.7.3 PTSD 免死金牌
         threshold = self._config.lifecycle.ptsd_arousal_threshold

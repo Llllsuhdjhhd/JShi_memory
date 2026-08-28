@@ -954,9 +954,16 @@ def run_ingest(
     report_path.write_text(report, encoding="utf-8")
 
     if args.db is None:
-        # 仅默认主测试库摄入时标记，自检（--db）不污染对话状态
-        mark_ingested(conv_path, all_turns, run_id)
-        print(f"已标记本轮 {len(turns)} 轮为已摄入（ingested_run={run_id}）")
+        # 仅默认主测试库摄入且无错误时标记；失败不标记，修复后可重跑，
+        # 避免 ingest 失败把轮次标记成已摄入（自检 --db 不污染对话状态）。
+        if not result.errors:
+            mark_ingested(conv_path, all_turns, run_id)
+            print(f"已标记本轮 {len(turns)} 轮为已摄入（ingested_run={run_id}）")
+        else:
+            print(
+                f"ingest 有错误（{len(result.errors)} 条），本轮未标记 ingested_run，"
+                "修复后可重跑。"
+            )
 
     # 控制台摘要
     print()

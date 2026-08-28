@@ -44,6 +44,20 @@ class MemoryExperience(BaseModel):
     )
     origin: str = Field(default="external", description="external | internal | dream")
 
+    sub_segments: list[SubSegment] = Field(
+        default_factory=list,
+        description="整批合并时的段级记录（segment_id + 原文 + 对象映射），"
+        "供封存事件按内容归属对象，避免整批对象并集串扰。",
+    )
+
+
+class SubSegment(BaseModel):
+    """合并批次中的一段原始经历（用于事件→段归属，进而确定事件对象）。"""
+
+    segment_id: str
+    text: str
+    objects: dict[str, str] = Field(default_factory=dict)
+
 
 class MemoryBatch(BaseModel):
     """一次写入请求：一条或多条经历（有序：对话 / 经历先后顺序）。"""

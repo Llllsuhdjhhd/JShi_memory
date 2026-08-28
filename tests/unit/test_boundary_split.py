@@ -403,3 +403,38 @@ class TestMetabolismServiceSplitFlow:
         assert len(ues) == 1
         assert ues[0].oversized
         assert ues[0].total_length > force_threshold
+
+
+class TestParseResponseRangeIndices:
+    """边界检测模型对超长输入会用区间压缩索引（[[start, end]]），解析必须展开。"""
+
+    def test_completed_range_and_unclosed_mixed(self, config, fake_llm):
+        skill = BoundaryDetectionSkill(fake_llm, config)
+        data = {
+            "completed_events": [
+                {"content_raw_indices": [[4, 6]], "continuation_of": None}
+            ],
+            "new_unclosed": [
+                {"indices": [[1, 2], 3], "split_id": None}
+            ],
+        }
+        sentences = ["a", "b", "c", "d", "e", "f", "g"]
+        result = skill.parse_response(data, sentences, shadow_count=0)
+
+        assert len(result.completed_events) == 1
+        assert result.completed_events[0].content_raw == "d\ne\nf"
+        assert len(result.new_unclosed) == 1
+        assert result.new_unclosed[0].content == "a\nb\nc"
+
+    def test_continuation_strips_shadow_ranges(self, config, fake_llm):
+        skill = BoundaryDetectionSkill(fake_llm, config)
+        data = {
+            "completed_events": [
+                {"content_raw_indices": [[1, 5]], "continuation_of": "UC-1"}
+            ],
+            "new_unclosed": [],
+        }
+        sentences = ["s1", "s2", "s3", "n1", "n2"]
+        result = skill.parse_response(data, sentences, shadow_count=3)
+        assert len(result.completed_events) == 1
+        assert result.completed_events[0].content_raw == "n1\nn2"

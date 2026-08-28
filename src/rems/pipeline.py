@@ -13,7 +13,13 @@ import logging
 from .config import REMSConfig
 from .llm.provider import LLMProvider
 from .models.event import Event
-from .port import BackendIngestResult, MemoryBatch, MemoryExperience, RecalledFragment
+from .port import (
+    BackendIngestResult,
+    MemoryBatch,
+    MemoryExperience,
+    RecalledFragment,
+    SubSegment,
+)
 from .recall import (
     BgeReranker,
     HashEmbedding,
@@ -22,6 +28,7 @@ from .recall import (
     RecallPipeline,
     SentenceTransformerEmbedding,
 )
+from .recall.intent import RuleIntentClassifier
 from .utils.text import segment_sentences
 from .services.belief_revision_service import BeliefRevisionService
 from .services.emotion_service import EMAEvolver
@@ -107,12 +114,26 @@ class REMSPipeline:
         )
         # reranker 默认 Null（纯 RRF）；启用时换 BgeReranker（见配置项，后续接入）。
         reranker: BgeReranker | NullReranker = NullReranker()
+        intent_classifier = RuleIntentClassifier(
+            entity_lexicon=config.recall_intent_entity_lexicon,
+            emotion_lexicon=config.recall_intent_emotion_lexicon,
+            fact_lexicon=config.recall_intent_fact_lexicon,
+        )
         recall_pipeline = RecallPipeline(
             embedding,
             vector_store,
             event_repo,
             object_timeline_repo,
             reranker=reranker,
+            intent_classifier=intent_classifier,
+            rrf_k=config.recall_rrf_k,
+            reinforce_multiplier=config.recall_reinforce_multiplier,
+            reinforce_cap=config.recall_forgetting_factor_cap,
+            recency_enabled=config.recall_recency_enabled,
+            recency_window_events=config.recall_recency_window_events,
+            recency_top_k=config.recall_recency_top_k,
+            factor_alpha=config.recall_factor_alpha,
+            mood_beta=config.recall_mood_beta,
         )
 
         # ---- 技能与领域服务 ----
@@ -184,9 +205,17 @@ class REMSPipeline:
             combined_text = "\n\n".join(e.text for e in valid)
             merged_objects: dict[str, str] = {}
             merged_sources: list[str] = []
+            sub_segments: list[SubSegment] = []
             for e in valid:
                 merged_objects.update(e.objects)
                 merged_sources.extend(e.source_ids)
+                sub_segments.append(
+                    SubSegment(
+                        segment_id=e.segment_id or f"seg-{len(sub_segments)+1:03d}",
+                        text=e.text,
+                        objects=dict(e.objects),
+                    )
+                )
             memory = MemoryExperience(
                 subject_id=batch.subject_id,
                 text=combined_text,
@@ -194,6 +223,7 @@ class REMSPipeline:
                 source_ids=tuple(merged_sources),
                 segment_id="+".join(e.segment_id for e in valid),
                 origin=valid[0].origin,
+                sub_segments=sub_segments,
             )
             try:
                 sealed = self.metabolism_service.process_input(

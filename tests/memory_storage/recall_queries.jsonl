@@ -1,0 +1,13 @@
+{"query": "新开分支测试记忆存储", "expected": ["EVT-6f32e5f4eb3d405fbdd1144f8ebd996e"], "note": "分支创建"}
+{"query": "测试程序子目录数据库落库怎么包装输入", "expected": ["EVT-ffe13023d92644f2b36abe4d9226b4b8"], "note": "测试程序搭建"}
+{"query": "每轮对话要做的两件独立的事是什么", "expected": ["EVT-1cf966b12fba46fbae61c345c7d1fafd"], "note": "测试规则"}
+{"query": "整批合并格式分隔续写去重", "expected": ["EVT-e8f99c25636847f89852e25eb5997ae5"], "note": "四项修复"}
+{"query": "真实ingest边界调用次数从几次降到几次", "expected": ["EVT-00f33beb4b2340c28fb028a7616db17a"], "note": "真实测试验证"}
+{"query": "deepseek最近关于不清库累积测试说了什么", "expected": ["EVT-bc247b0669e94c34927bfcf4514ae107"], "objects": ["OBJ-DEEPSEEK"], "note": "对象+近因"}
+{"query": "white_painting_entries 分级白描方案", "expected": ["EVT-a5a67d6da965485da473cf8f5b769a3b"], "note": "白描方案"}
+{"query": "事件对象遗忘因子和回忆是什么关系", "expected": ["EVT-60fc0a29daba4734a7d276581c21f969"], "note": "回忆关系"}
+{"query": "推荐用什么方式做回忆", "expected": ["EVT-60fc0a29daba4734a7d276581c21f969"], "note": "方案推荐"}
+{"query": "跑一下测试最近几轮不清库", "expected": ["EVT-bc247b0669e94c34927bfcf4514ae107"], "note": "累积流程"}
+{"query": "陈姐 方案 否定 心情", "expected": ["EVT-3ba2c3c0fbcf4082b73f802f988740c3"], "objects": ["OBJ-CHENJIE"], "note": "模拟-评审被否"}
+{"query": "西湖 阿明 demo 笔记本", "expected": ["EVT-3ba2c3c0fbcf4082b73f802f988740c3"], "objects": ["OBJ-AMING"], "note": "模拟-西湖回忆"}
+{"query": "杭州 阿明 高铁 天气", "expected": ["EVT-22e723ec5bef4120b0d5c0cbc588209e"], "objects": ["OBJ-AMING"], "note": "模拟-杭州赴约"}

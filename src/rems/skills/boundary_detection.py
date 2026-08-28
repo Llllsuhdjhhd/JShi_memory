@@ -14,7 +14,12 @@ from ..config import REMSConfig
 from ..llm.provider import LLMProvider
 from ..llm.prompts import BOUNDARY_SYSTEM, BOUNDARY_USER, build_user_mode_block
 from ..models.metabolism import UnclosedEvent
-from ..utils.text import segment_sentences, format_indexed_text, decode_indices
+from ..utils.text import (
+    segment_sentences,
+    format_indexed_text,
+    decode_indices,
+    normalize_indices,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -103,12 +108,7 @@ class BoundaryDetectionSkill:
             indices = item.get("indices")
             if not isinstance(indices, list):
                 continue
-            norm_idx: list[int] = []
-            for v in indices:
-                if isinstance(v, bool):
-                    continue
-                if isinstance(v, (int, float)):
-                    norm_idx.append(int(v))
+            norm_idx: list[int] = normalize_indices(indices)
             if not norm_idx:
                 continue
             content = decode_indices(sentences, norm_idx)
@@ -199,7 +199,7 @@ class BoundaryDetectionSkill:
         for item in data.get("completed_events", []):
             if not isinstance(item, dict):
                 continue
-            indices = item.get("content_raw_indices", [])
+            indices = normalize_indices(item.get("content_raw_indices", []))
             continuation_of = item.get("continuation_of")
             # 续写去重：命中 continuation_of 时，旧残影内容由后端合并 UC 自动补上；
             # 这里剥掉落在旧残影区间内的句子索引，避免 ue.merged_content + 片段重复。

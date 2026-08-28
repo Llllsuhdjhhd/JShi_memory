@@ -233,6 +233,9 @@ class REMSConfig(BaseSettings):
 
     # 情绪唤醒度映射遗忘因子的幂指数：base_forgetting_factor = 100 * arousal ** gamma。
     emotion_arousal_gamma: float = 2.0
+    # 事件 activation_energy → 初始遗忘因子：factor = 2 ** (gain * (activation - 0.5))。
+    # 中性 0.5 → 1.0；高唤醒 > 1（更难遗忘）；低唤醒 < 1（更快衰减）。测量后校准。
+    recall_activation_gain: float = 2.0
 
     # 白描时间线遗忘半衰期（天）。
     wp_half_life_days: float = 60.0
@@ -366,8 +369,10 @@ class REMSConfig(BaseSettings):
     recall_rrf_k: int = 60
     recall_factor_alpha: float = 0.5
     recall_mood_beta: float = 0.2
-    recall_reinforce_multiplier: float = 1.5
-    recall_forgetting_factor_cap: float = 300.0
+    # 回忆命中强化：温和增长（1.15x），避免指数累积把事件推向"永生"；
+    # 上限 3.0 保持强度可区分但有限（原 1.5x/300 会让高频命中事件永不遗忘）。
+    recall_reinforce_multiplier: float = 1.15
+    recall_forgetting_factor_cap: float = 3.0
 
     # ---- White-painting collection tier (白皮书 2.3 动态粒度路由·收集端) ----
     # 白描收集时对主要角色（S/A 或单人核心用户）落盘的默认档位字段：l3_decision / l2_interaction / l1_mention。

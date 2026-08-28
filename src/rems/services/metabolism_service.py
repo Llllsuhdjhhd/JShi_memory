@@ -17,6 +17,7 @@ from ..models.metabolism import Shadow, UnclosedEvent
 from ..models.role import Role
 from ..port import MemoryExperience
 from ..services.event_service import EventService
+from ..utils.text import segment_text_hits
 from ..skills.boundary_detection import BoundaryDetectionSkill, BoundaryResult
 from ..skills.shadow_compaction import ShadowCompactionSkill
 from ..skills.boundary_split import (
@@ -29,6 +30,22 @@ from ..skills.evaluation import SkillEvaluator, SkillRemediator, run_skill_with_
 from ..storage.repository import EventRepository, MetabolismRepository
 
 logger = logging.getLogger(__name__)
+
+
+def _objects_for_event(
+    content: str | None, memory: MemoryExperience | None
+) -> dict[str, str]:
+    """整批合并时按事件内容归属对象：命中子段的对象并集，未命中回退全批对象池。"""
+    if memory is None:
+        return {}
+    subs = getattr(memory, "sub_segments", None)
+    if not content or not subs:
+        return dict(memory.objects or {})
+    hits: dict[str, str] = {}
+    for sub in subs:
+        if segment_text_hits(sub.text or "", content):
+            hits.update(sub.objects)
+    return hits or dict(memory.objects or {})
 
 
 class MetabolismService:
@@ -276,6 +293,7 @@ class MetabolismService:
                 split_prefix_event_ids=inherited_prefix_chain or None,
                 **self._seal_memory_kwargs(
                     memory,
+                    content=content,
                     input_id=input_id,
                     known_roles_hint=known_roles_hint,
                     pre_role_entries=pre_role_entries,
@@ -371,6 +389,7 @@ class MetabolismService:
                 is_suspicious=is_suspicious,
                 **self._seal_memory_kwargs(
                     memory,
+                    content=combined,
                     input_id=input_id,
                     known_roles_hint=known_roles_hint,
                     pre_role_entries=pre_role_entries,
@@ -386,6 +405,7 @@ class MetabolismService:
                     split_prefix_event_ids=list(ue.split_prefix_event_ids or []) or None,
                     **self._seal_memory_kwargs(
                         memory,
+                        content=ue.merged_content,
                         input_id=input_id,
                         known_roles_hint=known_roles_hint,
                         pre_role_entries=pre_role_entries,
@@ -411,16 +431,22 @@ class MetabolismService:
     def _seal_memory_kwargs(
         memory: MemoryExperience | None,
         *,
+        content: str | None = None,
         input_id: str | None,
         known_roles_hint: list[Role] | None,
         pre_role_entries: list[EventRoleEntry] | None,
     ) -> dict:
-        """记忆路径（memory 非 None）传主体/对象/来源/时间/origin；旧路径传角色提示。"""
+        """记忆路径（memory 非 None）传主体/对象/来源/时间/origin；旧路径传角色提示。
+
+        整批合并时按 ``content`` 与各子段的重叠归属对象，避免整批对象并集串扰；
+        未匹配到子段时回退到全批对象池（保持旧行为兼容）。
+        """
         if memory is not None:
+            objects = _objects_for_event(content, memory)
             return {
                 "input_id": memory.segment_id,
                 "subject_id": memory.subject_id,
-                "objects": memory.objects,
+                "objects": objects,
                 "source_ids": memory.source_ids,
                 "occurred_at": memory.occurred_at,
                 "origin": memory.origin,

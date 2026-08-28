@@ -10,6 +10,7 @@ from ..models.event import Event
 from ..port import RecalledFragment
 from ..storage.repository import EventRepository, ObjectTimelineRepository
 from ..utils.zh_normalize import normalize_for_substring_match as _norm
+from .intent import RecallIntent, RuleIntentClassifier
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +50,12 @@ class RecallPipeline:
         silence_threshold: float = 0.02,
         reinforce_multiplier: float = 1.5,
         reinforce_cap: float = 300.0,
+        intent_classifier: RuleIntentClassifier | None = None,
+        recency_enabled: bool = False,
+        recency_window_events: int = 80,
+        recency_top_k: int = 40,
+        factor_alpha: float = 0.5,
+        mood_beta: float = 0.2,
     ):
         self._embedding = embedding
         self._vector_store = vector_store
@@ -62,6 +69,12 @@ class RecallPipeline:
         self._silence_threshold = silence_threshold
         self._reinforce_multiplier = reinforce_multiplier
         self._reinforce_cap = reinforce_cap
+        self._intent_classifier = intent_classifier
+        self._recency_enabled = recency_enabled
+        self._recency_window_events = recency_window_events
+        self._recency_top_k = recency_top_k
+        self._factor_alpha = factor_alpha
+        self._mood_beta = mood_beta
 
     # ------------------------------------------------------------------
     def recall(
@@ -73,11 +86,20 @@ class RecallPipeline:
         level: int = 1,
         limit: int | None = None,
         anchor_event_ids: tuple[str, ...] = (),
+        channels: tuple[str, ...] | None = None,
+        reinforce: bool = True,
     ) -> tuple[RecalledFragment, ...]:
         """实现 MemoryBackendPort.recall（只读 + 记忆恢复）。"""
         q = _norm((query or "").strip())
         if not q:
             return ()
+
+        # 查询理解（规则版）：对象 / 情绪 / 近因 / 事实意图
+        intent: RecallIntent | None = None
+        if self._intent_classifier is not None:
+            intent = self._intent_classifier.classify(q)
+            if not object_id and intent.object_id:
+                object_id = intent.object_id
 
         events = self._candidate_events(subject_id)
         if not events:
@@ -86,13 +108,17 @@ class RecallPipeline:
         # 多路召回：语义 / 词法 / 对象 / 时间 / 锚点
         semantic_ids = self._semantic_route(subject_id, q, object_id=object_id)
         lexical_scores = self._lexical_scores(q, events)
-        object_ids = self._object_route(subject_id, object_id)
+        object_ids = self._object_route(subject_id, object_id, events)
+        recency_scores = self._recency_route(events) if self._recency_enabled else {}
         anchor_ids = set(anchor_event_ids or ())
         for eid in anchor_event_ids:
             ev = self._event_repo.get(eid)
             if ev is not None:
                 anchor_ids.update(ev.split_prefix_event_ids or [])
 
+        active = set(channels) if channels else {
+            "semantic", "lexical", "object", "recency", "anchor",
+        }
         now = datetime.now()
         scores: dict[str, float] = {}
         for ev in events:
@@ -100,18 +126,20 @@ class RecallPipeline:
             if eff < self._silence_threshold:
                 continue
             rrf = 0.0
-            if ev.event_id in semantic_ids:
+            if "semantic" in active and ev.event_id in semantic_ids:
                 rrf += 1.0 / (self._rrf_k + semantic_ids[ev.event_id])
-            if ev.event_id in lexical_scores:
+            if "lexical" in active and ev.event_id in lexical_scores:
                 rrf += 1.0 / (self._rrf_k + lexical_scores[ev.event_id])
-            if ev.event_id in object_ids:
+            if "object" in active and ev.event_id in object_ids:
                 rrf += 1.0 / (self._rrf_k + object_ids[ev.event_id])
-            if ev.event_id in anchor_ids:
+            if "recency" in active and ev.event_id in recency_scores:
+                rrf += 1.0 / (self._rrf_k + recency_scores[ev.event_id])
+            if "anchor" in active and ev.event_id in anchor_ids:
                 rrf += 1.0 / (self._rrf_k + 1)
             if rrf <= 0:
                 continue
-            score = rrf * math.sqrt(eff)
-            score *= self._emotion_modifier(q, ev)
+            score = rrf * (eff ** self._factor_alpha)
+            score *= self._emotion_modifier(q, ev, intent=intent)
             scores[ev.event_id] = score
 
         if not scores:
@@ -147,8 +175,9 @@ class RecallPipeline:
                 score=round(sc, 6),
                 summary_level=summary_level,
             ))
-            # 记忆恢复：命中事件强化遗忘因子（唯一写操作）
-            self._reinforce(ev)
+            # 记忆恢复：命中事件强化遗忘因子（唯一写操作；recall_test 可关）
+            if reinforce:
+                self._reinforce(ev)
             if limit is not None and len(fragments) >= limit:
                 break
         return tuple(fragments)
@@ -198,32 +227,78 @@ class RecallPipeline:
         if not qb:
             return {}
         scored = [
-            (ev.event_id, len(qb & self._bigrams(ev.content_raw + " " + (ev.summaries.get("L1") or ""))))
+            (
+                ev.event_id,
+                self._bigram_jaccard(
+                    qb,
+                    self._bigrams(ev.content_raw + " " + (ev.summaries.get("L1") or "")),
+                ),
+            )
             for ev in events
         ]
         scored = [(eid, n) for eid, n in scored if n > 0]
         scored.sort(key=lambda kv: kv[1], reverse=True)
         return {eid: idx + 1 for idx, (eid, _) in enumerate(scored)}
 
-    def _object_route(self, subject_id: str, object_id: str | None) -> dict[str, int]:
-        if not object_id or self._object_timeline_repo is None:
+    @staticmethod
+    def _bigram_jaccard(a: set[str], b: set[str]) -> float:
+        """Bigram Jaccard：命中数 / 并集数，压制长摘要/长原文的天然优势。"""
+        if not a or not b:
+            return 0.0
+        inter = len(a & b)
+        union = len(a | b)
+        return inter / union if union else 0.0
+
+    def _object_route(
+        self, subject_id: str, object_id: str | None, events: list[Event] | None = None
+    ) -> dict[str, int]:
+        """Object route: resolve from candidate events' role_list first (memory mode
+        main path after white-painting migration), fall back to the legacy
+        object_timeline table for role-system era data."""
+        if not object_id:
             return {}
-        entries = self._object_timeline_repo.list_by_object(subject_id, object_id)
-        return {e.event_id: idx + 1 for idx, e in enumerate(entries)}
+        if events is None:
+            events = self._candidate_events(subject_id)
+        hits = [ev for ev in events if any(r.role_id == object_id for r in ev.role_list)]
+        if hits:
+            return {ev.event_id: idx + 1 for idx, ev in enumerate(hits)}
+        if self._object_timeline_repo is not None:
+            entries = self._object_timeline_repo.list_by_object(subject_id, object_id)
+            if entries:
+                return {e.event_id: idx + 1 for idx, e in enumerate(entries)}
+        return {}
+
+    def _recency_route(self, events: list[Event]) -> dict[str, int]:
+        """近因通道：窗口内按 create_time 降序给 RRF 排名（design/1010 §3）。"""
+        if not events:
+            return {}
+        window = max(1, self._recency_window_events)
+        k = max(1, self._recency_top_k)
+        ordered = sorted(events, key=lambda ev: ev.create_time, reverse=True)[:window]
+        return {ev.event_id: idx + 1 for idx, ev in enumerate(ordered[:k])}
 
     def _effective_factor(self, ev: Event, now: datetime) -> float:
         age_days = max((now - ev.create_time).total_seconds() / 86400.0, 0.0)
         decay = 0.5 ** (age_days / self._half_life_days)
         return float(getattr(ev, "forgetting_factor", 1.0) or 1.0) * decay
 
-    def _emotion_modifier(self, query: str, ev: Event) -> float:
-        q = _norm(query)
-        want_pos = any(w in q for w in _EMOTION_LEXICON["positive"])
-        want_neg = any(w in q for w in _EMOTION_LEXICON["negative"])
-        if (not want_pos and not want_neg) or ev.emotion is None:
+    def _emotion_modifier(
+        self, query: str, ev: Event, intent: RecallIntent | None = None,
+    ) -> float:
+        if ev.emotion is None:
+            return 1.0
+        if intent is not None and intent.emotion:
+            want_pos = intent.emotion == "positive"
+            want_neg = intent.emotion == "negative"
+        else:
+            q = _norm(query)
+            want_pos = any(w in q for w in _EMOTION_LEXICON["positive"])
+            want_neg = any(w in q for w in _EMOTION_LEXICON["negative"])
+        if not want_pos and not want_neg:
             return 1.0
         ev_pos = ev.emotion.valence > 0
-        return 1.25 if (want_pos and ev_pos) or (want_neg and not ev_pos) else 0.9
+        match = (want_pos and ev_pos) or (want_neg and not ev_pos)
+        return 1.0 + self._mood_beta if match else 1.0 - self._mood_beta
 
     def _select_summary(self, ev: Event, level: int) -> tuple[str, str | None]:
         key = f"L{max(1, level)}"
