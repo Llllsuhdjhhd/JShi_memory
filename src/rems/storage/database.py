@@ -197,6 +197,39 @@ class RecallTraceRecord(Base):
     n_items = Column(Integer, default=0)
 
 
+class PortraitRecord(Base):
+    """per-object 人物肖像：10 级渐进人物摘要（design/1010 §8.4 portrait）。"""
+
+    __tablename__ = "object_portraits"
+
+    subject_id = Column(String, default="", index=True)
+    object_id = Column(String, primary_key=True)
+    name = Column(String, nullable=True)
+    # {"L1": {"level","text","budget","actual_len"}, ...}
+    levels = Column(JSON, default=dict)
+    max_level = Column(String, default="")
+    total_content_len = Column(Integer, default=0)
+    compression_ratio = Column(Float, default=0.0)
+    fatigue = Column(Float, default=1.0)
+    created_at = Column(DateTime, nullable=False)
+    updated_at = Column(DateTime, nullable=False)
+
+
+class PortraitSummaryRecord(Base):
+    """一条对象人物摘要（待并入或已并入肖像；全量重建用全部，增量用最长级+未并入）。"""
+
+    __tablename__ = "portrait_summaries"
+
+    summary_id = Column(String, primary_key=True)
+    subject_id = Column(String, default="", index=True)
+    object_id = Column(String, nullable=False, index=True)
+    text = Column(Text, nullable=False)
+    source_event_id = Column(String, nullable=True)
+    weight = Column(Float, default=0.5)
+    incorporated = Column(Boolean, default=False)
+    created_at = Column(DateTime, nullable=False)
+
+
 # ------------------------------------------------------------------
 # Database facade
 # ------------------------------------------------------------------

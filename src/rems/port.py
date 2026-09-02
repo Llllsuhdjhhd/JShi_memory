@@ -165,6 +165,8 @@ class MemoryBackendPort(Protocol):
         anchor_event_ids: tuple[str, ...] = (),
     ) -> tuple[RecalledFragment, ...]: ...
 
+    def portrait(self, subject_id: str, object_id: str) -> dict | None: ...
+
     def consolidate(
         self,
         subject_id: str,

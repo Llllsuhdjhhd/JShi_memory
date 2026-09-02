@@ -70,6 +70,7 @@ class RecallPipeline:
         object_affinity_enabled: bool = True,
         object_affinity_boost: float = 1.15,
         object_affinity_penalty: float = 0.90,
+        event_fatigue: float = 1.0,
     ):
         self._embedding = embedding
         self._vector_store = vector_store
@@ -93,6 +94,8 @@ class RecallPipeline:
         self._object_affinity_enabled = object_affinity_enabled
         self._object_affinity_boost = object_affinity_boost
         self._object_affinity_penalty = object_affinity_penalty
+        # 事件记忆疲态：与遗忘率协同（乘进 effective factor）；<1 时更快"忘记"。
+        self._event_fatigue = event_fatigue
 
     # ------------------------------------------------------------------
     def recall(
@@ -302,7 +305,8 @@ class RecallPipeline:
     def _effective_factor(self, ev: Event, now: datetime) -> float:
         age_days = max((now - ev.create_time).total_seconds() / 86400.0, 0.0)
         decay = 0.5 ** (age_days / self._half_life_days)
-        return float(getattr(ev, "forgetting_factor", 1.0) or 1.0) * decay
+        # 记忆疲态与遗忘率协同：effective = event_fatigue × forgetting_factor × 时间衰减。
+        return self._event_fatigue * float(getattr(ev, "forgetting_factor", 1.0) or 1.0) * decay
 
     def _emotion_modifier(
         self, query: str, ev: Event, intent: RecallIntent | None = None,

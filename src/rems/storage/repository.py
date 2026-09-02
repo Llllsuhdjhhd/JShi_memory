@@ -10,11 +10,14 @@ from ..models.object_entry import ObjectMemoryEntry
 from ..models.role import Role, WhitePaintingEntry
 from datetime import datetime
 
+from ..models.portrait import ObjectPortrait, PendingPortraitSummary, PortraitLevelInfo
 from ..port import RecallTrace
 from .database import (
     Database,
     EventRecord,
     ObjectMemoryEntryRecord,
+    PortraitRecord,
+    PortraitSummaryRecord,
     RecallTraceRecord,
     RoleRecord,
     ShadowRecord,
@@ -725,3 +728,106 @@ class RecallTraceRepository:
             "items": list(r.items or []),
             "n_items": int(r.n_items or 0),
         }
+
+
+# =====================================================================
+# 人物肖像（design/1010 §8.4 portrait）：ObjectPortrait + portrait_summaries
+# =====================================================================
+
+class PortraitRepository:
+    """object_portraits / portrait_summaries 读写。
+
+    一张肖像一张表（object_id 主键，单主体）；人物摘要表存全部（含已并入），
+    ``incorporated`` 标记是否已并入肖像，便于增量（最长级 + 未并入）与全量（全部）两种压缩方式。
+    """
+
+    def __init__(self, db: Database):
+        self._db = db
+
+    # ---- portrait ----
+    def save_portrait(self, p: ObjectPortrait) -> None:
+        with self._db.session() as s:
+            r = PortraitRecord(
+                subject_id=p.subject_id,
+                object_id=p.object_id,
+                name=p.name,
+                levels={k: v.model_dump(mode="json") for k, v in p.levels.items()},
+                max_level=p.max_level,
+                total_content_len=p.total_content_len,
+                compression_ratio=p.compression_ratio,
+                fatigue=p.fatigue,
+                created_at=p.created_at,
+                updated_at=p.updated_at,
+            )
+            s.merge(r)
+            s.commit()
+
+    def get_portrait(self, object_id: str) -> ObjectPortrait | None:
+        with self._db.session() as s:
+            r = s.get(PortraitRecord, object_id)
+            return self._to_portrait(r) if r else None
+
+    # ---- summaries ----
+    def add_summary(self, item: PendingPortraitSummary) -> None:
+        with self._db.session() as s:
+            s.merge(PortraitSummaryRecord(
+                summary_id=item.summary_id,
+                object_id=item.object_id,
+                subject_id=item.subject_id,
+                text=item.text,
+                source_event_id=item.source_event_id,
+                weight=item.weight,
+                incorporated=item.incorporated,
+                created_at=item.created_at,
+            ))
+            s.commit()
+
+    def list_summaries(self, object_id: str, *, incorporated: bool | None = None) -> list[PendingPortraitSummary]:
+        with self._db.session() as s:
+            q = s.query(PortraitSummaryRecord).filter(PortraitSummaryRecord.object_id == object_id)
+            if incorporated is not None:
+                q = q.filter(PortraitSummaryRecord.incorporated == incorporated)
+            q = q.order_by(PortraitSummaryRecord.created_at)
+            return [self._to_summary(r) for r in q.all()]
+
+    def mark_incorporated(self, summary_ids: list[str]) -> None:
+        if not summary_ids:
+            return
+        with self._db.session() as s:
+            for sid in summary_ids:
+                r = s.get(PortraitSummaryRecord, sid)
+                if r:
+                    r.incorporated = True
+            s.commit()
+
+    # ---- convert ----
+    @staticmethod
+    def _to_portrait(r: PortraitRecord) -> ObjectPortrait:
+        levels = {}
+        for k, v in (r.levels or {}).items():
+            levels[k] = PortraitLevelInfo(**v)
+        return ObjectPortrait(
+            subject_id=getattr(r, "subject_id", "") or "",
+            object_id=r.object_id,
+            name=r.name,
+            levels=levels,
+            max_level=r.max_level or "",
+            total_content_len=int(r.total_content_len or 0),
+            compression_ratio=float(r.compression_ratio or 0.0),
+            fatigue=float(r.fatigue or 1.0),
+            created_at=r.created_at,
+            updated_at=r.updated_at,
+        )
+
+    @staticmethod
+    def _to_summary(r: PortraitSummaryRecord) -> PendingPortraitSummary:
+        return PendingPortraitSummary(
+            summary_id=r.summary_id,
+            subject_id=getattr(r, "subject_id", "") or "",
+            object_id=r.object_id,
+            text=r.text,
+            source_event_id=r.source_event_id,
+            weight=float(r.weight or 0.5),
+            incorporated=bool(r.incorporated),
+            created_at=r.created_at,
+        )

@@ -37,15 +37,19 @@ from .services.belief_revision_service import BeliefRevisionService
 from .services.emotion_service import EMAEvolver
 from .services.event_service import EventService
 from .services.metabolism_service import MetabolismService
+from .services.portrait_service import PortraitService
+from .services.recall_budget import RecallBudgetManager
 from .services.role_service import RoleService
 from .skills.boundary_detection import BoundaryDetectionSkill
 from .skills.event_enrichment import EventEnrichmentSkill
+from .skills.portrait_compression import PortraitCompressionSkill
 from .skills.role_extraction import RoleExtractionSkill
 from .storage.database import Database
 from .storage.repository import (
     EventRepository,
     MetabolismRepository,
     ObjectTimelineRepository,
+    PortraitRepository,
     RecallTraceRepository,
     RoleRepository,
     StoredMarksRepository,
@@ -75,6 +79,8 @@ class REMSPipeline:
         object_timeline_repo: ObjectTimelineRepository | None = None,
         stored_marks_repo: StoredMarksRepository | None = None,
         recall_trace_repo: RecallTraceRepository | None = None,
+        portrait_service: PortraitService | None = None,
+        recall_budget: RecallBudgetManager | None = None,
     ):
         self.config = config
         self.llm = llm
@@ -90,6 +96,8 @@ class REMSPipeline:
         self.object_timeline_repo = object_timeline_repo
         self.stored_marks_repo = stored_marks_repo
         self.recall_trace_repo = recall_trace_repo
+        self.portrait_service = portrait_service
+        self.recall_budget = recall_budget
 
     # ------------------------------------------------------------------
     @classmethod
@@ -108,6 +116,14 @@ class REMSPipeline:
         object_timeline_repo = ObjectTimelineRepository(db)
         stored_marks_repo = StoredMarksRepository(db)
         recall_trace_repo = RecallTraceRepository(db)
+
+        portrait_service: PortraitService | None = None
+        if config.portrait_enabled:
+            portrait_repo = PortraitRepository(db)
+            portrait_skill = PortraitCompressionSkill(llm, config)
+            portrait_service = PortraitService(config, portrait_repo, portrait_skill)
+
+        recall_budget = RecallBudgetManager(config) if config.recall_budget_enabled else None
 
         # ---- 回忆 provider（插拔式） ----
         if config.embedding.provider == "hash":
@@ -144,6 +160,7 @@ class REMSPipeline:
             object_affinity_enabled=config.recall_object_affinity_enabled,
             object_affinity_boost=config.recall_object_affinity_boost,
             object_affinity_penalty=config.recall_object_affinity_penalty,
+            event_fatigue=config.event_fatigue,
         )
 
         # ---- 技能与领域服务 ----
@@ -191,6 +208,8 @@ class REMSPipeline:
             object_timeline_repo=object_timeline_repo,
             stored_marks_repo=stored_marks_repo,
             recall_trace_repo=recall_trace_repo,
+            portrait_service=portrait_service,
+            recall_budget=recall_budget,
         )
 
     # ------------------------------------------------------------------
@@ -314,6 +333,13 @@ class REMSPipeline:
                     except Exception as exc:  # noqa: BLE001
                         logger.warning("interlocutor save failed for %s: %s", ev.event_id, exc)
 
+                # 人物肖像：interlocutor 已落盘后，为事件涉及的每个对象各生成一条人物摘要（后台/并行，不阻塞 ingest）
+                if self.portrait_service is not None:
+                    try:
+                        self.portrait_service.note_event(ev, self._portrait_objects(ev))
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("portrait note_event %s failed: %s", ev.event_id, exc)
+
             if self.stored_marks_repo is not None:
                 for seg, ids in result.stored_marks.items():
                     try:
@@ -341,7 +367,7 @@ class REMSPipeline:
         limit: int | None = None,
         anchor_event_ids: tuple[str, ...] = (),
     ) -> tuple[RecalledFragment, ...]:
-        """实现 MemoryBackendPort.recall（记忆恢复 + 可选 recall_traces 落库）。"""
+        """实现 MemoryBackendPort.recall（记忆恢复 + 预算管理 + 可选 recall_traces 落库）。"""
         if self.recall_pipeline is None:
             return ()
         fragments = self.recall_pipeline.recall(
@@ -352,6 +378,7 @@ class REMSPipeline:
             limit=limit,
             anchor_event_ids=anchor_event_ids,
         )
+        out = self.apply_recall_budget(subject_id, object_id, fragments)
         self._record_recall_trace(
             subject_id,
             query,
@@ -359,9 +386,108 @@ class REMSPipeline:
             level=level,
             limit=limit,
             anchor_event_ids=anchor_event_ids,
-            fragments=fragments,
+            fragments=out,
         )
-        return fragments
+        return out
+
+    def apply_recall_budget(
+        self,
+        subject_id: str,
+        object_id: str | None,
+        fragments: tuple[RecalledFragment, ...],
+    ) -> tuple[RecalledFragment, ...]:
+        """把回忆条目按 6 级预算贪心分配；对话人（object_id）的人物肖像作为条目同场。
+
+        - 未启用预算（``recall_budget=None``）→ 原样返回；
+        - 启用时：肖像条目（若有）优先，与事件条目一起按评分排序、分档、截断到各自档位字数；
+        - 总字数 ≤ ``recall_budget_chars``（0 => physical_redline）；超限尾部条目丢弃。
+        """
+        if self.recall_budget is None:
+            return fragments
+        items: list[RecalledFragment] = list(fragments)
+        if (
+            self._config.recall_budget_include_portrait
+            and object_id
+            and self.portrait_service is not None
+        ):
+            pfrag = self._make_portrait_fragment(subject_id, object_id)
+            if pfrag is not None:
+                items = [pfrag] + items
+        if not items:
+            return ()
+        selected = self.recall_budget.allocate(items)
+        out: list[RecalledFragment] = []
+        for s in selected:
+            frag = s["fragment"]
+            used = s.get("used") or s["budget"]
+            content = (frag.content or frag.text or "")[:used]
+            out.append(frag.model_copy(update={"content": content, "summary_level": s["level"]}))
+        return tuple(out)
+
+    def assemble_recall_block(
+        self,
+        subject_id: str,
+        query: str,
+        *,
+        object_id: str | None = None,
+        level: int = 1,
+        limit: int | None = None,
+        anchor_event_ids: tuple[str, ...] = (),
+        budget: int | None = None,
+    ) -> dict:
+        """预算受限的回忆块：条目 + 各级文本 + 总长（供上层组装上下文）。"""
+        if self.recall_pipeline is None:
+            return {"items": [], "total_length": 0, "budget": budget}
+        fragments = self.recall_pipeline.recall(
+            subject_id, query, object_id=object_id, level=level, limit=limit, anchor_event_ids=anchor_event_ids,
+        )
+        items: list[RecalledFragment] = list(fragments)
+        if (
+            self._config.recall_budget_include_portrait
+            and object_id and self.portrait_service is not None
+        ):
+            pfrag = self._make_portrait_fragment(subject_id, object_id)
+            if pfrag is not None:
+                items = [pfrag] + items
+        b = budget or (self.recall_budget.budget_chars() if self.recall_budget else None)
+        selected = self.recall_budget.allocate(items, budget=b) if self.recall_budget else [
+            {"fragment": it, "level": it.summary_level or "L1", "budget": len(it.content or it.text or "")}
+            for it in items
+        ]
+        out_items = []
+        total = 0
+        for s in selected:
+            frag = s["fragment"]
+            used = s.get("used") or s["budget"]
+            content = (frag.content or frag.text or "")[: used]
+            total += len(content)
+            out_items.append({
+                "event_id": frag.event_id, "object_id": frag.object_id, "interlocutor": frag.interlocutor,
+                "kind": frag.kind, "level": s["level"], "budget": s["budget"], "used": used,
+                "content": content, "score": frag.score,
+            })
+        return {"items": out_items, "total_length": total, "budget": b}
+
+    def _make_portrait_fragment(self, subject_id: str, object_id: str) -> RecalledFragment | None:
+        """把对话人的人物肖像包装成回忆条目（最高优先）。"""
+        p = self.portrait_service.get_portrait(object_id) if self.portrait_service else None
+        if p is None:
+            return None
+        text = p.longest_level.text if p.longest_level else ""
+        if not text:
+            return None
+        return RecalledFragment(
+            event_id=f"portrait:{object_id}",
+            text=text,
+            content=text,
+            kind="portrait",
+            object_id=object_id,
+            interlocutor=object_id,
+            # 对话人的肖像=核心上下文，优先级高于普通事件条目，保证在预算内优先纳入。
+            score=100.0,
+            summary_level=p.max_level,
+            occurred_at=p.updated_at,
+        )
 
     def _record_recall_trace(
         self,
@@ -412,6 +538,42 @@ class REMSPipeline:
         except Exception as exc:  # noqa: BLE001
             # 观测失败不影响召回结果本身
             logger.warning("recall_trace save failed: %s", exc)
+
+    # ------------------------------------------------------------------
+    # 人物肖像（design/1010 §8.4 portrait）
+    # ------------------------------------------------------------------
+
+    def _portrait_objects(self, ev) -> list[str]:
+        """事件涉及的对象集：interlocutor（说话/互动对象）∪ 非主体 role_list 提及。"""
+        ids: list[str] = []
+        il = getattr(ev, "interlocutor", None)
+        if il:
+            ids.append(il)
+        for re_ in getattr(ev, "role_list", []) or []:
+            if not getattr(re_, "is_subject", False) and getattr(re_, "role_id", None):
+                ids.append(re_.role_id)
+        return list(dict.fromkeys(ids))
+
+    def portrait(self, subject_id: str, object_id: str) -> dict | None:
+        """返回某对象的人物肖像（10 级渐进摘要的最长级 + 概要）。"""
+        if self.portrait_service is None:
+            return None
+        p = self.portrait_service.get_portrait(object_id)
+        if p is None:
+            return None
+        longest = p.longest_level
+        return {
+            "subject_id": p.subject_id,
+            "object_id": p.object_id,
+            "name": p.name,
+            "max_level": p.max_level,
+            "total_content_len": p.total_content_len,
+            "compression_ratio": p.compression_ratio,
+            "fatigue": p.fatigue,
+            "visible_summary": longest.text if longest else "",
+            "levels": {k: v.text for k, v in p.levels.items()},
+            "updated_at": p.updated_at,
+        }
 
     # ------------------------------------------------------------------
     # 便捷方法（API 用）

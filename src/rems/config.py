@@ -176,6 +176,41 @@ class REMSConfig(BaseSettings):
     recall_object_affinity_boost: float = 1.15
     recall_object_affinity_penalty: float = 0.90
 
+    # ---- Portrait（人物肖像：per-object 10 级渐进人物摘要 + 记忆疲态）----
+    # 等级化：L1 = max(portrait_magic_num, 总长 / growth^(max_levels-1)) —— 取较长，保证最短级(L1)
+    #        至少达到魔法数(默认100)、保持有效性；Lk = L1 * growth^(k-1)；
+    # 某级预算 > 总长 即停（该级保留原长度=截到总长），最多 portrait_max_levels 级。
+    # 压缩率 = 汇总原始字数 / 最长一级字数（模型压缩，忽略/简化/调整）。
+    portrait_enabled: bool = True
+    portrait_magic_num: int = 100       # L1 基准魔法数
+    portrait_max_levels: int = 10
+    portrait_growth: float = 2.0        # 每级是上一级倍数
+    # 触发：对象「待画像摘要」累计字数 >= context_window / portrait_trigger_divisor 时执行肖像动作。
+    portrait_trigger_divisor: int = 600
+    # 组合/压缩方式：incremental（已有肖像最长级 + 新摘要 压缩）| full（所有摘要 重建）。
+    # "auto"：当累计总长 ≤ context_window * portrait_full_mode_context_ratio（默认 1/6 上下文）时用 full，
+    #        否则用 incremental（内容多了就不整包重建）。
+    portrait_compose_mode: str = "auto"
+    portrait_full_mode_context_ratio: float = 1.0 / 6.0
+    # 记忆疲态：分成两个值，**不能共用一个**——
+    #   portrait_fatigue：人物肖像摘要，由整体负担 + 对象负担合成（综合）。
+    #   event_fatigue：事件，仅由整体记忆负担决定（不看对象负担）。
+    # 均默认 1（无遗忘）；<1 时按概率让部分内容概率不可见（期望可见占比 ≈ fatigue），保留偶然性。
+    portrait_fatigue: float = 1.0
+    event_fatigue: float = 1.0
+
+    # ---- Recall budget management（回忆预算管理，design/1010 §8.5）----
+    # 预算 = 本次回忆的总字数，与回忆等级相关。回忆分 recall_level_count 级，各级字数递增
+    # (L1=最短=recall_magic_num，之后逐级 ×recall_level_growth，L{count}=最长)。
+    # 分配：条目按(评分)排序，贪心——能装最高级就装最高级，装不下下降级，再装不下丢弃；
+    # 对话人人物肖像作为回忆条目同场参与。总字数 ≤ recall_budget_chars（0 => physical_redline）。
+    recall_budget_enabled: bool = True
+    recall_budget_chars: int = 0            # 0 = 用 physical_redline 作预算
+    recall_level_count: int = 6
+    recall_magic_num: int = 100
+    recall_level_growth: float = 2.0
+    recall_budget_include_portrait: bool = True
+
     # ---- Recall: 并发人物提取与多路检索（本轮新增）----
     # 回忆是否等待回忆前的人物提取结果。默认 False：人物提取并发跑，回忆用即时启发式 focus，不阻塞。
     # True 时回忆前 await，使用完整 focus_role_entries（valence / 焦点档位更准，但更慢）。
