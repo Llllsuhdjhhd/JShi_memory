@@ -159,6 +159,23 @@ class REMSConfig(BaseSettings):
     # 分层比例：最近 N% 的条目对全局可见，剩余部分仅焦点角色关联可见。
     recall_global_ratio: float = 0.7
 
+    # ---- Recall trace（回忆内容落库，observability / 召回质量回溯） ----
+    # 每次 recall 调用把输入与命中的回忆条目写入 ``recall_traces`` 表；
+    # 关闭则回忆起只读路径（不新增记录）。只作观测，不影响召回结果。
+    recall_trace_enabled: bool = True
+    # 单条轨迹最多记录多少个命中条目（防御超大 top_k 撑爆 JSON 列）。
+    recall_trace_max_items: int = 60
+
+    # ---- Recall object-affinity（按对象归属的软纠偏，design/1010 防串线） ----
+    # 原则：只做**有界**的软调制，不硬删、不过度——不同对象但主题相关度强的记忆仍能排上来。
+    # - 焦点对象明确（recall 的 object_id 或 query 解析出对象）时才生效；
+    # - 条目无归属 / 无焦点对象 → 乘 1.0（退化为纯主题相关，绝不乱纠偏）；
+    # - 归属一致 → 轻增益 object_affinity_boost；归属冲突 → 轻惩罚 object_affinity_penalty；
+    # - 两者都贴近 1.0，只影响关系分先后、不翻转强相关记忆。
+    recall_object_affinity_enabled: bool = True
+    recall_object_affinity_boost: float = 1.15
+    recall_object_affinity_penalty: float = 0.90
+
     # ---- Recall: 并发人物提取与多路检索（本轮新增）----
     # 回忆是否等待回忆前的人物提取结果。默认 False：人物提取并发跑，回忆用即时启发式 focus，不阻塞。
     # True 时回忆前 await，使用完整 focus_role_entries（valence / 焦点档位更准，但更慢）。

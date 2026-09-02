@@ -33,6 +33,11 @@ class MemoryExperience(BaseModel):
         default_factory=dict,
         description="对象映射表：名字/称呼 → 01 object_id（含没说话的、未在文本中出现的）",
     )
+    interlocutor: str | None = Field(
+        default=None,
+        description="说话/互动对象 id（本段主体对话的对象；区别于 objects 的泛提及）。"
+        "None = 主体自述/系统段。用于召回时按说话人软纠偏（design/1010 防串线）。",
+    )
     source_ids: tuple[str, ...] = Field(
         default_factory=tuple, description="来源链：事实 / 活动 / 认知 id，必带"
     )
@@ -57,6 +62,7 @@ class SubSegment(BaseModel):
     segment_id: str
     text: str
     objects: dict[str, str] = Field(default_factory=dict)
+    interlocutor: str | None = None  # 该段的说话/互动对象；None = 主体自述/系统段
 
 
 class MemoryBatch(BaseModel):
@@ -93,9 +99,47 @@ class RecalledFragment(BaseModel):
     )
     kind: str | None = None
     object_id: str | None = None
+    interlocutor: str | None = None  # 说话/互动对象（比 object_id 更准，驱动软纠偏）
     source_ids: list[str] = Field(default_factory=list)
     score: float = 0.0
     summary_level: str | None = None
+    occurred_at: datetime | None = None
+
+
+class RecallTraceItem(BaseModel):
+    """单条回忆命中条目（回忆轨迹落库用）。
+
+    携带 ``object_id`` / ``source_ids`` 等归属字段，便于回溯"这条记忆属于谁"，
+    是诊断说话人串线（张冠李戴）的核心可观测载体。
+    """
+
+    event_id: str
+    object_id: str | None = None
+    interlocutor: str | None = None  # 说话/互动对象（诊断张冠李戴的关键字段）
+    score: float = 0.0
+    summary_level: str | None = None
+    source_ids: list[str] = Field(default_factory=list)
+    text: str = ""
+    content: str = ""
+    occurred_at: datetime | None = None
+
+
+class RecallTrace(BaseModel):
+    """一次 recall 调用及其命中的回忆条目（输入 + 条目落库）。
+
+    记录每次召回的输入（query / 对象 / 档位 / 上下文）与命中的条目，用于召回质量回溯；
+    只作 observability，不参与抽象、不影响召回结果。
+    """
+
+    recall_id: str
+    subject_id: str
+    query: str
+    object_id: str | None = None
+    level: int = 1
+    limit: int | None = None
+    anchor_event_ids: list[str] = Field(default_factory=list)
+    created_at: datetime = Field(default_factory=datetime.now)
+    items: list[RecallTraceItem] = Field(default_factory=list)
 
 
 @runtime_checkable
@@ -103,7 +147,8 @@ class MemoryBackendPort(Protocol):
     """匠石记忆后端四步端口。
 
     - ``ingest_batch``：记忆写入（本轮实现）；
-    - ``recall``：回忆读取（预留，只读；保留记忆恢复，不新增记录、不登记 recall_log）；
+    - ``recall``：回忆读取（保留记忆恢复；默认只读。可选 ``recall_trace_enabled`` 把本次
+      输入与命中条目记入 ``recall_traces``，仅作 observability，不参与抽象）；
     - ``consolidate`` / ``dream``：后台接口（本轮占位）。
     """
 
@@ -143,4 +188,6 @@ __all__ = [
     "MemoryBatch",
     "MemoryExperience",
     "RecalledFragment",
+    "RecallTrace",
+    "RecallTraceItem",
 ]

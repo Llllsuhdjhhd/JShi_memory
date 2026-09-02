@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from contextlib import contextmanager
 from typing import Iterator
 
@@ -19,6 +20,8 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 from sqlalchemy.types import JSON
+
+logger = logging.getLogger(__name__)
 
 
 class Base(DeclarativeBase):
@@ -171,6 +174,29 @@ class StoredMarkRecord(Base):
     created_at = Column(DateTime, nullable=False)
 
 
+class RecallTraceRecord(Base):
+    """recall 轨迹：一次 recall 调用的输入 + 命中的回忆条目（observability / 召回质量回溯）。
+
+    记录每次召回的输入（query / object_id / level / limit / anchor_event_ids）与命中条目
+    （event_id / object_id / score / summary_level / source_ids / 摘要文本），
+    供回溯"这条记忆属于谁"（诊断张冠李戴）。只作可观测，不影响召回结果。
+    """
+
+    __tablename__ = "recall_traces"
+
+    recall_id = Column(String, primary_key=True)
+    subject_id = Column(String, default="", index=True)
+    query = Column(Text, nullable=False, default="")
+    object_id = Column(String, nullable=True)
+    level = Column(Integer, default=1)
+    limit = Column(Integer, nullable=True)
+    anchor_event_ids = Column(JSON, default=list)
+    created_at = Column(DateTime, nullable=False)
+    # 命中条目：RecallTraceItem.model_dump(mode="json") 列表。
+    items = Column(JSON, default=list)
+    n_items = Column(Integer, default=0)
+
+
 # ------------------------------------------------------------------
 # Database facade
 # ------------------------------------------------------------------
@@ -185,12 +211,33 @@ from functools import partial
 class Database:
     def __init__(self, url: str):
         # 强制 json_serializer 使用 ensure_ascii=False，确保中文在 SQLite 数据库中以明文存储
+        connect_args = {"timeout": 30} if url.startswith("sqlite") else {}
         self.engine = create_engine(
             url, 
             echo=False, 
-            json_serializer=partial(json.dumps, ensure_ascii=False)
+            json_serializer=partial(json.dumps, ensure_ascii=False),
+            connect_args=connect_args,
         )
         self._session_factory = sessionmaker(bind=self.engine)
+        self._enable_sqlite_concurrency()
+
+    def _enable_sqlite_concurrency(self) -> None:
+        """SQLite 并发调优：WAL（写不阻塞读）+ busy_timeout + NORMAL 同步。
+
+        ingest（后台线程）与 recall（主线程）并发时，避免 ``database is locked``；
+        WAL 为持久设置，busy_timeout 通过 sqlite3 timeout=30 兜底。
+        """
+        if not self.engine.url.get_backend_name().startswith("sqlite"):
+            return
+        from sqlalchemy import text
+
+        try:
+            with self.engine.connect() as conn:
+                conn.execute(text("PRAGMA journal_mode=WAL"))
+                conn.execute(text("PRAGMA busy_timeout=30000"))
+                conn.execute(text("PRAGMA synchronous=NORMAL"))
+        except Exception:  # noqa: BLE001
+            logger.debug("SQLite WAL/busy_timeout setup skipped", exc_info=True)
 
     def create_tables(self) -> None:
         Base.metadata.create_all(self.engine)

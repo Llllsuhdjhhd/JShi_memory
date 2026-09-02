@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import logging
+import uuid
 
 from .config import REMSConfig
 from .llm.provider import LLMProvider
@@ -18,6 +19,8 @@ from .port import (
     MemoryBatch,
     MemoryExperience,
     RecalledFragment,
+    RecallTrace,
+    RecallTraceItem,
     SubSegment,
 )
 from .recall import (
@@ -43,6 +46,7 @@ from .storage.repository import (
     EventRepository,
     MetabolismRepository,
     ObjectTimelineRepository,
+    RecallTraceRepository,
     RoleRepository,
     StoredMarksRepository,
 )
@@ -70,6 +74,7 @@ class REMSPipeline:
         recall_pipeline: RecallPipeline | None = None,
         object_timeline_repo: ObjectTimelineRepository | None = None,
         stored_marks_repo: StoredMarksRepository | None = None,
+        recall_trace_repo: RecallTraceRepository | None = None,
     ):
         self.config = config
         self.llm = llm
@@ -84,6 +89,7 @@ class REMSPipeline:
         self.recall_pipeline = recall_pipeline
         self.object_timeline_repo = object_timeline_repo
         self.stored_marks_repo = stored_marks_repo
+        self.recall_trace_repo = recall_trace_repo
 
     # ------------------------------------------------------------------
     @classmethod
@@ -101,6 +107,7 @@ class REMSPipeline:
         meta_repo = MetabolismRepository(db)
         object_timeline_repo = ObjectTimelineRepository(db)
         stored_marks_repo = StoredMarksRepository(db)
+        recall_trace_repo = RecallTraceRepository(db)
 
         # ---- 回忆 provider（插拔式） ----
         if config.embedding.provider == "hash":
@@ -134,6 +141,9 @@ class REMSPipeline:
             recency_top_k=config.recall_recency_top_k,
             factor_alpha=config.recall_factor_alpha,
             mood_beta=config.recall_mood_beta,
+            object_affinity_enabled=config.recall_object_affinity_enabled,
+            object_affinity_boost=config.recall_object_affinity_boost,
+            object_affinity_penalty=config.recall_object_affinity_penalty,
         )
 
         # ---- 技能与领域服务 ----
@@ -180,6 +190,7 @@ class REMSPipeline:
             recall_pipeline=recall_pipeline,
             object_timeline_repo=object_timeline_repo,
             stored_marks_repo=stored_marks_repo,
+            recall_trace_repo=recall_trace_repo,
         )
 
     # ------------------------------------------------------------------
@@ -214,6 +225,7 @@ class REMSPipeline:
                         segment_id=e.segment_id or f"seg-{len(sub_segments)+1:03d}",
                         text=e.text,
                         objects=dict(e.objects),
+                        interlocutor=getattr(e, "interlocutor", None) or None,
                     )
                 )
             memory = MemoryExperience(
@@ -224,6 +236,10 @@ class REMSPipeline:
                 segment_id="+".join(e.segment_id for e in valid),
                 origin=valid[0].origin,
                 sub_segments=sub_segments,
+                interlocutor=next(
+                    (getattr(e, "interlocutor", None) for e in valid if getattr(e, "interlocutor", None)),
+                    None,
+                ),
             )
             try:
                 sealed = self.metabolism_service.process_input(
@@ -264,6 +280,17 @@ class REMSPipeline:
                     for s in segment_sentences(segment_text)
                 )
 
+            # 说话/互动对象归属（interlocutor）：按事件内容命中的子段取该段说话对象；
+            # 无命中回退到批级。与 stored_marks 的段级匹配共用同一套 ``_segment_hits``。
+            seg_interlocutors = {
+                e.segment_id: (getattr(e, "interlocutor", None) or None)
+                for e in valid
+            }
+            batch_interlocutor = next(
+                (getattr(e, "interlocutor", None) for e in valid if getattr(e, "interlocutor", None)),
+                None,
+            )
+
             for ev in sealed:
                 hits = [
                     e.segment_id for e in valid
@@ -275,6 +302,17 @@ class REMSPipeline:
                     result.stored_marks.setdefault(
                         "+".join(e.segment_id for e in valid), [],
                     ).append(ev.event_id)
+
+                # interlocutor：命中段里第一个有归属的段说话对象；无则回退批级；仍无则留 None。
+                il = next((seg_interlocutors[seg] for seg in hits if seg_interlocutors.get(seg)), None)
+                if il is None:
+                    il = batch_interlocutor
+                if il:
+                    ev.interlocutor = il
+                    try:
+                        self.event_repo.save(ev)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("interlocutor save failed for %s: %s", ev.event_id, exc)
 
             if self.stored_marks_repo is not None:
                 for seg, ids in result.stored_marks.items():
@@ -303,10 +341,10 @@ class REMSPipeline:
         limit: int | None = None,
         anchor_event_ids: tuple[str, ...] = (),
     ) -> tuple[RecalledFragment, ...]:
-        """实现 MemoryBackendPort.recall（只读 + 记忆恢复）。"""
+        """实现 MemoryBackendPort.recall（记忆恢复 + 可选 recall_traces 落库）。"""
         if self.recall_pipeline is None:
             return ()
-        return self.recall_pipeline.recall(
+        fragments = self.recall_pipeline.recall(
             subject_id,
             query,
             object_id=object_id,
@@ -314,6 +352,66 @@ class REMSPipeline:
             limit=limit,
             anchor_event_ids=anchor_event_ids,
         )
+        self._record_recall_trace(
+            subject_id,
+            query,
+            object_id=object_id,
+            level=level,
+            limit=limit,
+            anchor_event_ids=anchor_event_ids,
+            fragments=fragments,
+        )
+        return fragments
+
+    def _record_recall_trace(
+        self,
+        subject_id: str,
+        query: str,
+        *,
+        object_id: str | None,
+        level: int,
+        limit: int | None,
+        anchor_event_ids: tuple[str, ...],
+        fragments: tuple[RecalledFragment, ...],
+    ) -> None:
+        """把本次 recall 的输入与命中条目写入 recall_traces（observability）。
+
+        只作观测，不影响召回结果；关闭 ``recall_trace_enabled`` 或未装配 repo 时静默跳过。
+        """
+        if not self.config.recall_trace_enabled or self.recall_trace_repo is None:
+            return
+        try:
+            items = [
+                RecallTraceItem(
+                    event_id=f.event_id,
+                    object_id=f.object_id,
+                    interlocutor=f.interlocutor,
+                    score=f.score,
+                    summary_level=f.summary_level,
+                    source_ids=list(f.source_ids or []),
+                    text=f.text or "",
+                    content=f.content or "",
+                    occurred_at=f.occurred_at,
+                )
+                for f in fragments
+            ]
+            max_items = int(getattr(self.config, "recall_trace_max_items", 0) or 0)
+            if max_items > 0 and len(items) > max_items:
+                items = items[:max_items]
+            trace = RecallTrace(
+                recall_id=uuid.uuid4().hex,
+                subject_id=subject_id,
+                query=query,
+                object_id=object_id,
+                level=level,
+                limit=limit,
+                anchor_event_ids=list(anchor_event_ids or ()),
+                items=items,
+            )
+            self.recall_trace_repo.save(trace)
+        except Exception as exc:  # noqa: BLE001
+            # 观测失败不影响召回结果本身
+            logger.warning("recall_trace save failed: %s", exc)
 
     # ------------------------------------------------------------------
     # 便捷方法（API 用）

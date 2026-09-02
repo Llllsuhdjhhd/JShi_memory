@@ -10,10 +10,12 @@ from ..models.object_entry import ObjectMemoryEntry
 from ..models.role import Role, WhitePaintingEntry
 from datetime import datetime
 
+from ..port import RecallTrace
 from .database import (
     Database,
     EventRecord,
     ObjectMemoryEntryRecord,
+    RecallTraceRecord,
     RoleRecord,
     ShadowRecord,
     StoredMarkRecord,
@@ -65,6 +67,7 @@ class EventRepository:
                 recall_metadata={
                     "keywords": list(getattr(event, "keywords", None) or []),
                     "location": getattr(event, "location", None),
+                    "interlocutor": getattr(event, "interlocutor", None) or None,
                 },
             )
             s.merge(record)
@@ -277,6 +280,7 @@ class EventRepository:
             origin="external" if (getattr(r, "origin", None) or "") in ("", "normal") else r.origin,
             keywords=list((getattr(r, "recall_metadata", None) or {}).get("keywords") or []),
             location=getattr(r, "location", None) or (getattr(r, "recall_metadata", None) or {}).get("location"),
+            interlocutor=(getattr(r, "recall_metadata", None) or {}).get("interlocutor") or None,
             emotion=EmotionalModel(**r.emotion) if (getattr(r, "emotion", None) or None) else None,
             forgetting_factor=float(getattr(r, "forgetting_factor", 1.0) or 1.0),
         )
@@ -650,3 +654,74 @@ class StoredMarksRepository:
                 }
                 for r in q.order_by(StoredMarkRecord.created_at).all()
             ]
+
+
+# =====================================================================
+# recall_traces（design/1010 可观测：本次回忆输入 + 命中条目）
+# =====================================================================
+
+class RecallTraceRepository:
+    """recall_traces 表读写：一次 recall 调用一行（输入 + 命中条目）。
+
+    用于回溯召回质量与说话人归属（诊断张冠李戴）；只作观测，不影响召回结果。
+    """
+
+    def __init__(self, db: Database):
+        self._db = db
+
+    def save(self, trace: RecallTrace) -> None:
+        with self._db.session() as s:
+            record = RecallTraceRecord(
+                recall_id=trace.recall_id,
+                subject_id=trace.subject_id,
+                query=trace.query,
+                object_id=trace.object_id,
+                level=trace.level,
+                limit=trace.limit,
+                anchor_event_ids=list(trace.anchor_event_ids or []),
+                created_at=trace.created_at,
+                items=[it.model_dump(mode="json") for it in trace.items],
+                n_items=len(trace.items),
+            )
+            s.merge(record)
+            s.commit()
+
+    def get(self, recall_id: str) -> dict | None:
+        with self._db.session() as s:
+            r = s.get(RecallTraceRecord, recall_id)
+            return self._to_dict(r) if r else None
+
+    def list_all(
+        self,
+        subject_id: str | None = None,
+        *,
+        limit: int | None = None,
+        ascending: bool = False,
+    ) -> list[dict]:
+        with self._db.session() as s:
+            q = s.query(RecallTraceRecord)
+            if subject_id:
+                q = q.filter(RecallTraceRecord.subject_id == subject_id)
+            order = (
+                RecallTraceRecord.created_at.asc() if ascending
+                else RecallTraceRecord.created_at.desc()
+            )
+            q = q.order_by(order)
+            if limit:
+                q = q.limit(int(limit))
+            return [self._to_dict(r) for r in q.all()]
+
+    @staticmethod
+    def _to_dict(r: RecallTraceRecord) -> dict:
+        return {
+            "recall_id": r.recall_id,
+            "subject_id": getattr(r, "subject_id", "") or "",
+            "query": r.query,
+            "object_id": r.object_id,
+            "level": r.level,
+            "limit": r.limit,
+            "anchor_event_ids": list(r.anchor_event_ids or []),
+            "created_at": r.created_at,
+            "items": list(r.items or []),
+            "n_items": int(r.n_items or 0),
+        }

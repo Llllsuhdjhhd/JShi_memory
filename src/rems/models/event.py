@@ -214,6 +214,10 @@ class Event(BaseModel):
     # Optional recall metadata (BM25 / literary profile); persisted as recall_metadata JSON.
     keywords: list[str] = Field(default_factory=list)
     location: str | None = None
+    # 说话/互动对象 id（本事件主体对话的对象；区别于 role_list 泛提及）。
+    # 用于召回时按说话人软纠偏（design/1010 防串线）；None = 主体自述/无归属。
+    # 与 keywords/location 一样走 recall_metadata JSON，免 schema 迁移。
+    interlocutor: str | None = None
 
     def model_post_init(self, __context: object) -> None:
         if not self.event_length:

@@ -20,6 +20,17 @@ _EMOTION_LEXICON = {
     "negative": ["难过", "伤心", "悲伤", "痛苦", "害怕", "恐惧", "生气", "愤怒", "焦虑", "失望"],
 }
 
+_IMPORTANCE_ORDER = {"S": 0, "A": 1, "B": 2, "C": 3, "D": 4}
+
+
+def _event_object_id(ev: Event) -> str | None:
+    """取这条记忆事件自己的对象（外部角色），不做成查询对象。"""
+    others = [r for r in ev.role_list if not r.is_subject]
+    if not others:
+        return None
+    others.sort(key=lambda r: _IMPORTANCE_ORDER.get(r.importance.value, 99))
+    return others[0].role_id
+
 
 def retrieval_text(event: Event) -> str:
     """事件检索文本：L1 摘要（或原文）+ 对象 id + 地点（design/1010 §2.4）。"""
@@ -56,6 +67,9 @@ class RecallPipeline:
         recency_top_k: int = 40,
         factor_alpha: float = 0.5,
         mood_beta: float = 0.2,
+        object_affinity_enabled: bool = True,
+        object_affinity_boost: float = 1.15,
+        object_affinity_penalty: float = 0.90,
     ):
         self._embedding = embedding
         self._vector_store = vector_store
@@ -75,6 +89,10 @@ class RecallPipeline:
         self._recency_top_k = recency_top_k
         self._factor_alpha = factor_alpha
         self._mood_beta = mood_beta
+        # 按对象归属的软纠偏（防串线）：有界、不硬删、不翻转强相关。
+        self._object_affinity_enabled = object_affinity_enabled
+        self._object_affinity_boost = object_affinity_boost
+        self._object_affinity_penalty = object_affinity_penalty
 
     # ------------------------------------------------------------------
     def recall(
@@ -140,6 +158,8 @@ class RecallPipeline:
                 continue
             score = rrf * (eff ** self._factor_alpha)
             score *= self._emotion_modifier(q, ev, intent=intent)
+            # 按对象归属软纠偏（防串线）：有界增益/惩罚，不硬删、不翻转强相关。
+            score *= self._object_affinity(ev, object_id)
             scores[ev.event_id] = score
 
         if not scores:
@@ -170,10 +190,12 @@ class RecallPipeline:
                 text=ev.content_raw,
                 content=content,
                 kind=ev.origin,
-                object_id=object_id,
+                object_id=_event_object_id(ev),
+                interlocutor=getattr(ev, "interlocutor", None) or None,
                 source_ids=list(ev.source_ids or []),
                 score=round(sc, 6),
                 summary_level=summary_level,
+                occurred_at=ev.occurred_at or ev.create_time,
             ))
             # 记忆恢复：命中事件强化遗忘因子（唯一写操作；recall_test 可关）
             if reinforce:
@@ -299,6 +321,26 @@ class RecallPipeline:
         ev_pos = ev.emotion.valence > 0
         match = (want_pos and ev_pos) or (want_neg and not ev_pos)
         return 1.0 + self._mood_beta if match else 1.0 - self._mood_beta
+
+    def _object_affinity(self, ev: Event, focus_object_id: str | None) -> float:
+        """按**说话/互动对象**的软纠偏系数（防串线，design/1010）。
+
+        原则：**有界、不硬删、不过度**——不同对象但主题相关度强的记忆仍能排上来。
+        - 未启用 / 无焦点对象 / 条目无归属 → 1.0（退化为纯主题相关，绝不乱纠偏）；
+        - 条目归属 == 焦点对象 → ``object_affinity_boost``（轻增益）；
+        - 条目归属 != 焦点对象 → ``object_affinity_penalty``（轻惩罚，非 0，不删除）。
+
+        用事件级 ``interlocutor``（说话/互动对象）作为归属，而不是泛提及对象
+        （``_event_object_id`` 是"主对象"近似，混淆说话人与提及对象，不作为纠偏依据）。
+        """
+        if not self._object_affinity_enabled:
+            return 1.0
+        item_object = getattr(ev, "interlocutor", None) or None
+        if not focus_object_id or not item_object:
+            return 1.0
+        if item_object == focus_object_id:
+            return self._object_affinity_boost
+        return self._object_affinity_penalty
 
     def _select_summary(self, ev: Event, level: int) -> tuple[str, str | None]:
         key = f"L{max(1, level)}"

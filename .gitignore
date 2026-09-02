@@ -11,6 +11,7 @@ chroma_data/
 .pytest_cache/
 .pytest_tmp/
 .ruff_cache/
+_basetmp/
 *.so
 .venv/
 venv/

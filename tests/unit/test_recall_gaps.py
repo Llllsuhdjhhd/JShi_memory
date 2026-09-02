@@ -162,3 +162,41 @@ def test_reinforce_false_keeps_forgetting_factor(recall_pipeline):
 
     pipe.recall("jshi-1", "重要", reinforce=False)
     assert event_repo.get(ev.event_id).forgetting_factor == pytest.approx(1.0)
+
+
+def test_fragment_object_id_uses_event_not_query(recall_pipeline):
+    pipe, event_repo, _ = recall_pipeline
+    a = Event(
+        content_raw="和luguang讨论生存模式", subject_id="jshi-1",
+        summaries={"L1": "讨论生存模式"},
+        role_list=_mk_role_list("OBJ-LUGUANG"),
+    )
+    b = Event(
+        content_raw="和lux讨论袭击塔", subject_id="jshi-1",
+        summaries={"L1": "讨论袭击塔"},
+        role_list=_mk_role_list("OBJ-LUX"),
+    )
+    event_repo.save(a)
+    event_repo.save(b)
+    pipe.index_event(a)
+    pipe.index_event(b)
+
+    # 查询对象=lux（过滤参数），但两条都被召回时，片段对象必须是事件自己的对象
+    frags = pipe.recall("jshi-1", "讨论 生存 袭击", object_id="OBJ-LUX", reinforce=False)
+    by_id = {f.event_id: f.object_id for f in frags}
+    assert by_id[a.event_id] == "OBJ-LUGUANG"
+    assert by_id[b.event_id] == "OBJ-LUX"
+
+
+def test_fragment_occurred_at_falls_back_to_create_time(recall_pipeline):
+    pipe, event_repo, _ = recall_pipeline
+    ev = Event(
+        content_raw="测试时间", subject_id="jshi-1",
+        summaries={"L1": "测试时间"}, occurred_at=None,
+    )
+    event_repo.save(ev)
+    pipe.index_event(ev)
+
+    frags = pipe.recall("jshi-1", "测试时间", reinforce=False)
+    assert frags
+    assert frags[0].occurred_at == ev.create_time

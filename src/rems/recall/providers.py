@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import threading
 from typing import Protocol, Sequence
 
 logger = logging.getLogger(__name__)
@@ -66,6 +67,7 @@ class SentenceTransformerEmbedding:
     def __init__(self, model_name: str):
         self._model_name = model_name
         self._model = None
+        self._lock = threading.Lock()
 
     def _ensure(self):
         if self._model is None:
@@ -74,12 +76,14 @@ class SentenceTransformerEmbedding:
             self._model = SentenceTransformer(self._model_name)
 
     def embed_documents(self, texts: Sequence[str]) -> list[list[float]]:
-        self._ensure()
-        return self._model.encode(list(texts), normalize_embeddings=True).tolist()
+        with self._lock:
+            self._ensure()
+            return self._model.encode(list(texts), normalize_embeddings=True).tolist()
 
     def embed_query(self, text: str) -> list[float]:
-        self._ensure()
-        return self._model.encode([text], normalize_embeddings=True)[0].tolist()
+        with self._lock:
+            self._ensure()
+            return self._model.encode([text], normalize_embeddings=True)[0].tolist()
 
 
 class NullReranker:
@@ -95,6 +99,7 @@ class BgeReranker:
     def __init__(self, model_name: str = "BAAI/bge-reranker-v2-m3"):
         self._model_name = model_name
         self._model = None
+        self._lock = threading.Lock()
 
     def _ensure(self):
         if self._model is None:
@@ -105,10 +110,11 @@ class BgeReranker:
     def rerank(self, query: str, candidates: Sequence[str]) -> list[float]:
         if not candidates:
             return []
-        self._ensure()
-        pairs = [(query, c) for c in candidates]
-        scores = self._model.predict(pairs)
-        return [float(s) for s in scores]
+        with self._lock:
+            self._ensure()
+            pairs = [(query, c) for c in candidates]
+            scores = self._model.predict(pairs)
+            return [float(s) for s in scores]
 
 
 class QdrantRecallVectorStore:
@@ -132,6 +138,8 @@ class QdrantRecallVectorStore:
             self._client = QdrantClient(":memory:")
         self._collection = collection
         self._dim: int | None = None
+        # 同实例并发 upsert/search：本地 Qdrant 无细粒度内部锁，窄锁保护。
+        self._lock = threading.RLock()
 
     def _ensure_collection(self, dim: int) -> None:
         if self._dim == dim:
@@ -159,19 +167,20 @@ class QdrantRecallVectorStore:
         self._dim = dim
 
     def upsert(self, event_id: str, vector: list[float], payload: dict) -> None:
-        from qdrant_client import models
+        with self._lock:
+            from qdrant_client import models
 
-        self._ensure_collection(len(vector))
-        self._client.upsert(
-            collection_name=self._collection,
-            points=[
-                models.PointStruct(
-                    id=hashlib.md5(event_id.encode("utf-8")).hexdigest(),
-                    vector=vector,
-                    payload={"event_id": event_id, **payload},
-                )
-            ],
-        )
+            self._ensure_collection(len(vector))
+            self._client.upsert(
+                collection_name=self._collection,
+                points=[
+                    models.PointStruct(
+                        id=hashlib.md5(event_id.encode("utf-8")).hexdigest(),
+                        vector=vector,
+                        payload={"event_id": event_id, **payload},
+                    )
+                ],
+            )
 
     def search(
         self,
@@ -180,52 +189,54 @@ class QdrantRecallVectorStore:
         top_k: int,
         payload_filter: dict | None = None,
     ) -> list[dict]:
-        from qdrant_client import models
+        with self._lock:
+            from qdrant_client import models
 
-        self._ensure_collection(len(vector))
-        qfilter = None
-        if payload_filter:
-            conditions = []
-            for key, value in payload_filter.items():
-                conditions.append(models.FieldCondition(
-                    key=key,
-                    match=models.MatchValue(value=value),
-                ))
-            qfilter = models.Filter(must=conditions)
-        hits: list[dict] = []
-        if hasattr(self._client, "query_points"):
-            resp = self._client.query_points(
-                collection_name=self._collection,
-                query=vector,
-                query_filter=qfilter,
-                limit=top_k,
-                with_payload=True,
-            )
-            for h in resp.points:
-                if h.payload:
-                    hits.append({
-                        "event_id": h.payload.get("event_id"),
-                        "score": float(h.score),
-                        "payload": h.payload,
-                    })
-        else:
-            raw = self._client.search(
-                collection_name=self._collection,
-                query_vector=vector,
-                query_filter=qfilter,
-                limit=top_k,
-                with_payload=True,
-            )
-            hits = [
-                {"event_id": h.payload.get("event_id"), "score": float(h.score), "payload": h.payload}
-                for h in raw
-                if h.payload
-            ]
-        return hits
+            self._ensure_collection(len(vector))
+            qfilter = None
+            if payload_filter:
+                conditions = []
+                for key, value in payload_filter.items():
+                    conditions.append(models.FieldCondition(
+                        key=key,
+                        match=models.MatchValue(value=value),
+                    ))
+                qfilter = models.Filter(must=conditions)
+            hits: list[dict] = []
+            if hasattr(self._client, "query_points"):
+                resp = self._client.query_points(
+                    collection_name=self._collection,
+                    query=vector,
+                    query_filter=qfilter,
+                    limit=top_k,
+                    with_payload=True,
+                )
+                for h in resp.points:
+                    if h.payload:
+                        hits.append({
+                            "event_id": h.payload.get("event_id"),
+                            "score": float(h.score),
+                            "payload": h.payload,
+                        })
+            else:
+                raw = self._client.search(
+                    collection_name=self._collection,
+                    query_vector=vector,
+                    query_filter=qfilter,
+                    limit=top_k,
+                    with_payload=True,
+                )
+                hits = [
+                    {"event_id": h.payload.get("event_id"), "score": float(h.score), "payload": h.payload}
+                    for h in raw
+                    if h.payload
+                ]
+            return hits
 
     def delete(self, event_id: str) -> None:
-        point_id = hashlib.md5(event_id.encode("utf-8")).hexdigest()
-        self._client.delete(
-            collection_name=self._collection,
-            points_selector=[point_id],
-        )
+        with self._lock:
+            point_id = hashlib.md5(event_id.encode("utf-8")).hexdigest()
+            self._client.delete(
+                collection_name=self._collection,
+                points_selector=[point_id],
+            )
