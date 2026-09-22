@@ -161,6 +161,9 @@ class REMSPipeline:
             object_affinity_boost=config.recall_object_affinity_boost,
             object_affinity_penalty=config.recall_object_affinity_penalty,
             event_fatigue=config.event_fatigue,
+            meta_repo=meta_repo,
+            include_unclosed=config.recall_include_unclosed,
+            unclosed_same_object_score=config.recall_unclosed_same_object_score,
         )
 
         # ---- 技能与领域服务 ----
@@ -333,13 +336,6 @@ class REMSPipeline:
                     except Exception as exc:  # noqa: BLE001
                         logger.warning("interlocutor save failed for %s: %s", ev.event_id, exc)
 
-                # 人物肖像：interlocutor 已落盘后，为事件涉及的每个对象各生成一条人物摘要（后台/并行，不阻塞 ingest）
-                if self.portrait_service is not None:
-                    try:
-                        self.portrait_service.note_event(ev, self._portrait_objects(ev))
-                    except Exception as exc:  # noqa: BLE001
-                        logger.warning("portrait note_event %s failed: %s", ev.event_id, exc)
-
             if self.stored_marks_repo is not None:
                 for seg, ids in result.stored_marks.items():
                     try:
@@ -406,7 +402,7 @@ class REMSPipeline:
             return fragments
         items: list[RecalledFragment] = list(fragments)
         if (
-            self._config.recall_budget_include_portrait
+            self.config.recall_budget_include_portrait
             and object_id
             and self.portrait_service is not None
         ):
@@ -443,7 +439,7 @@ class REMSPipeline:
         )
         items: list[RecalledFragment] = list(fragments)
         if (
-            self._config.recall_budget_include_portrait
+            self.config.recall_budget_include_portrait
             and object_id and self.portrait_service is not None
         ):
             pfrag = self._make_portrait_fragment(subject_id, object_id)
@@ -542,17 +538,6 @@ class REMSPipeline:
     # ------------------------------------------------------------------
     # 人物肖像（design/1010 §8.4 portrait）
     # ------------------------------------------------------------------
-
-    def _portrait_objects(self, ev) -> list[str]:
-        """事件涉及的对象集：interlocutor（说话/互动对象）∪ 非主体 role_list 提及。"""
-        ids: list[str] = []
-        il = getattr(ev, "interlocutor", None)
-        if il:
-            ids.append(il)
-        for re_ in getattr(ev, "role_list", []) or []:
-            if not getattr(re_, "is_subject", False) and getattr(re_, "role_id", None):
-                ids.append(re_.role_id)
-        return list(dict.fromkeys(ids))
 
     def portrait(self, subject_id: str, object_id: str) -> dict | None:
         """返回某对象的人物肖像（10 级渐进摘要的最长级 + 概要）。"""

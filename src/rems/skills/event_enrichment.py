@@ -48,10 +48,9 @@ class EnrichmentResult(BaseModel):
     roles: list[ExtractedRole] = Field(default_factory=list)
     keywords: list[str] = Field(default_factory=list)
     location: str | None = None
-    # memory 模式（design/610）：事件级主体情感 + 对象一句话快照（name → summary）。
+    # memory 模式：事件级主体情感 + 每个对象一句事实（name → fact）。
     emotion: EmotionalModel | None = None
     object_snapshots: dict[str, str] = Field(default_factory=dict)
-    # 匠石对对象的分级白描（design/610）：name → {l1_mention, l2_interaction, l3_decision}。
     object_white_paintings: dict[str, RoleSnapshot] = Field(default_factory=dict)
 
 
@@ -86,6 +85,7 @@ class EventEnrichmentSkill:
         skip_roles: bool = False,
         names_only: bool = False,
         memory_objects: dict[str, str] | None = None,
+        seal_reason: str = "closed",
     ) -> EnrichmentResult:
         memory_mode = memory_objects is not None
         if memory_mode:
@@ -119,6 +119,13 @@ class EventEnrichmentSkill:
                 object_list=object_list,
                 summary_budget_table=summary_budget_text,
             )
+            if seal_reason in ("split", "truncated"):
+                user_msg += (
+                    "\n\n## 封存口径\n"
+                    "本段因切开或搁置而封存，不是自然结束。"
+                    "摘要和对象事实只描述原文里已经出现的内容，"
+                    "不要补写结局，不要写成这件事已经结束。"
+                )
             mode = "memory"
         elif skip_roles:
             user_msg = ENRICHMENT_SUMMARY_ONLY_USER.format(
@@ -199,19 +206,9 @@ class EventEnrichmentSkill:
                     name = (od.get("name") or "").strip()
                     if not name:
                         continue
-                    l1 = (od.get("l1_mention") or "").strip() or None
-                    l2 = (od.get("l2_interaction") or "").strip() or None
-                    l3 = (od.get("l3_decision") or "").strip() or None
-                    if l1 is None:  # 兼容旧格式 summary → 作为 L1
-                        l1 = (od.get("summary") or "").strip() or None
-                    if l1 or l2 or l3:
-                        object_white_paintings[name] = RoleSnapshot(
-                            l1_mention=l1,
-                            l2_interaction=l2,
-                            l3_decision=l3,
-                        )
-                    if l1:
-                        object_snapshots[name] = l1
+                    fact = (od.get("fact") or od.get("summary") or "").strip()
+                    if fact:
+                        object_snapshots[name] = fact
 
         keywords: list[str] = []
         location: str | None = None

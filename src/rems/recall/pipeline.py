@@ -71,6 +71,9 @@ class RecallPipeline:
         object_affinity_boost: float = 1.15,
         object_affinity_penalty: float = 0.90,
         event_fatigue: float = 1.0,
+        meta_repo=None,
+        include_unclosed: bool = True,
+        unclosed_same_object_score: float = 90.0,
     ):
         self._embedding = embedding
         self._vector_store = vector_store
@@ -96,6 +99,9 @@ class RecallPipeline:
         self._object_affinity_penalty = object_affinity_penalty
         # 事件记忆疲态：与遗忘率协同（乘进 effective factor）；<1 时更快"忘记"。
         self._event_fatigue = event_fatigue
+        self._meta_repo = meta_repo
+        self._include_unclosed = include_unclosed
+        self._unclosed_same_object_score = unclosed_same_object_score
 
     # ------------------------------------------------------------------
     def recall(
@@ -123,67 +129,71 @@ class RecallPipeline:
                 object_id = intent.object_id
 
         events = self._candidate_events(subject_id)
-        if not events:
+        unclosed_frags = self._unclosed_fragments(subject_id, q, object_id=object_id)
+        if not events and not unclosed_frags:
             return ()
 
-        # 多路召回：语义 / 词法 / 对象 / 时间 / 锚点
-        semantic_ids = self._semantic_route(subject_id, q, object_id=object_id)
-        lexical_scores = self._lexical_scores(q, events)
-        object_ids = self._object_route(subject_id, object_id, events)
-        recency_scores = self._recency_route(events) if self._recency_enabled else {}
-        anchor_ids = set(anchor_event_ids or ())
-        for eid in anchor_event_ids:
-            ev = self._event_repo.get(eid)
-            if ev is not None:
-                anchor_ids.update(ev.split_prefix_event_ids or [])
+        ranked: list[tuple[str, float]] = []
+        if events:
+            # 多路召回：语义 / 词法 / 对象 / 时间 / 锚点
+            semantic_ids = self._semantic_route(subject_id, q, object_id=object_id)
+            lexical_scores = self._lexical_scores(q, events)
+            object_ids = self._object_route(subject_id, object_id, events)
+            recency_scores = self._recency_route(events) if self._recency_enabled else {}
+            anchor_ids = set(anchor_event_ids or ())
+            for eid in anchor_event_ids:
+                ev = self._event_repo.get(eid)
+                if ev is not None:
+                    anchor_ids.update(ev.split_prefix_event_ids or [])
 
-        active = set(channels) if channels else {
-            "semantic", "lexical", "object", "recency", "anchor",
-        }
-        now = datetime.now()
-        scores: dict[str, float] = {}
-        for ev in events:
-            eff = self._effective_factor(ev, now)
-            if eff < self._silence_threshold:
-                continue
-            rrf = 0.0
-            if "semantic" in active and ev.event_id in semantic_ids:
-                rrf += 1.0 / (self._rrf_k + semantic_ids[ev.event_id])
-            if "lexical" in active and ev.event_id in lexical_scores:
-                rrf += 1.0 / (self._rrf_k + lexical_scores[ev.event_id])
-            if "object" in active and ev.event_id in object_ids:
-                rrf += 1.0 / (self._rrf_k + object_ids[ev.event_id])
-            if "recency" in active and ev.event_id in recency_scores:
-                rrf += 1.0 / (self._rrf_k + recency_scores[ev.event_id])
-            if "anchor" in active and ev.event_id in anchor_ids:
-                rrf += 1.0 / (self._rrf_k + 1)
-            if rrf <= 0:
-                continue
-            score = rrf * (eff ** self._factor_alpha)
-            score *= self._emotion_modifier(q, ev, intent=intent)
-            # 按对象归属软纠偏（防串线）：有界增益/惩罚，不硬删、不翻转强相关。
-            score *= self._object_affinity(ev, object_id)
-            scores[ev.event_id] = score
+            active = set(channels) if channels else {
+                "semantic", "lexical", "object", "recency", "anchor",
+            }
+            now = datetime.now()
+            scores: dict[str, float] = {}
+            for ev in events:
+                eff = self._effective_factor(ev, now)
+                if eff < self._silence_threshold:
+                    continue
+                rrf = 0.0
+                if "semantic" in active and ev.event_id in semantic_ids:
+                    rrf += 1.0 / (self._rrf_k + semantic_ids[ev.event_id])
+                if "lexical" in active and ev.event_id in lexical_scores:
+                    rrf += 1.0 / (self._rrf_k + lexical_scores[ev.event_id])
+                if "object" in active and ev.event_id in object_ids:
+                    rrf += 1.0 / (self._rrf_k + object_ids[ev.event_id])
+                if "recency" in active and ev.event_id in recency_scores:
+                    rrf += 1.0 / (self._rrf_k + recency_scores[ev.event_id])
+                if "anchor" in active and ev.event_id in anchor_ids:
+                    rrf += 1.0 / (self._rrf_k + 1)
+                if rrf <= 0:
+                    continue
+                score = rrf * (eff ** self._factor_alpha)
+                score *= self._emotion_modifier(q, ev, intent=intent)
+                # 按对象归属软纠偏（防串线）：有界增益/惩罚，不硬删、不翻转强相关。
+                score *= self._object_affinity(ev, object_id)
+                scores[ev.event_id] = score
 
-        if not scores:
-            return ()
-        ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[: self._top_k]
+            if scores:
+                ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[: self._top_k]
 
-        # 精排（可选）
-        if self._reranker is not None and ranked:
-            cand_events = [self._event_repo.get(eid) for eid, _ in ranked]
-            cand_texts = [self._retrieval_text(e) for e in cand_events if e is not None]
-            rerank_scores = self._reranker.rerank(q, cand_texts)
-            if rerank_scores:
-                ordered = sorted(
-                    zip(ranked, rerank_scores),
-                    key=lambda pair: pair[1],
-                    reverse=True,
-                )
-                ranked = [item for item, _ in ordered]
+                # 精排（可选）
+                if self._reranker is not None and ranked:
+                    cand_events = [self._event_repo.get(eid) for eid, _ in ranked]
+                    cand_texts = [self._retrieval_text(e) for e in cand_events if e is not None]
+                    rerank_scores = self._reranker.rerank(q, cand_texts)
+                    if rerank_scores:
+                        ordered = sorted(
+                            zip(ranked, rerank_scores),
+                            key=lambda pair: pair[1],
+                            reverse=True,
+                        )
+                        ranked = [item for item, _ in ordered]
 
-        fragments: list[RecalledFragment] = []
+        fragments: list[RecalledFragment] = list(unclosed_frags)
         for eid, sc in ranked:
+            if limit is not None and len(fragments) >= limit:
+                break
             ev = self._event_repo.get(eid)
             if ev is None:
                 continue
@@ -203,8 +213,8 @@ class RecallPipeline:
             # 记忆恢复：命中事件强化遗忘因子（唯一写操作；recall_test 可关）
             if reinforce:
                 self._reinforce(ev)
-            if limit is not None and len(fragments) >= limit:
-                break
+        if limit is not None:
+            fragments = fragments[:limit]
         return tuple(fragments)
 
     # ------------------------------------------------------------------
@@ -228,6 +238,66 @@ class RecallPipeline:
             e for e in self._event_repo.list_all(exclude_tombstoned=True)
             if (e.subject_id or "") == subject_id and not e.is_tombstoned
         ]
+
+    def _unclosed_fragments(
+        self,
+        subject_id: str,
+        query: str,
+        *,
+        object_id: str | None,
+    ) -> list[RecalledFragment]:
+        """把相关未完成条目并入回忆：同一对象优先，其次主题有重叠。
+
+        未完成是工作记忆（说话人离开前没说完的事）。召回同对象的挂起条目，
+        便于续写；不把无关对象的残影整包灌进本次回忆。
+        """
+        if not self._include_unclosed or self._meta_repo is None:
+            return []
+        try:
+            items = self._meta_repo.get_unclosed_events()
+        except Exception:  # noqa: BLE001
+            logger.debug("list unclosed for recall failed", exc_info=True)
+            return []
+
+        qb = self._bigrams(query)
+        out: list[RecalledFragment] = []
+        for ue in items:
+            sid = getattr(ue, "subject_id", "") or ""
+            if sid and sid != subject_id:
+                continue
+            text = (ue.merged_content or "").strip()
+            if not text:
+                continue
+            interlocutor = getattr(ue, "interlocutor", None) or None
+            roles = list(getattr(ue, "identified_roles", None) or [])
+            same_object = bool(
+                object_id
+                and (interlocutor == object_id or object_id in roles)
+            )
+            jac = self._bigram_jaccard(qb, self._bigrams(text)) if qb else 0.0
+            if same_object:
+                score = self._unclosed_same_object_score
+            elif object_id:
+                # 焦点对象已定：不把其他对象的未完成拉进来（防串线）。
+                continue
+            elif jac > 0:
+                score = 40.0 * (0.5 + jac)
+            else:
+                continue
+            out.append(RecalledFragment(
+                event_id=ue.id,
+                text=text,
+                content=text,
+                kind="unclosed",
+                object_id=interlocutor,
+                interlocutor=interlocutor,
+                score=round(score, 6),
+                summary_level="raw",
+                occurred_at=getattr(ue, "last_hit_time", None)
+                or getattr(ue, "updated_at", None),
+            ))
+        out.sort(key=lambda f: f.score, reverse=True)
+        return out
 
     def _retrieval_text(self, ev: Event) -> str:
         return retrieval_text(ev)

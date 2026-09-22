@@ -29,8 +29,9 @@ class UnclosedEvent(BaseModel):
     """A logically-opened but not-yet-closed event object.
 
     未完成事件：叙事上已启动但缺关键结果或上下文的事实对象（白皮书 4.1）。
-    所有的未完成事件拼接在一起构成了系统的“残影”。当边界模型识别到逻辑闭环时，
-    对应的未完成事件将被封存为基本事件，并从残影中移除。
+    所有的未完成事件拼接在一起构成了系统的“残影”。封存条件不只是语义闭环：
+    单条字数触及 ``unclosed_char_limit``，或满足闲置规则（半限×3 天 / 满 7 天）时
+    也会按原文封存。说话人更换不触发封存。
 
     分裂链路字段（2026-05 新增）：
         ``split_prefix_event_ids`` —— 若本 UC 是边界模型执行 80/20 强制分裂的"尾段"，
@@ -50,6 +51,8 @@ class UnclosedEvent(BaseModel):
     created_at: datetime = Field(default_factory=datetime.now)
     updated_at: datetime = Field(default_factory=datetime.now)
     last_hit_time: datetime = Field(default_factory=datetime.now)
+    # 挂起时的说话/互动对象（召回软纠偏用）；不因更换而封存。
+    interlocutor: str | None = None
 
     # 分裂链路：前缀事件 id（按从远到近的顺序）。
     split_prefix_event_ids: list[str] = Field(default_factory=list)

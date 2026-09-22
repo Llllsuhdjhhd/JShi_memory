@@ -115,26 +115,22 @@ class RoleService:
         object_id: str,
         subject_id: str,
         event: Event,
-        snapshot: RoleSnapshot,
+        fact: str,
     ) -> None:
-        """记忆路径白描：对象来自输入映射表，不建档、不注册角色。
+        """记忆路径白描：每个对象、每条事件追加一句事实，绑在 event_id 上。
 
-        白描 = 匠石（subject）对该对象的分级白描（l1/l2/l3），事件关联；
-        对象无情感、无等级（design/610 记忆契约）。
+        用「我」的视角写这一次发生了什么。不写三级快照，不写长期性格。
         """
-        l1 = snapshot.l1_mention
-        l2 = snapshot.l2_interaction
-        l3 = snapshot.l3_decision
-        if not (l1 or l2 or l3):
+        text = (fact or "").strip()
+        if not text:
             return
-        summary = l2 or l1 or l3 or ""
         wp = WhitePaintingEntry(
             subject_id=subject_id,
             event_id=event.event_id,
-            role_summary=summary,
-            l1_mention=l1,
-            l2_interaction=l2,
-            l3_decision=l3,
+            role_summary=text,
+            l1_mention=None,
+            l2_interaction=None,
+            l3_decision=None,
             emotional_model=EmotionalModel(),
             importance=Importance.C,
             create_time=event.create_time,

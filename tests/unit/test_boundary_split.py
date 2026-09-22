@@ -423,8 +423,9 @@ class TestParseResponseRangeIndices:
 
         assert len(result.completed_events) == 1
         assert result.completed_events[0].content_raw == "d\ne\nf"
-        assert len(result.new_unclosed) == 1
+        assert len(result.new_unclosed) == 2
         assert result.new_unclosed[0].content == "a\nb\nc"
+        assert result.new_unclosed[1].content == "g"
 
     def test_continuation_strips_shadow_ranges(self, config, fake_llm):
         skill = BoundaryDetectionSkill(fake_llm, config)

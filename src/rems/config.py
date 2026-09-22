@@ -210,6 +210,9 @@ class REMSConfig(BaseSettings):
     recall_magic_num: int = 100
     recall_level_growth: float = 2.0
     recall_budget_include_portrait: bool = True
+    # 召回时并入相关未完成事件（同一对话人优先；无焦点对象时按查询词重叠）。
+    recall_include_unclosed: bool = True
+    recall_unclosed_same_object_score: float = 90.0
 
     # ---- Recall: 并发人物提取与多路检索（本轮新增）----
     # 回忆是否等待回忆前的人物提取结果。默认 False：人物提取并发跑，回忆用即时启发式 focus，不阻塞。
@@ -265,6 +268,21 @@ class REMSConfig(BaseSettings):
     # 但"认知层"的默认路径不再做盲目强制封存——只做评估 → 修复 → 保留 oversized UC。
     # 是否「可疑」由角色抽取与 RoleService 仲裁判断。
     unclosed_force_ratio: float = 1.2
+    # ---- 未完成事件封存条件（按单条 UC 字数，非残影总长；design/610）----
+    # 字数上限魔法数。单条未完成事件字数 ≥ 该值 → 按原文封存。
+    # 匠石可通过环境变量 REMS_UNCLOSED_CHAR_LIMIT 覆盖；0 = 关闭字数触发。
+    unclosed_char_limit: int = 2000
+    # 闲置封存（相对 last_hit_time / occurred_at）：
+    #   (字数 > partial_ratio × unclosed_char_limit 且闲置 ≥ partial_days)
+    #   或 (闲置 ≥ hard_days)
+    # 说话人更换不再触发封存（多人场合合法）。
+    unclosed_idle_seal_enabled: bool = True
+    unclosed_idle_partial_days: float = 3.0
+    unclosed_idle_hard_days: float = 7.0
+    unclosed_idle_partial_ratio: float = 0.5
+    # 兼容旧环境变量；逻辑已废弃，勿再依赖。
+    unclosed_idle_hours: float = 1.0
+    unclosed_interlocutor_break_seal: bool = False
     # ---- 80/20 Forced Split (2026-05, 白皮书 4.2 升级) ----
     # 评估到 oversized_uc 后，OverlongUCSplitSkill 的目标切分比例与可接受区间。
     # 切点仍由模型基于"逻辑闭环"选择，此处只给数量级指引。

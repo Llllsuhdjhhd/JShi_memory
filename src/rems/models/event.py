@@ -211,6 +211,9 @@ class Event(BaseModel):
     # 记忆单元级遗忘因子（情感 arousal 初始化，随时间衰减；回忆命中强化，见 design/610/1010）。
     forgetting_factor: float = 1.0
 
+    # 封存原因：closed 自然闭环 / split 资源切开的前段 / truncated 搁置或无法切开。
+    seal_reason: str = "closed"
+
     # Optional recall metadata (BM25 / literary profile); persisted as recall_metadata JSON.
     keywords: list[str] = Field(default_factory=list)
     location: str | None = None

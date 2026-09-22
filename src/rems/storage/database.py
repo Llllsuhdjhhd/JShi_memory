@@ -67,6 +67,7 @@ class EventRecord(Base):
     location = Column(String, nullable=True)
     emotion = Column(JSON, nullable=True)
     forgetting_factor = Column(Float, default=1.0)
+    seal_reason = Column(String, default="closed")
     recall_metadata = Column(JSON, default=dict)
 
 
@@ -143,6 +144,7 @@ class UnclosedEventRecord(Base):
     created_at = Column(DateTime, nullable=False)
     updated_at = Column(DateTime, nullable=False)
     last_hit_time = Column(DateTime, nullable=False)
+    interlocutor = Column(String, nullable=True)
     # 80/20 强制分裂：前缀事件链（自远而近）。UC 闭环为事件时由 MetabolismService 继承给目标事件。
     split_prefix_event_ids = Column(JSON, default=list)
     # 审计：评估器判定 oversized 但修复失败时置为 True；不触发强制封存。
@@ -213,6 +215,39 @@ class PortraitRecord(Base):
     fatigue = Column(Float, default=1.0)
     created_at = Column(DateTime, nullable=False)
     updated_at = Column(DateTime, nullable=False)
+
+
+class _ObjectKnowledgeRecord(Base):
+    """匠石以后写回的对象认识。本仓只建表，不写入。"""
+
+    __abstract__ = True
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    subject_id = Column(String, default="", index=True)
+    object_id = Column(String, nullable=False, index=True)
+    body = Column(Text, nullable=False, default="")
+    source_event_ids = Column(JSON, default=list)
+    is_tombstoned = Column(Boolean, default=False)
+    forgetting_factor = Column(Float, default=1.0)
+    created_at = Column(DateTime, nullable=False)
+
+
+class ObjectTraitRecord(_ObjectKnowledgeRecord):
+    """长期特征。空表，供匠石以后追加。"""
+
+    __tablename__ = "object_traits"
+
+
+class ObjectStateRecord(_ObjectKnowledgeRecord):
+    """当前状态。空表，供匠石以后追加。"""
+
+    __tablename__ = "object_states"
+
+
+class ObjectDispositionRecord(_ObjectKnowledgeRecord):
+    """互动倾向。空表，供匠石以后追加。"""
+
+    __tablename__ = "object_dispositions"
 
 
 class PortraitSummaryRecord(Base):
@@ -305,11 +340,13 @@ class Database:
                 ("emotion", "TEXT"),
                 ("location", "TEXT"),
                 ("forgetting_factor", "FLOAT DEFAULT 1.0"),
+                ("seal_reason", "TEXT DEFAULT 'closed'"),
             ],
             "unclosed_events": [
                 ("split_prefix_event_ids", "TEXT DEFAULT '[]'"),
                 ("oversized", "BOOLEAN DEFAULT 0"),
                 ("subject_id", "TEXT DEFAULT ''"),
+                ("interlocutor", "TEXT"),
             ],
             "shadow": [
                 ("subject_id", "TEXT DEFAULT ''"),

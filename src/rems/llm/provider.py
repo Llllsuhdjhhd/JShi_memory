@@ -232,6 +232,45 @@ class LLMProvider:
         return "".join(" " if ord(c) < 32 else c for c in fragment)
 
     @staticmethod
+    def _escape_unescaped_quotes_in_json_strings(s: str) -> str:
+        """Escape bare ``"`` that appear inside JSON string values (common in LLM narrative).
+
+        Closing quotes are recognized when the next non-whitespace is ``,`` ``}`` ``]`` or EOF.
+        A following ``:`` also closes (property name → value). Other bare quotes are escaped.
+        """
+        out: list[str] = []
+        i = 0
+        n = len(s)
+        in_string = False
+        while i < n:
+            c = s[i]
+            if not in_string:
+                out.append(c)
+                if c == '"':
+                    in_string = True
+                i += 1
+                continue
+            if c == "\\" and i + 1 < n:
+                out.append(c)
+                out.append(s[i + 1])
+                i += 2
+                continue
+            if c == '"':
+                j = i + 1
+                while j < n and s[j] in " \t\r\n":
+                    j += 1
+                if j >= n or s[j] in ",:}]":
+                    out.append(c)
+                    in_string = False
+                else:
+                    out.append('\\"')
+                i += 1
+                continue
+            out.append(c)
+            i += 1
+        return "".join(out)
+
+    @staticmethod
     def _extract_json(text: str) -> dict[str, Any]:
         text = text.strip()
         # 1. Isolating JSON from markdown fences (handles leading/trailing LLM talk)
@@ -244,24 +283,6 @@ class LLMProvider:
             # Trailing commas: {"a":1,} -> {"a":1}
             s = re.sub(r",\s*([\]}])", r"\1", s)
             return s.strip()
-
-        # 3. Structural recovery (Handles unescaped quotes in narrative content)
-        def structural_fix(s: str) -> str:
-            # Look for property patterns: "key": "value"
-            # This regex identifies values that might contain unescaped quotes by 
-            # greedy-matching until we see the "next" property or the end of object.
-            # Warning: heuristic, but powerful for LLM narrative outputs.
-            # Example fix: "content": "He said "Hi"" -> "content": "He said \"Hi\""
-            
-            # Identify the outermost JSON block
-            start = s.find("{")
-            end = s.rfind("}") + 1
-            if start == -1: return s
-            json_str = s[start:end]
-            
-            # Simple escape of internal quotes: matches " inside a value string
-            # This is complex in pure regex, so we use a more targeted approach if loads fails.
-            return json_str
 
         candidate = clean_basic(text)
         try:
@@ -283,6 +304,14 @@ class LLMProvider:
                 try:
                     return json.loads(clean_basic(inner_clean))
                 except json.JSONDecodeError:
+                    # Fallback 1b: escape bare quotes inside string values
+                    try:
+                        fixed = LLMProvider._escape_unescaped_quotes_in_json_strings(
+                            clean_basic(inner_clean)
+                        )
+                        return json.loads(fixed)
+                    except json.JSONDecodeError:
+                        pass
                     # Fallback 2: Structural Scraper (Regex)
                     # This targets specific keys to rebuild the dictionary manually
                     # Useful when LLM fails to escape internal quotes.

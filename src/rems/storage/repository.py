@@ -67,6 +67,7 @@ class EventRepository:
                 location=getattr(event, "location", None),
                 emotion=event.emotion.model_dump(mode="json") if event.emotion is not None else None,
                 forgetting_factor=float(getattr(event, "forgetting_factor", 1.0) or 1.0),
+                seal_reason=getattr(event, "seal_reason", None) or "closed",
                 recall_metadata={
                     "keywords": list(getattr(event, "keywords", None) or []),
                     "location": getattr(event, "location", None),
@@ -286,6 +287,7 @@ class EventRepository:
             interlocutor=(getattr(r, "recall_metadata", None) or {}).get("interlocutor") or None,
             emotion=EmotionalModel(**r.emotion) if (getattr(r, "emotion", None) or None) else None,
             forgetting_factor=float(getattr(r, "forgetting_factor", 1.0) or 1.0),
+            seal_reason=getattr(r, "seal_reason", None) or "closed",
         )
 
 
@@ -526,6 +528,7 @@ class MetabolismRepository:
                 created_at=event.created_at,
                 updated_at=event.updated_at,
                 last_hit_time=event.last_hit_time,
+                interlocutor=event.interlocutor,
                 split_prefix_event_ids=list(event.split_prefix_event_ids or []),
                 oversized=bool(event.oversized),
             )
@@ -557,6 +560,7 @@ class MetabolismRepository:
             created_at=r.created_at,
             updated_at=r.updated_at,
             last_hit_time=r.last_hit_time,
+            interlocutor=getattr(r, "interlocutor", None) or None,
             split_prefix_event_ids=list(getattr(r, "split_prefix_event_ids", None) or []),
             oversized=bool(getattr(r, "oversized", False) or False),
         )

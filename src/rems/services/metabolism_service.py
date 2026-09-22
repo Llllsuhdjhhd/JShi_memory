@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import secrets
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Any, Optional
 
 # 事件代谢：残影合并、边界检测、封存、未完成库维护、物理红线强制整理。
 # 对照《REMS 记忆系统规范解析》4.1–4.2。
@@ -174,17 +174,32 @@ class MetabolismService:
             )
 
         unclosed = self._repo.get_unclosed_events()
+        now = self._ingest_time(memory)
+
+        abandoned: list[Event] = []
+        if not force_save:
+            abandoned, unclosed = self._seal_abandoned_unclosed(
+                unclosed,
+                now=now,
+                memory=memory,
+                input_id=input_id,
+                known_roles_hint=known_roles_hint,
+                pre_role_entries=pre_role_entries,
+            )
+
         # 白皮书新定义：残影是未完成事件的直接拼接
         shadow_content = "\n".join(ue.merged_content for ue in unclosed)
 
         if force_save:
-            return self._force_save_all(
+            sealed = self._force_save_all(
                 shadow_content, raw_input, unclosed,
                 input_id=input_id,
                 known_roles_hint=known_roles_hint,
                 pre_role_entries=pre_role_entries,
                 memory=memory,
             )
+            self._raise_dormant_same_object(sealed)
+            return sealed
 
         # 边界检测仅负责事件切分；摘要/角色等衍生字段由 EventEnrichment 在 seal 时生成。
         # 评估 → 修复 → 采用 三段式：评估器失败时，若配置了修复器则调用一次；
@@ -218,13 +233,16 @@ class MetabolismService:
                 type(self._boundary_remediator).__name__ if self._boundary_remediator else None,
             )
 
-        return self._apply_boundary_result(
+        sealed = self._apply_boundary_result(
             result, unclosed,
             input_id=input_id,
             known_roles_hint=known_roles_hint,
             pre_role_entries=pre_role_entries,
             memory=memory,
         )
+        sealed = abandoned + sealed
+        self._raise_dormant_same_object(sealed)
+        return sealed
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -241,16 +259,14 @@ class MetabolismService:
     ) -> list[Event]:
         """Apply LLM boundary result and refresh shadow / unclosed library.
 
-        关键不变量（修自 P0-5 残影跨轮重复 bug）：**残影仅由当前未完成事件拼接而成**
-        （白皮书 §4.1 视图定义）。本轮入口处 ``shadow = join(previous_unclosed)``，
-        模型已经看到 shadow 全部内容；剩余仍未闭合的部分**必须**通过
-        ``result.new_unclosed`` 重新声明，否则按白皮书 §4.2.2 机制 3「无主碎屑垃圾回收」
-        被丢弃（trace decay）。所以本轮结束时：
+        残影是未完成库的拼接。本轮模型把「残影 + 新输入」的序号划进事件、续写或新的未完成线。
+        旧线被划走后删除，避免同一段文字存两份。没被任何序号领走的句子已由边界解析收成一条未完成线。
+        本轮结束时：
 
             1. 已被 ``continuation_of`` 命中的旧 UC 在循环中删除；
-            2. 把**所有**未被命中的旧 UC 一次性清空——避免与 new_unclosed 内容重复持有；
-            3. 用 ``result.new_unclosed`` 重建未完成库；
-            4. 残影 = join(new_unclosed.merged_content)。
+            2. 删除其余旧 UC，避免与重新声明的内容叠成两份；
+            3. 用 ``result.new_unclosed``（含未领走的句子）重建未完成库；
+            4. 残影 = join(未完成线原文)。
 
         ``known_roles_hint`` 由 pipeline 在 pre-recall 阶段抽取得到，向下传给
         ``EventEnrichmentSkill``，仅作为代词消解的提示——不直接覆盖事件 role_list，
@@ -291,6 +307,7 @@ class MetabolismService:
             event = self._event_svc.seal_event(
                 content,
                 split_prefix_event_ids=inherited_prefix_chain or None,
+                seal_reason="split" if frag.is_split_prefix else "closed",
                 **self._seal_memory_kwargs(
                     memory,
                     content=content,
@@ -316,10 +333,8 @@ class MetabolismService:
                             prefix_id, event.event_id, exc_info=True,
                         )
 
-        # 关键修复：清空所有未被 continuation_of 命中的旧 UC——它们的内容已经作为 shadow
-        # 整段进入 boundary 模型；模型若仍认为它们未闭合，应通过 ``new_unclosed`` 重新声明，
-        # 否则被认定为已彻底失去叙事价值的"无主碎屑"，按 trace decay 丢弃。
-        # 不这样做就会"旧 UC + 新 UC 同时持有同一段文本"——长跑会单调膨胀。
+        # 旧线若已被模型重新声明，会随 new_unclosed 再建一条；这里删掉旧行，避免两份原文。
+        # 模型没领走的句子已经在解析阶段收成一条 new_unclosed，不会在这里丢失。
         for ue in unclosed:
             if ue.id not in consumed_uc_ids:
                 self._repo.delete_unclosed_event(ue.id)
@@ -338,6 +353,7 @@ class MetabolismService:
                 )
 
             prefix_event_id = split_id_to_prefix_event_id.get(nu.split_id) if nu.split_id else None
+            hit_at = self._ingest_time(memory)
             ue = UnclosedEvent(
                 id=f"UC-{secrets.token_hex(4)}",
                 subject_id=memory.subject_id if memory is not None else "",
@@ -345,6 +361,10 @@ class MetabolismService:
                 logical_gaps=nu.logical_gaps,
                 split_prefix_event_ids=[prefix_event_id] if prefix_event_id else [],
                 oversized=is_oversized,
+                interlocutor=getattr(memory, "interlocutor", None) if memory is not None else None,
+                created_at=hit_at,
+                updated_at=hit_at,
+                last_hit_time=hit_at,
             )
             self._repo.save_unclosed_event(ue)
 
@@ -357,7 +377,6 @@ class MetabolismService:
             subject_id=memory.subject_id if memory is not None else "",
         ))
 
-        self._maybe_shadow_compact(final_unclosed)
         self._check_physical_redline()
 
         return sealed
@@ -387,6 +406,7 @@ class MetabolismService:
             event = self._event_svc.seal_event(
                 combined,
                 is_suspicious=is_suspicious,
+                seal_reason="truncated",
                 **self._seal_memory_kwargs(
                     memory,
                     content=combined,
@@ -403,6 +423,7 @@ class MetabolismService:
                     ue.merged_content,
                     is_suspicious=is_suspicious,
                     split_prefix_event_ids=list(ue.split_prefix_event_ids or []) or None,
+                    seal_reason="truncated",
                     **self._seal_memory_kwargs(
                         memory,
                         content=ue.merged_content,
@@ -458,27 +479,10 @@ class MetabolismService:
         }
 
     # ------------------------------------------------------------------
-    def _maybe_shadow_compact(self, unclosed: list[UnclosedEvent]) -> None:
-        """Rewrite fragmented unclosed narratives when fragment count exceeds threshold (§4.2.2)."""
-        skill = self._shadow_compaction
-        if skill is None or not skill.should_compact(unclosed):
-            return
-        for ue in unclosed:
-            compacted = skill.compact(ue.merged_content)
-            if compacted != ue.merged_content:
-                ue.merged_content = compacted
-                self._repo.save_unclosed_event(ue)
-                logger.info("Shadow-compacted unclosed %s", ue.id)
-
     def _check_physical_redline(self) -> None:
-        """If shadow + unclosed exceed physical redline, force-compact.
+        """总长越过物理红线时，把过长或已超时的整条未完成线按 truncated 封存。
 
-        当残影长度与所有未完成事件片段长度之和超过 ``physical_redline`` 时触发：
-        对超过 ``len_msg * unclosed_force_ratio`` 的未完成条目强制封存；按策略遗忘陈旧未完成项；
-        若残影仍高于 ``safe_watermark`` 则截断保留尾部，防止缓冲区无限增长（白皮书 4.2 工程化防溢出）。
-
-        注意：这是"最后一道物理防线"——即便认知层（评估 → 修复）失败，也不允许
-        残影无上限膨胀。此处 force-seal 仍保留，并在封存时继承 ``split_prefix_event_ids``。
+        不改写残影，也不把残影字符串截尾。封存后按剩余未完成线重拼残影。
         """
         shadow = self._repo.get_shadow()
         unclosed = self._repo.get_unclosed_events()
@@ -487,42 +491,221 @@ class MetabolismService:
         if total <= self._config.physical_redline:
             return
 
-        logger.warning("Physical redline hit (%d > %d), forcing compaction", total, self._config.physical_redline)
+        logger.warning("Physical redline hit (%d > %d), sealing overlong lines", total, self._config.physical_redline)
 
+        force_threshold = self._config.len_msg * self._config.unclosed_force_ratio
+        sealed_ids: set[str] = set()
         for ue in unclosed:
-            force_threshold = self._config.len_msg * self._config.unclosed_force_ratio
-            if ue.total_length >= force_threshold:
-                event = self._event_svc.seal_event(
-                    ue.merged_content,
-                    split_prefix_event_ids=list(ue.split_prefix_event_ids or []) or None,
-                )
-                if ue.split_prefix_event_ids and self._event_repo is not None:
-                    for prefix_id in ue.split_prefix_event_ids:
-                        try:
-                            self._event_repo.append_split_successor(prefix_id, event.event_id)
-                        except Exception:  # noqa: BLE001
-                            logger.debug(
-                                "append_split_successor(%s, %s) failed; skipping",
-                                prefix_id, event.event_id, exc_info=True,
-                            )
-                self._repo.delete_unclosed_event(ue.id)
-                logger.info("Force-sealed unclosed %s as event %s (physical-redline tier)", ue.id, event.event_id)
+            if ue.total_length < force_threshold:
+                continue
+            event = self._seal_unclosed_as_event(
+                ue,
+                memory=None,
+                input_id=None,
+                known_roles_hint=None,
+                pre_role_entries=None,
+                seal_reason="truncated",
+            )
+            sealed_ids.add(ue.id)
+            logger.info("Force-sealed unclosed %s as event %s (physical-redline tier)", ue.id, event.event_id)
 
-        self._forget_stale_unclosed(unclosed)
-
-        remaining_shadow = self._repo.get_shadow()
-        if remaining_shadow.length > self._config.safe_watermark:
-            trimmed = remaining_shadow.content[-self._config.safe_watermark:]
-            self._repo.update_shadow(Shadow(content=trimmed, updated_at=datetime.now()))
+        self._forget_stale_unclosed([ue for ue in unclosed if ue.id not in sealed_ids])
+        self._rebuild_shadow()
 
     # ------------------------------------------------------------------
-    def _forget_stale_unclosed(self, unclosed: list[UnclosedEvent], stale_hours: int = 24) -> None:
-        # 长时间未续写的未完成条目丢弃，避免库无限膨胀（工程策略）。
-        cutoff = datetime.now() - timedelta(hours=stale_hours)
+    def _seal_abandoned_unclosed(
+        self,
+        unclosed: list[UnclosedEvent],
+        *,
+        now: datetime,
+        memory: MemoryExperience | None,
+        input_id: str | None,
+        known_roles_hint: list[Role] | None,
+        pre_role_entries: list[EventRoleEntry] | None,
+    ) -> tuple[list[Event], list[UnclosedEvent]]:
+        """按闲置规则封存未完成条目，原因记为 truncated。
+
+        单条字数变长不在边界检测前封存，先交给边界和 80/20 切开。
+        闲置启用时：字数 > 0.5×上限且闲置达到部分天数，或闲置达到硬天数。
+        说话人更换不触发封存。
+        """
+        char_limit = int(self._config.unclosed_char_limit or 0)
+        idle_on = bool(self._config.unclosed_idle_seal_enabled)
+        if char_limit <= 0 and not idle_on:
+            return [], list(unclosed)
+
+        sealed: list[Event] = []
+        remaining: list[UnclosedEvent] = []
         for ue in unclosed:
-            if ue.last_hit_time < cutoff:
-                logger.info("Forgetting stale unclosed event %s", ue.id)
+            if ue.total_length <= 0:
                 self._repo.delete_unclosed_event(ue.id)
+                continue
+            if self._is_abandoned_unclosed(ue, now=now):
+                logger.info(
+                    "Sealing abandoned unclosed %s (char-limit/idle; incomplete OK)",
+                    ue.id,
+                )
+                sealed.append(
+                    self._seal_unclosed_as_event(
+                        ue,
+                        memory=memory,
+                        input_id=input_id,
+                        known_roles_hint=known_roles_hint,
+                        pre_role_entries=pre_role_entries,
+                    )
+                )
+            else:
+                remaining.append(ue)
+
+        if sealed:
+            subject_id = memory.subject_id if memory is not None else ""
+            self._repo.update_shadow(Shadow(
+                content="\n".join(ue.merged_content for ue in remaining),
+                updated_at=now,
+                subject_id=subject_id,
+            ))
+        return sealed, remaining
+
+    def _is_abandoned_unclosed(
+        self,
+        ue: UnclosedEvent,
+        *,
+        now: datetime,
+    ) -> bool:
+        """单条未完成事件是否应封存。"""
+        length = int(ue.total_length)
+        char_limit = int(self._config.unclosed_char_limit or 0)
+
+        if not self._config.unclosed_idle_seal_enabled:
+            return False
+
+        hit = self._as_naive(ue.last_hit_time or ue.updated_at)
+        if hit is None:
+            return False
+        idle = now - hit
+        hard_days = float(self._config.unclosed_idle_hard_days or 0.0)
+        partial_days = float(self._config.unclosed_idle_partial_days or 0.0)
+        partial_ratio = float(self._config.unclosed_idle_partial_ratio or 0.5)
+
+        # 1.3 闲置 ≥ 硬上限天数（默认 7 天）
+        if hard_days > 0 and idle >= timedelta(days=hard_days):
+            return True
+        # 1.3 字数 > 0.5×限制 且闲置 ≥ 部分天数（默认 3 天）
+        if (
+            char_limit > 0
+            and partial_days > 0
+            and length > char_limit * partial_ratio
+            and idle >= timedelta(days=partial_days)
+        ):
+            return True
+        return False
+
+    def _seal_unclosed_as_event(
+        self,
+        ue: UnclosedEvent,
+        *,
+        memory: MemoryExperience | None,
+        input_id: str | None,
+        known_roles_hint: list[Role] | None,
+        pre_role_entries: list[EventRoleEntry] | None,
+        seal_reason: str = "truncated",
+    ) -> Event:
+        event = self._event_svc.seal_event(
+            ue.merged_content,
+            split_prefix_event_ids=list(ue.split_prefix_event_ids or []) or None,
+            seal_reason=seal_reason,
+            **self._seal_memory_kwargs(
+                memory,
+                content=ue.merged_content,
+                input_id=input_id,
+                known_roles_hint=known_roles_hint,
+                pre_role_entries=pre_role_entries,
+            ),
+        )
+        if ue.split_prefix_event_ids and self._event_repo is not None:
+            for prefix_id in ue.split_prefix_event_ids:
+                try:
+                    self._event_repo.append_split_successor(prefix_id, event.event_id)
+                except Exception:  # noqa: BLE001
+                    logger.debug(
+                        "append_split_successor(%s, %s) failed; skipping",
+                        prefix_id, event.event_id, exc_info=True,
+                    )
+        self._repo.delete_unclosed_event(ue.id)
+        self._raise_dormant_same_object([event])
+        return event
+
+    def _forget_stale_unclosed(self, unclosed: list[UnclosedEvent], stale_hours: int = 24) -> None:
+        # 物理红线兜底：过久未续写的未完成改为封存，不再丢弃原文。
+        now = datetime.now()
+        cutoff = now - timedelta(hours=stale_hours)
+        for ue in unclosed:
+            if ue.total_length <= 0:
+                continue
+            hit = ue.last_hit_time or ue.updated_at
+            if hit is None or hit >= cutoff:
+                continue
+            if self._repo.get_unclosed_event(ue.id) is None:
+                continue
+            logger.info("Sealing stale unclosed event %s (physical-redline idle)", ue.id)
+            self._seal_unclosed_as_event(
+                ue,
+                memory=None,
+                input_id=None,
+                known_roles_hint=None,
+                pre_role_entries=None,
+            )
+
+    def _rebuild_shadow(self) -> None:
+        remaining = self._repo.get_unclosed_events()
+        self._repo.update_shadow(Shadow(
+            content="\n".join(ue.merged_content for ue in remaining),
+            updated_at=datetime.now(),
+        ))
+
+    def _raise_dormant_same_object(self, events: list[Event]) -> None:
+        """同一对象出现新事件时，把该对象仍低于静默阈值的旧事件抬到阈值。
+
+        只改遗忘因子，不改原文，也不改召回管线。
+        """
+        if not events or self._event_repo is None:
+            return
+        threshold = float(self._config.forgetting_silence_threshold or 0.02)
+        for event in events:
+            object_ids = {
+                entry.role_id
+                for entry in (event.role_list or [])
+                if not getattr(entry, "is_subject", False) and entry.role_id
+            }
+            if not object_ids:
+                continue
+            subject = event.subject_id or ""
+            for other in self._event_repo.list_all(exclude_tombstoned=True):
+                if other.event_id == event.event_id:
+                    continue
+                if subject and other.subject_id and other.subject_id != subject:
+                    continue
+                if float(other.forgetting_factor or 0) >= threshold:
+                    continue
+                other_ids = {
+                    entry.role_id
+                    for entry in (other.role_list or [])
+                    if not getattr(entry, "is_subject", False) and entry.role_id
+                }
+                if object_ids & other_ids:
+                    self._event_repo.update_forgetting_factor(other.event_id, threshold)
+
+    @staticmethod
+    def _ingest_time(memory: MemoryExperience | None) -> datetime:
+        if memory is not None and getattr(memory, "occurred_at", None):
+            return MetabolismService._as_naive(memory.occurred_at)
+        return datetime.now()
+
+    @staticmethod
+    def _as_naive(dt: datetime) -> datetime:
+        if dt.tzinfo is not None:
+            return dt.replace(tzinfo=None)
+        return dt
 
     # ------------------------------------------------------------------
     @staticmethod

@@ -55,6 +55,37 @@ class BoundaryDetectionSkill:
     """
 
     @staticmethod
+    def _collect_object_indices(raw: list, n_sent: int) -> set[int]:
+        claimed: set[int] = set()
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            indices = item.get("indices")
+            if not isinstance(indices, list):
+                continue
+            claimed.update(i for i in normalize_indices(indices) if 1 <= i <= n_sent)
+        return claimed
+
+    @staticmethod
+    def _collect_legacy_indices(raw: list, n_sent: int) -> set[int]:
+        claimed: set[int] = set()
+
+        def _walk(node: object) -> None:
+            if isinstance(node, bool):
+                return
+            if isinstance(node, (int, float)):
+                idx = int(node)
+                if 1 <= idx <= n_sent:
+                    claimed.add(idx)
+                return
+            if isinstance(node, list):
+                for child in node:
+                    _walk(child)
+
+        _walk(raw)
+        return claimed
+
+    @staticmethod
     def _decode_new_unclosed_list(raw: list, sentences: list[str]) -> list[NewUnclosed]:
         """Map legacy ``new_unclosed_indices`` JSON to ``NewUnclosed`` list.
 
@@ -144,6 +175,10 @@ class BoundaryDetectionSkill:
             indexed_input=ctx["indexed_input"],
             range_hint=ctx["range_hint"],
             force_threshold=force_threshold,
+            unclosed_char_limit=int(self._config.unclosed_char_limit or 0),
+            unclosed_idle_partial_days=float(self._config.unclosed_idle_partial_days or 0.0),
+            unclosed_idle_hard_days=float(self._config.unclosed_idle_hard_days or 0.0),
+            unclosed_idle_partial_ratio=float(self._config.unclosed_idle_partial_ratio or 0.5),
         )
         system_msg = build_user_mode_block(self._config) + BOUNDARY_SYSTEM
 
@@ -166,7 +201,12 @@ class BoundaryDetectionSkill:
     ) -> dict:
         """Build sentence index table for boundary (shared by standalone + session Turn3)."""
         unclosed_summary = "无" if not unclosed_events else "\n".join(
-            f"- ID={ue.id}, 片段={ue.merged_content[:80]}…, 缺={ue.logical_gaps or '未知'}"
+            (
+                f"- ID={ue.id}, 片段={ue.merged_content[:80]}…, "
+                f"缺={ue.logical_gaps or '未知'}, "
+                f"说话对象={ue.interlocutor or '无'}, "
+                f"上次触及={ue.last_hit_time}"
+            )
             for ue in (unclosed_events or [])
         )
         shadow_sentences = segment_sentences(shadow_content) if shadow_content else []
@@ -196,13 +236,17 @@ class BoundaryDetectionSkill:
         self, data: dict, sentences: list[str], shadow_count: int = 0,
     ) -> BoundaryResult:
         completed: list[CompletedFragment] = []
+        claimed: set[int] = set()
+        n_sent = len(sentences)
         for item in data.get("completed_events", []):
             if not isinstance(item, dict):
                 continue
             indices = normalize_indices(item.get("content_raw_indices", []))
+            claimed.update(i for i in indices if 1 <= i <= n_sent)
             continuation_of = item.get("continuation_of")
             # 续写去重：命中 continuation_of 时，旧残影内容由后端合并 UC 自动补上；
             # 这里剥掉落在旧残影区间内的句子索引，避免 ue.merged_content + 片段重复。
+            # 这些旧序号已经计入 claimed，不会再被收成另一条未完成线。
             if continuation_of and shadow_count > 0:
                 indices = [i for i in indices if i > shadow_count]
             extracted_raw = decode_indices(sentences, indices)
@@ -228,11 +272,19 @@ class BoundaryDetectionSkill:
         new_unc: list[NewUnclosed] = []
         new_obj = data.get("new_unclosed")
         if isinstance(new_obj, list) and new_obj and all(isinstance(x, dict) for x in new_obj):
+            claimed.update(self._collect_object_indices(new_obj, n_sent))
             new_unc = self._decode_new_unclosed_objects(new_obj, sentences)
         else:
             legacy_raw = data.get("new_unclosed_indices") or data.get("new_unclosed") or []
             if isinstance(legacy_raw, list):
+                claimed.update(self._collect_legacy_indices(legacy_raw, n_sent))
                 new_unc = self._decode_new_unclosed_list(legacy_raw, sentences)
+
+        missing = [i for i in range(1, n_sent + 1) if i not in claimed]
+        if missing:
+            leftover = decode_indices(sentences, missing)
+            if leftover:
+                new_unc.append(NewUnclosed(content=leftover, logical_gaps=None))
 
         return BoundaryResult(
             completed_events=completed,

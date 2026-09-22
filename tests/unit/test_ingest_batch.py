@@ -72,9 +72,8 @@ class TestIngestBatch:
             "emotion": {"joy": 0.8},
             "objects": [{
                 "name": "阿明",
-                "l1_mention": "阿明与匠石一起看落日。",
-                "l2_interaction": "阿明陪匠石在海边看落日。",
-                "l3_decision": "阿明决定陪匠石看落日。",
+                "fact": "我和小明一起看了落日。",
+                "l3_decision": "性格急躁",
             }],
             "location": "海边",
         })
@@ -102,6 +101,7 @@ class TestIngestBatch:
         assert ev.content_raw == "今天看到美丽的落日"
         assert ev.subject_id == "jshi-1"
         assert ev.origin == "external"
+        assert ev.seal_reason == "closed"
         assert ev.source_ids == ["FACT-1"]
         assert ev.emotion is not None
         assert ev.emotion.emotion.joy == pytest.approx(0.8)
@@ -110,18 +110,19 @@ class TestIngestBatch:
         assert len(subjects) == 1
         assert subjects[0].role_id == "jshi-1"
         obj_entry = next(r for r in ev.role_list if r.role_id == "OBJ-AMING" and not r.is_subject)
-        assert obj_entry.role_snapshot.l1_mention == "阿明与匠石一起看落日。"
-        assert obj_entry.role_snapshot.l2_interaction == "阿明陪匠石在海边看落日。"
-        assert obj_entry.role_snapshot.l3_decision == "阿明决定陪匠石看落日。"
+        assert obj_entry.role_snapshot.l1_mention is None
+        assert obj_entry.role_snapshot.l2_interaction is None
+        assert obj_entry.role_snapshot.l3_decision is None
 
-        # 白描（white_painting_entries）：匠石对对象的分级白描，事件关联，无情感
         wps = role_repo.get_white_painting("OBJ-AMING")
         assert len(wps) == 1
         assert wps[0].event_id == ev.event_id
         assert wps[0].subject_id == "jshi-1"
-        assert wps[0].l1_mention == "阿明与匠石一起看落日。"
-        assert wps[0].l2_interaction == "阿明陪匠石在海边看落日。"
-        assert wps[0].role_summary == "阿明陪匠石在海边看落日。"
+        assert wps[0].role_summary == "我和小明一起看了落日。"
+        assert wps[0].l1_mention is None
+        assert wps[0].l2_interaction is None
+        assert wps[0].l3_decision is None
+        assert "性格" not in wps[0].role_summary
         assert marks_repo.get("seg-001") == [ev.event_id]
 
     def test_subject_memory_no_objects(self, memory_pipeline, fake_llm: FakeLLM):

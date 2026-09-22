@@ -17,7 +17,6 @@ from ..models.event import (
     EventRoleEntry,
     EventStatus,
     Importance,
-    RoleSnapshot,
 )
 from ..models.object_entry import ObjectMemoryEntry
 from ..models.role import Role
@@ -83,6 +82,7 @@ class EventService:
         known_roles: list[Role] | None = None,
         pre_role_entries: list[EventRoleEntry] | None = None,
         split_prefix_event_ids: list[str] | None = None,
+        seal_reason: str = "closed",
         subject_id: str = "",
         objects: dict[str, str] | None = None,
         source_ids: tuple[str, ...] = (),
@@ -93,7 +93,8 @@ class EventService:
 
         创建、丰富字段、持久化并索引一条新的基本事件（``is_abstract`` 默认为 False）。
         可选传入已构造好的 ``role_entries`` 或 ``skip_roles`` 跳过角色抽取；
-        ``known_roles`` 供 Enrichment 技能做去代词化对齐。超长 ``content_raw`` 会在 ``len_msg`` 处截断。
+        ``known_roles`` 供 Enrichment 技能做去代词化对齐。``content_raw`` 保持字面全文。
+        ``seal_reason`` 为 ``closed`` / ``split`` / ``truncated``；后两者的摘要只描述已出现的原文。
 
         ``split_prefix_event_ids``：当本事件是某条 tail UC 闭环而来时，传入该 UC 继承的
         分裂前缀链（自远而近）；本事件会把它写入 ``Event.split_prefix_event_ids``，
@@ -108,13 +109,8 @@ class EventService:
 
         实现上：一次 ``EventEnrichmentSkill.enrich`` 调用按需走 full / names_only / summary_only 分支。
         """
-        length_cap = self._config.len_msg
-        if len(content_raw) > length_cap:
-            logger.warning(
-                "content_raw (%d chars) exceeds len_msg (%d), truncating",
-                len(content_raw), length_cap,
-            )
-            content_raw = content_raw[:length_cap]
+        if seal_reason not in ("closed", "split", "truncated"):
+            seal_reason = "closed"
 
         # 白皮书 1.2：前置预算计算 —— 在调用任何 LLM 之前确定性地算出各衍生数据项的字符预算
         budget = self._compute_budget(len(content_raw))
@@ -130,6 +126,7 @@ class EventService:
         #     snapshot/情感由后端从池中回填；
         #   - 否则：full，由 enrichment 一并产出 snapshot + 8 维情绪。
         # ``known_roles`` 始终作为代词消解 hint 透传给 enrichment。
+        memory_mode = objects is not None
         external_roles_provided = bool(role_entries) or skip_roles
         use_names_only = (
             not external_roles_provided
@@ -143,12 +140,12 @@ class EventService:
             names_only=use_names_only,
             known_roles=known_roles,
             memory_objects=objects,
+            seal_reason=seal_reason if memory_mode else "closed",
         )
 
         from ..skills.role_extraction import RoleExtractionSkill
         resolved_role_entries = list(role_entries or [])
 
-        memory_mode = objects is not None
         if memory_mode:
             # 记忆路径（design/410/610）：角色列表 = 主体恒在 + 对象映射表；
             # 不抽取、不建档、不建角色系统；对象无情感。
@@ -169,12 +166,6 @@ class EventService:
                         EventRoleEntry(
                             role_id=oid,
                             importance=Importance.C,
-                            role_snapshot=(
-                                enrichment.object_white_paintings.get(name)
-                                or RoleSnapshot(
-                                    l1_mention=enrichment.object_snapshots.get(name),
-                                )
-                            ),
                         )
                     )
         elif use_names_only:
@@ -242,9 +233,9 @@ class EventService:
                 assigned_id = id_mapping.get(lookup_key, lookup_key)
                 resolved_role_entries.append(RoleExtractionSkill.to_event_role_entry(r, assigned_id))
 
-        # 3. 生成主观装饰 (Decoration) - 受开关管控
+        # 3. 生成主观装饰 (Decoration) - 受开关管控。记忆路径不写装饰。
         decoration = ""
-        if self._config.enable_decoration:
+        if self._config.enable_decoration and not memory_mode:
             decoration = self._generate_decoration(content_raw, char_budget=budget.decoration_budget)
         else:
             logging.debug("Decoration skipped per config.")
@@ -272,6 +263,7 @@ class EventService:
             location=getattr(enrichment, "location", None),
             emotion=enrichment.emotion,
             origin=origin or "external",
+            seal_reason=seal_reason,
         )
 
         if memory_mode and event.emotion is not None:
@@ -300,18 +292,18 @@ class EventService:
 
         self._event_repo.save(event)
         if memory_mode and self._role_service is not None:
-            # 匠石对对象的分级白描 → white_painting_entries（事件关联，无情感、无等级）
+            # 每个对象追加一句与本事件绑定的事实白描。
             for name, oid in (objects or {}).items():
                 if not oid:
                     continue
-                snap = enrichment.object_white_paintings.get(name) or RoleSnapshot(
-                    l1_mention=enrichment.object_snapshots.get(name),
-                )
+                fact = (enrichment.object_snapshots.get(name) or "").strip()
+                if not fact:
+                    continue
                 self._role_service.append_object_white_painting(
                     object_id=oid,
                     subject_id=subject_id,
                     event=event,
-                    snapshot=snap,
+                    fact=fact,
                 )
         if not memory_mode and self._vector is not None:
             # 旧路径兼容：仅当显式注入了旧向量库才索引（新架构索引走 recall_pipeline，design/1010）。
