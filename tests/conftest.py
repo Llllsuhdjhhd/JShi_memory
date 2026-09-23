@@ -20,6 +20,8 @@ def config(tmp_dir):
     cfg.embedding.provider = "hash"  # Use deterministic hash to avoid downloading models
     cfg.recall_query_compress_enabled = False
     cfg.ingest_llm_session_enabled = False
+    # 生产默认 200 字才立即封存。既有单测用短文本，并断言当轮封存。
+    cfg.event_min_chars = 0
     return cfg
 
 @pytest.fixture

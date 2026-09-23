@@ -325,7 +325,7 @@ class LLMProvider:
                             recovered[key] = match.group(1).replace('\\"', '"') # Basic unescape
                     
                     # Pattern for list of objects (like completed_events or new_unclosed)
-                    for key in ["completed_events", "new_unclosed", "roles", "sealed_events"]:
+                    for key in ["completed_events", "new_unclosed", "events", "residual", "roles", "sealed_events"]:
                         # Extract the array content between [...]
                         match = re.search(f'"{key}"\\s*:\\s*\\[(.*?)\\]\\s*(?:,|}})', inner, re.DOTALL)
                         if match:

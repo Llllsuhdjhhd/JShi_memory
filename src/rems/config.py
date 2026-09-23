@@ -283,6 +283,9 @@ class REMSConfig(BaseSettings):
     # 兼容旧环境变量；逻辑已废弃，勿再依赖。
     unclosed_idle_hours: float = 1.0
     unclosed_interlocutor_break_seal: bool = False
+    # 立即封存的原文字数门槛。短于该值的事件仍是事件，留在形成窗口等待持久化。
+    # 0 = 不设门槛，当轮封存。模型不看这个数。
+    event_min_chars: int = 200
     # ---- 80/20 Forced Split (2026-05, 白皮书 4.2 升级) ----
     # 评估到 oversized_uc 后，OverlongUCSplitSkill 的目标切分比例与可接受区间。
     # 切点仍由模型基于"逻辑闭环"选择，此处只给数量级指引。

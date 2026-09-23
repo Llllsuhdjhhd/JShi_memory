@@ -285,24 +285,31 @@ class MetabolismService:
         """
         sealed: list[Event] = []
         consumed_uc_ids: set[str] = set()
+        kept: list[UnclosedEvent] = []
         # split_id → prefix event_id，便于 tail UC 落库时回写 split_prefix_event_ids。
         split_id_to_prefix_event_id: dict[str, str] = {}
+        minimum = int(self._config.event_min_chars or 0)
 
         for frag in result.completed_events:
-            if frag.continuation_of:
-                ue = self._find_unclosed(unclosed, frag.continuation_of)
-                if ue:
-                    content = ue.merged_content + "\n" + frag.content_raw
-                    # 继承该 UC 持有的前缀链（若它本身是 tail UC）。
-                    inherited_prefix_chain = list(ue.split_prefix_event_ids or [])
-                    self._repo.delete_unclosed_event(ue.id)
-                    consumed_uc_ids.add(ue.id)
-                else:
-                    content = frag.content_raw
-                    inherited_prefix_chain = []
-            else:
-                content = frag.content_raw
-                inherited_prefix_chain = []
+            ue, content, inherited_prefix_chain = self._resolve_fragment(frag, unclosed)
+            if ue:
+                consumed_uc_ids.add(ue.id)
+            hold_short = (
+                not frag.is_split_prefix
+                and minimum > 0
+                and len(content) < minimum
+            )
+            if hold_short:
+                same = ue is not None and content == ue.merged_content
+                kept.append(self._window_line(
+                    ue=ue,
+                    content=content,
+                    role="formed",
+                    prefix=inherited_prefix_chain,
+                    memory=memory,
+                    last_hit=ue.last_hit_time if same and ue is not None else None,
+                ))
+                continue
 
             event = self._event_svc.seal_event(
                 content,
@@ -333,13 +340,18 @@ class MetabolismService:
                             prefix_id, event.event_id, exc_info=True,
                         )
 
-        # 旧线若已被模型重新声明，会随 new_unclosed 再建一条；这里删掉旧行，避免两份原文。
-        # 模型没领走的句子已经在解析阶段收成一条 new_unclosed，不会在这里丢失。
-        for ue in unclosed:
-            if ue.id not in consumed_uc_ids:
-                self._repo.delete_unclosed_event(ue.id)
+        for text in result.no_form_texts:
+            logger.info("Dust exit (no_form), not stored: %s", text[:200])
 
-        # 新建未完成事件：不再盲目 force-seal；越阈值条目仅标记 oversized=True。
+        # 已形成但本轮没被改写的短事件留在窗口里，不退回残影，也不删掉。
+        for ue in unclosed:
+            if ue.formation_role == "formed" and ue.id not in consumed_uc_ids:
+                continue
+            self._repo.delete_unclosed_event(ue.id)
+
+        for item in kept:
+            self._repo.save_unclosed_event(item)
+
         force_threshold = int(self._config.len_msg * self._config.unclosed_force_ratio)
         for nu in result.new_unclosed:
             is_oversized = len(nu.content) > force_threshold
@@ -351,22 +363,29 @@ class MetabolismService:
                     self._config.unclosed_force_ratio,
                     force_threshold,
                 )
-
+            source = self._find_unclosed(unclosed, nu.continuation_of) if nu.continuation_of else None
+            prefix_ids = list(source.split_prefix_event_ids or []) if source else []
             prefix_event_id = split_id_to_prefix_event_id.get(nu.split_id) if nu.split_id else None
-            hit_at = self._ingest_time(memory)
-            ue = UnclosedEvent(
-                id=f"UC-{secrets.token_hex(4)}",
-                subject_id=memory.subject_id if memory is not None else "",
-                content_fragments=[nu.content],
+            if prefix_event_id:
+                prefix_ids.append(prefix_event_id)
+            self._repo.save_unclosed_event(self._window_line(
+                ue=None,
+                content=nu.content,
+                role="residual",
+                prefix=prefix_ids,
+                memory=memory,
                 logical_gaps=nu.logical_gaps,
-                split_prefix_event_ids=[prefix_event_id] if prefix_event_id else [],
                 oversized=is_oversized,
-                interlocutor=getattr(memory, "interlocutor", None) if memory is not None else None,
-                created_at=hit_at,
-                updated_at=hit_at,
-                last_hit_time=hit_at,
-            )
-            self._repo.save_unclosed_event(ue)
+            ))
+
+        for text in result.pending_texts:
+            self._repo.save_unclosed_event(self._window_line(
+                ue=None,
+                content=text,
+                role="rejudge",
+                prefix=[],
+                memory=memory,
+            ))
 
         # 更新残影记录（为保持一致性，每次代谢后同步更新）
         final_unclosed = self._repo.get_unclosed_events()
@@ -540,11 +559,11 @@ class MetabolismService:
             if ue.total_length <= 0:
                 self._repo.delete_unclosed_event(ue.id)
                 continue
-            if self._is_abandoned_unclosed(ue, now=now):
-                logger.info(
-                    "Sealing abandoned unclosed %s (char-limit/idle; incomplete OK)",
-                    ue.id,
-                )
+            if not self._is_abandoned_unclosed(ue, now=now):
+                remaining.append(ue)
+                continue
+            if (ue.formation_role or "residual") == "formed":
+                logger.info("Sealing held event %s after wait (closed)", ue.id)
                 sealed.append(
                     self._seal_unclosed_as_event(
                         ue,
@@ -552,10 +571,18 @@ class MetabolismService:
                         input_id=input_id,
                         known_roles_hint=known_roles_hint,
                         pre_role_entries=pre_role_entries,
+                        seal_reason="closed",
                     )
                 )
-            else:
-                remaining.append(ue)
+                continue
+            logger.info("Rejudging abandoned residual %s before seal", ue.id)
+            sealed.extend(self._rejudge_abandoned(
+                [ue],
+                memory=memory,
+                input_id=input_id,
+                known_roles_hint=known_roles_hint,
+                pre_role_entries=pre_role_entries,
+            ))
 
         if sealed:
             subject_id = memory.subject_id if memory is not None else ""
@@ -706,6 +733,126 @@ class MetabolismService:
         if dt.tzinfo is not None:
             return dt.replace(tzinfo=None)
         return dt
+
+    def _resolve_fragment(
+        self,
+        frag,
+        unclosed: list[UnclosedEvent],
+    ) -> tuple[UnclosedEvent | None, str, list[str]]:
+        ue = self._find_unclosed(unclosed, frag.continuation_of) if frag.continuation_of else None
+        if getattr(frag, "content_includes_source", False):
+            content = frag.content_raw
+        elif ue and frag.content_raw:
+            content = ue.merged_content + "\n" + frag.content_raw
+        elif ue:
+            content = ue.merged_content
+        else:
+            content = frag.content_raw
+        prefix = list(ue.split_prefix_event_ids or []) if ue else []
+        return ue, content, prefix
+
+    def _window_line(
+        self,
+        *,
+        ue: UnclosedEvent | None,
+        content: str,
+        role: str,
+        prefix: list[str],
+        memory: MemoryExperience | None,
+        last_hit: datetime | None = None,
+        logical_gaps: str | None = None,
+        oversized: bool = False,
+    ) -> UnclosedEvent:
+        now = self._ingest_time(memory)
+        hit = last_hit or now
+        subject = ""
+        if ue is not None and ue.subject_id:
+            subject = ue.subject_id
+        elif memory is not None:
+            subject = memory.subject_id
+        interlocutor = ue.interlocutor if ue is not None else None
+        if memory is not None and getattr(memory, "interlocutor", None):
+            interlocutor = memory.interlocutor
+        return UnclosedEvent(
+            id=ue.id if ue is not None else f"UC-{secrets.token_hex(4)}",
+            subject_id=subject,
+            content_fragments=[content],
+            logical_gaps=logical_gaps if logical_gaps is not None else (ue.logical_gaps if ue else None),
+            split_prefix_event_ids=list(prefix or []),
+            oversized=oversized,
+            interlocutor=interlocutor,
+            created_at=ue.created_at if ue is not None else now,
+            updated_at=now,
+            last_hit_time=hit,
+            formation_role=role,
+        )
+
+    def _rejudge_abandoned(
+        self,
+        lines: list[UnclosedEvent],
+        *,
+        memory: MemoryExperience | None,
+        input_id: str | None,
+        known_roles_hint: list[Role] | None,
+        pre_role_entries: list[EventRoleEntry] | None,
+    ) -> list[Event]:
+        """搁置的残影再划分一次。已有边界的封为 closed，仍未形成的封为 truncated。"""
+        try:
+            result = self._boundary.detect("", "", lines)
+        except Exception:
+            logger.exception("Formation rejudge failed; sealing residual as truncated")
+            return [
+                self._seal_unclosed_as_event(
+                    ue,
+                    memory=memory,
+                    input_id=input_id,
+                    known_roles_hint=known_roles_hint,
+                    pre_role_entries=pre_role_entries,
+                    seal_reason="truncated",
+                )
+                for ue in lines
+            ]
+
+        sealed: list[Event] = []
+        handled: set[str] = set()
+        no_form = set(result.no_form_texts)
+        if result.completed_events:
+            for frag in result.completed_events:
+                ue, content, prefix = self._resolve_fragment(frag, lines)
+                if ue:
+                    handled.add(ue.id)
+                event = self._event_svc.seal_event(
+                    content,
+                    split_prefix_event_ids=prefix or None,
+                    seal_reason="closed",
+                    **self._seal_memory_kwargs(
+                        memory,
+                        content=content,
+                        input_id=input_id,
+                        known_roles_hint=known_roles_hint,
+                        pre_role_entries=pre_role_entries,
+                    ),
+                )
+                sealed.append(event)
+                if ue is not None:
+                    self._repo.delete_unclosed_event(ue.id)
+                    self._raise_dormant_same_object([event])
+        for ue in lines:
+            if ue.id in handled:
+                continue
+            if ue.merged_content and ue.merged_content in no_form:
+                logger.info("Dust exit on rejudge, not stored: %s", ue.merged_content[:200])
+                self._repo.delete_unclosed_event(ue.id)
+                continue
+            sealed.append(self._seal_unclosed_as_event(
+                ue,
+                memory=memory,
+                input_id=input_id,
+                known_roles_hint=known_roles_hint,
+                pre_role_entries=pre_role_entries,
+                seal_reason="truncated",
+            ))
+        return sealed
 
     # ------------------------------------------------------------------
     @staticmethod

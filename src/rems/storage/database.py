@@ -149,6 +149,7 @@ class UnclosedEventRecord(Base):
     split_prefix_event_ids = Column(JSON, default=list)
     # 审计：评估器判定 oversized 但修复失败时置为 True；不触发强制封存。
     oversized = Column(Boolean, default=False)
+    formation_role = Column(String, default="residual")
 
 
 class ObjectMemoryEntryRecord(Base):
@@ -347,6 +348,7 @@ class Database:
                 ("oversized", "BOOLEAN DEFAULT 0"),
                 ("subject_id", "TEXT DEFAULT ''"),
                 ("interlocutor", "TEXT"),
+                ("formation_role", "TEXT DEFAULT 'residual'"),
             ],
             "shadow": [
                 ("subject_id", "TEXT DEFAULT ''"),

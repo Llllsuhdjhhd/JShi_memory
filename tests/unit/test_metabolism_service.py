@@ -86,6 +86,11 @@ class TestAbandonedUnclosedSeal:
             updated_at=past,
             last_hit_time=past,
         ))
+        fake_llm.push_response({
+            "events": [],
+            "residual": [{"indices": [1], "continues": "UC-idle"}],
+            "no_form": [],
+        })
         fake_llm.push_response({"summaries": {"L1": "商量出门未定"}, "roles": []})
         fake_llm.push_response({
             "completed_events": [{"content_raw_indices": [1], "continuation_of": None}],
@@ -122,6 +127,11 @@ class TestAbandonedUnclosedSeal:
             updated_at=past,
             last_hit_time=past,
         ))
+        fake_llm.push_response({
+            "events": [],
+            "residual": [{"indices": [1], "continues": "UC-partial"}],
+            "no_form": [],
+        })
         fake_llm.push_response({"summaries": {"L1": "半限闲置封存"}, "roles": []})
         fake_llm.push_response({
             "completed_events": [{"content_raw_indices": [1], "continuation_of": None}],

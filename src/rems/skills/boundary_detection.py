@@ -31,6 +31,8 @@ class CompletedFragment(BaseModel):
     # ``split_id`` 与同一 BoundaryResult 中某条 NewUnclosed.split_id 配对。
     is_split_prefix: bool = False
     split_id: Optional[str] = None
+    # 新协议：indices 已含来源线的句子，原文不再与旧线拼接一次。
+    content_includes_source: bool = False
 
 
 class NewUnclosed(BaseModel):
@@ -39,11 +41,14 @@ class NewUnclosed(BaseModel):
     # 分裂尾段标记：若非 None，则指向同一 ``BoundaryResult`` 中
     # 某条 ``is_split_prefix=True`` 的 ``CompletedFragment``。
     split_id: Optional[str] = None
+    continuation_of: Optional[str] = None
 
 
 class BoundaryResult(BaseModel):
     completed_events: list[CompletedFragment] = Field(default_factory=list)
     new_unclosed: list[NewUnclosed] = Field(default_factory=list)
+    no_form_texts: list[str] = Field(default_factory=list)
+    pending_texts: list[str] = Field(default_factory=list)
 
 
 class BoundaryDetectionSkill:
@@ -169,16 +174,11 @@ class BoundaryDetectionSkill:
         unclosed_events: list[UnclosedEvent] | None = None,
     ) -> BoundaryResult:
         ctx = self.build_index_context(shadow_content, current_input, unclosed_events)
-        force_threshold = int(self._config.len_msg * self._config.unclosed_force_ratio)
         user_msg = BOUNDARY_USER.format(
-            unclosed_summary=ctx["unclosed_summary"],
+            formed_lines=ctx["formed_lines"],
+            residual_lines=ctx["residual_lines"],
             indexed_input=ctx["indexed_input"],
             range_hint=ctx["range_hint"],
-            force_threshold=force_threshold,
-            unclosed_char_limit=int(self._config.unclosed_char_limit or 0),
-            unclosed_idle_partial_days=float(self._config.unclosed_idle_partial_days or 0.0),
-            unclosed_idle_hard_days=float(self._config.unclosed_idle_hard_days or 0.0),
-            unclosed_idle_partial_ratio=float(self._config.unclosed_idle_partial_ratio or 0.5),
         )
         system_msg = build_user_mode_block(self._config) + BOUNDARY_SYSTEM
 
@@ -190,8 +190,35 @@ class BoundaryDetectionSkill:
             ],
         )
         return self.parse_response(
-            data, ctx["sentences"], shadow_count=ctx["shadow_count"],
+            data,
+            ctx["sentences"],
+            shadow_count=ctx["shadow_count"],
+            formed_indices=ctx["formed_indices"],
         )
+
+    @staticmethod
+    def _line_label(start: int, end: int) -> str:
+        if start == end:
+            return f"序号 {start}"
+        return f"序号 {start}–{end}"
+
+    @staticmethod
+    def _append_lines(
+        lines: list[UnclosedEvent],
+        sentences: list[str],
+    ) -> tuple[str, set[int]]:
+        labels: list[str] = []
+        owned: set[int] = set()
+        for ue in lines:
+            parts = segment_sentences(ue.merged_content)
+            if not parts:
+                continue
+            start = len(sentences) + 1
+            sentences.extend(parts)
+            end = len(sentences)
+            owned.update(range(start, end + 1))
+            labels.append(f"- {ue.id}：{BoundaryDetectionSkill._line_label(start, end)}")
+        return ("\n".join(labels) if labels else "（无）"), owned
 
     @staticmethod
     def build_index_context(
@@ -200,41 +227,138 @@ class BoundaryDetectionSkill:
         unclosed_events: list[UnclosedEvent] | None = None,
     ) -> dict:
         """Build sentence index table for boundary (shared by standalone + session Turn3)."""
-        unclosed_summary = "无" if not unclosed_events else "\n".join(
-            (
-                f"- ID={ue.id}, 片段={ue.merged_content[:80]}…, "
-                f"缺={ue.logical_gaps or '未知'}, "
-                f"说话对象={ue.interlocutor or '无'}, "
-                f"上次触及={ue.last_hit_time}"
-            )
-            for ue in (unclosed_events or [])
-        )
-        shadow_sentences = segment_sentences(shadow_content) if shadow_content else []
+        lines = list(unclosed_events or [])
+        formed = [ue for ue in lines if (ue.formation_role or "residual") == "formed"]
+        rejudge = [ue for ue in lines if (ue.formation_role or "residual") == "rejudge"]
+        residual = [
+            ue for ue in lines
+            if (ue.formation_role or "residual") not in ("formed", "rejudge")
+        ]
+        sentences: list[str] = []
+        formed_lines, formed_indices = BoundaryDetectionSkill._append_lines(formed, sentences)
+        residual_lines, _residual_idx = BoundaryDetectionSkill._append_lines(residual, sentences)
+        _rejudge_lines, _rejudge_idx = BoundaryDetectionSkill._append_lines(rejudge, sentences)
+        prior_count = len(sentences)
+        if not lines and shadow_content:
+            shadow_sentences = segment_sentences(shadow_content)
+            sentences.extend(shadow_sentences)
+            prior_count = len(sentences)
+            if shadow_sentences:
+                residual_lines = (
+                    f"- ：{BoundaryDetectionSkill._line_label(1, len(shadow_sentences))}"
+                )
         current_sentences = segment_sentences(current_input) if current_input else []
-        sentences = shadow_sentences + current_sentences
-        shadow_count = len(shadow_sentences)
-        if shadow_count > 0 and current_sentences:
-            range_hint = (
-                f"（【1..{shadow_count}】=既有残影；"
-                f"【{shadow_count + 1}..{len(sentences)}】=本轮新输入）"
-            )
-        elif shadow_count > 0:
-            range_hint = f"（【1..{shadow_count}】=既有残影；本轮无新输入）"
-        elif current_sentences:
-            range_hint = f"（【1..{len(sentences)}】=本轮新输入；无既有残影）"
-        else:
-            range_hint = "（无任何输入）"
+        current_start = len(sentences) + 1
+        sentences.extend(current_sentences)
+        parts: list[str] = []
+        cursor = 1
+        for label, group in (
+            ("已形成尚未封存", formed),
+            ("已有残影", residual),
+            ("待重判", rejudge),
+        ):
+            count = 0
+            for ue in group:
+                count += len(segment_sentences(ue.merged_content))
+            if count:
+                parts.append(f"【{cursor}..{cursor + count - 1}】={label}")
+                cursor += count
+        if not lines and shadow_content and prior_count:
+            parts.append(f"【1..{prior_count}】=已有残影")
+            cursor = prior_count + 1
+        if current_sentences:
+            parts.append(f"【{current_start}..{len(sentences)}】=本轮新输入")
+        range_hint = f"（{'；'.join(parts)}）" if parts else "（无任何输入）"
         return {
-            "unclosed_summary": unclosed_summary,
+            "formed_lines": formed_lines,
+            "residual_lines": residual_lines,
             "sentences": sentences,
             "range_hint": range_hint,
             "indexed_input": format_indexed_text(sentences),
-            "shadow_count": shadow_count,
+            "shadow_count": prior_count,
+            "formed_indices": formed_indices,
         }
 
-    def parse_response(
-        self, data: dict, sentences: list[str], shadow_count: int = 0,
+    @staticmethod
+    def _continues_id(raw: object) -> Optional[str]:
+        if raw is None or raw == "null":
+            return None
+        if isinstance(raw, str) and raw.strip():
+            return raw.strip()
+        return None
+
+    def _parse_formation(
+        self,
+        data: dict,
+        sentences: list[str],
+        formed_indices: set[int],
     ) -> BoundaryResult:
+        n_sent = len(sentences)
+        claimed: set[int] = set()
+        completed: list[CompletedFragment] = []
+        for item in data.get("events") or []:
+            if not isinstance(item, dict):
+                continue
+            indices = normalize_indices(item.get("indices") or item.get("content_raw_indices") or [])
+            indices = [i for i in indices if 1 <= i <= n_sent]
+            if not indices:
+                continue
+            claimed.update(indices)
+            content = decode_indices(sentences, indices)
+            if not content:
+                continue
+            completed.append(CompletedFragment(
+                content_raw=content,
+                continuation_of=self._continues_id(item.get("continues", item.get("continuation_of"))),
+                content_includes_source=True,
+            ))
+
+        new_unc: list[NewUnclosed] = []
+        for item in data.get("residual") or []:
+            if not isinstance(item, dict):
+                continue
+            indices = normalize_indices(item.get("indices") or [])
+            indices = [i for i in indices if 1 <= i <= n_sent and i not in claimed]
+            if not indices:
+                continue
+            claimed.update(indices)
+            content = decode_indices(sentences, indices)
+            if not content:
+                continue
+            new_unc.append(NewUnclosed(
+                content=content,
+                continuation_of=self._continues_id(item.get("continues")),
+            ))
+
+        no_form_idx = [
+            i for i in normalize_indices(data.get("no_form") or [])
+            if 1 <= i <= n_sent and i not in claimed
+        ]
+        claimed.update(no_form_idx)
+        no_form_texts = [sentences[i - 1] for i in no_form_idx]
+
+        missing = [
+            i for i in range(1, n_sent + 1)
+            if i not in claimed and i not in formed_indices
+        ]
+        pending = [decode_indices(sentences, missing)] if missing else []
+        pending = [text for text in pending if text]
+        return BoundaryResult(
+            completed_events=completed,
+            new_unclosed=new_unc,
+            no_form_texts=no_form_texts,
+            pending_texts=pending,
+        )
+
+    def parse_response(
+        self,
+        data: dict,
+        sentences: list[str],
+        shadow_count: int = 0,
+        formed_indices: set[int] | None = None,
+    ) -> BoundaryResult:
+        if any(key in data for key in ("events", "residual", "no_form")):
+            return self._parse_formation(data, sentences, formed_indices or set())
         completed: list[CompletedFragment] = []
         claimed: set[int] = set()
         n_sent = len(sentences)

@@ -204,6 +204,66 @@ def test_new_event_raises_dormant_same_object(config, db, fake_llm: FakeLLM, vec
     assert refreshed.forgetting_factor == pytest.approx(config.forgetting_silence_threshold)
 
 
+def test_short_event_stays_formed_until_it_grows(
+    metabolism_service: MetabolismService, fake_llm: FakeLLM,
+):
+    metabolism_service._config.event_min_chars = 200
+    fake_llm.push_response({
+        "events": [{"indices": [1], "continues": None}],
+        "residual": [],
+        "no_form": [],
+    })
+    events = metabolism_service.process_input("小王来了。")
+    assert events == []
+    held = metabolism_service._repo.get_unclosed_events()
+    assert len(held) == 1
+    assert held[0].formation_role == "formed"
+    assert held[0].merged_content == "小王来了。"
+
+    extra = ("他" * 210) + "。"
+    fake_llm.push_response({
+        "events": [{"indices": [1, 2], "continues": held[0].id}],
+        "residual": [],
+        "no_form": [],
+    })
+    fake_llm.push_response({"summaries": {"L1": "小王来讲经过"}, "roles": []})
+    sealed = metabolism_service.process_input(extra)
+    assert len(sealed) == 1
+    assert sealed[0].seal_reason == "closed"
+    assert len(sealed[0].content_raw) >= 200
+    assert metabolism_service._repo.get_unclosed_events() == []
+
+
+def test_no_form_does_not_become_event_or_residual(
+    metabolism_service: MetabolismService, fake_llm: FakeLLM,
+):
+    fake_llm.push_response({
+        "events": [],
+        "residual": [],
+        "no_form": [1],
+    })
+    events = metabolism_service.process_input("好的。")
+    assert events == []
+    assert metabolism_service._repo.get_unclosed_events() == []
+
+
+def test_unclaimed_sentence_waits_for_rejudge(
+    metabolism_service: MetabolismService, fake_llm: FakeLLM,
+):
+    fake_llm.push_response({
+        "events": [{"indices": [1], "continues": None}],
+        "residual": [],
+        "no_form": [],
+    })
+    fake_llm.push_response({"summaries": {"L1": "周末"}, "roles": []})
+    events = metabolism_service.process_input("甲说周末。乙问晚饭。")
+    assert len(events) == 1
+    pending = metabolism_service._repo.get_unclosed_events()
+    assert len(pending) == 1
+    assert pending[0].formation_role == "rejudge"
+    assert "乙问晚饭" in pending[0].merged_content
+
+
 def test_knowledge_tables_exist_and_start_empty(db):
     db.create_tables()
     with db.session() as session:

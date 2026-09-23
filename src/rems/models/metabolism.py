@@ -58,6 +58,9 @@ class UnclosedEvent(BaseModel):
     split_prefix_event_ids: list[str] = Field(default_factory=list)
     # 审计标记：模型失败切分后残留的超长未完成条目。
     oversized: bool = False
+    # residual：尚未形成的线。formed：已形成、尚未达到封存门槛的事件。
+    # rejudge：模型漏掉、留待下一轮重判的句子。
+    formation_role: str = "residual"
 
     @property
     def total_length(self) -> int:

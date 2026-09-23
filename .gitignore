@@ -21,3 +21,8 @@ tests/scenarios/*/outputs/
 tests/integration/outputs/
 test_chroma/
 memory_samples/
+
+# --- local live tests and dumps ---
+_tmp_*/
+_tmp_*.py
+logs/

@@ -531,6 +531,7 @@ class MetabolismRepository:
                 interlocutor=event.interlocutor,
                 split_prefix_event_ids=list(event.split_prefix_event_ids or []),
                 oversized=bool(event.oversized),
+                formation_role=event.formation_role or "residual",
             )
             s.merge(record)
             s.commit()
@@ -563,6 +564,7 @@ class MetabolismRepository:
             interlocutor=getattr(r, "interlocutor", None) or None,
             split_prefix_event_ids=list(getattr(r, "split_prefix_event_ids", None) or []),
             oversized=bool(getattr(r, "oversized", False) or False),
+            formation_role=getattr(r, "formation_role", None) or "residual",
         )
 
 

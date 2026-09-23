@@ -88,7 +88,7 @@ def test_boundary_prompt_marks_shadow_and_current_ranges(config):
     skill.detect("旧残影第一句。", "新输入第一句。新输入第二句。")
     user_prompt = llm.last_messages[1]["content"]
 
-    assert "既有残影" in user_prompt
+    assert "已有残影" in user_prompt
     assert "本轮新输入" in user_prompt
 
 
