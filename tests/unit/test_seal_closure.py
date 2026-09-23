@@ -207,7 +207,7 @@ def test_new_event_raises_dormant_same_object(config, db, fake_llm: FakeLLM, vec
 def test_short_event_stays_formed_until_it_grows(
     metabolism_service: MetabolismService, fake_llm: FakeLLM,
 ):
-    metabolism_service._config.event_min_chars = 200
+    metabolism_service._config.event_min_chars = 900
     fake_llm.push_response({
         "events": [{"indices": [1], "continues": None}],
         "residual": [],
@@ -220,7 +220,7 @@ def test_short_event_stays_formed_until_it_grows(
     assert held[0].formation_role == "formed"
     assert held[0].merged_content == "小王来了。"
 
-    extra = ("他" * 210) + "。"
+    extra = ("他" * 910) + "。"
     fake_llm.push_response({
         "events": [{"indices": [1, 2], "continues": held[0].id}],
         "residual": [],
@@ -230,7 +230,7 @@ def test_short_event_stays_formed_until_it_grows(
     sealed = metabolism_service.process_input(extra)
     assert len(sealed) == 1
     assert sealed[0].seal_reason == "closed"
-    assert len(sealed[0].content_raw) >= 200
+    assert len(sealed[0].content_raw) >= 900
     assert metabolism_service._repo.get_unclosed_events() == []
 
 
