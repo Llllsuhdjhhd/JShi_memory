@@ -166,16 +166,6 @@ class REMSConfig(BaseSettings):
     # 单条轨迹最多记录多少个命中条目（防御超大 top_k 撑爆 JSON 列）。
     recall_trace_max_items: int = 60
 
-    # ---- Recall object-affinity（按对象归属的软纠偏，design/1010 防串线） ----
-    # 原则：只做**有界**的软调制，不硬删、不过度——不同对象但主题相关度强的记忆仍能排上来。
-    # - 焦点对象明确（recall 的 object_id 或 query 解析出对象）时才生效；
-    # - 条目无归属 / 无焦点对象 → 乘 1.0（退化为纯主题相关，绝不乱纠偏）；
-    # - 归属一致 → 轻增益 object_affinity_boost；归属冲突 → 轻惩罚 object_affinity_penalty；
-    # - 两者都贴近 1.0，只影响关系分先后、不翻转强相关记忆。
-    recall_object_affinity_enabled: bool = True
-    recall_object_affinity_boost: float = 1.15
-    recall_object_affinity_penalty: float = 0.90
-
     # ---- Portrait（人物肖像：per-object 10 级渐进人物摘要 + 记忆疲态）----
     # 等级化：L1 = max(portrait_magic_num, 总长 / growth^(max_levels-1)) —— 取较长，保证最短级(L1)
     #        至少达到魔法数(默认100)、保持有效性；Lk = L1 * growth^(k-1)；
@@ -213,6 +203,13 @@ class REMSConfig(BaseSettings):
     # 召回时并入相关未完成事件（同一对话人优先；无焦点对象时按查询词重叠）。
     recall_include_unclosed: bool = True
     recall_unclosed_same_object_score: float = 90.0
+    # 进入候选的语义、词面门槛，以及相关度视为接近、才允许可及性改序的幅度。
+    # 数值只放在配置里，不写进 design/1010。
+    recall_semantic_min: float = 0.35
+    recall_lexical_min: float = 0.05
+    recall_relevance_close: float = 0.08
+    # 嵌入模型或维度变更时递增。物理集合名会带上这个版本，旧集合不覆盖。
+    recall_embedding_version: int = 1
 
     # ---- Recall: 并发人物提取与多路检索（本轮新增）----
     # 回忆是否等待回忆前的人物提取结果。默认 False：人物提取并发跑，回忆用即时启发式 focus，不阻塞。
@@ -275,19 +272,20 @@ class REMSConfig(BaseSettings):
     # 闲置封存（相对 last_hit_time / occurred_at）：
     #   (字数 > partial_ratio × unclosed_char_limit 且闲置 ≥ partial_days)
     #   或 (闲置 ≥ hard_days)
-    # 说话人更换不再触发封存（多人场合合法）。
     unclosed_idle_seal_enabled: bool = True
     unclosed_idle_partial_days: float = 3.0
     unclosed_idle_hard_days: float = 7.0
     unclosed_idle_partial_ratio: float = 0.5
     # 兼容旧环境变量；逻辑已废弃，勿再依赖。
     unclosed_idle_hours: float = 1.0
-    unclosed_interlocutor_break_seal: bool = False
     # 立即封存的原文字数门槛（资源目标，不是事件的语义尺度）。
     # 常见工作尺度暂定约 800–1000 字，有弹性，鼓励偏长；本默认取区间中部。
     # 短于该值的已形成事件仍是事件，可在形成窗口多留一些时间等待扩写或结束等待。
     # 0 = 不设门槛，当轮封存。模型不看这个数。可用 REMS_EVENT_MIN_CHARS 覆盖。
     event_min_chars: int = 900
+    # 事件工作尺度 ev_len 的上限倍数。模型在 [ev_len, k·ev_len) 内取最接近 ev_len 的闭合。
+    # ev_len 使用 event_min_chars。0 表示不设尺度，模型标成事件的都封存。
+    event_len_factor: float = 2.0
     # ---- 80/20 Forced Split (2026-05, 白皮书 4.2 升级) ----
     # 评估到 oversized_uc 后，OverlongUCSplitSkill 的目标切分比例与可接受区间。
     # 切点仍由模型基于"逻辑闭环"选择，此处只给数量级指引。

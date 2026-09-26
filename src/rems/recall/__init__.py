@@ -1,10 +1,9 @@
 """回忆模块（design/1010）：可插拔 provider + 检索管线。
 
-旧回忆模块（RecallService / tri_band / retrieval backends / BM25 / Tier-1）不再保留，
-完全按 1010 新方案实现：BGE-M3（或本地小模型）嵌入 + 多路召回 + RRF + 可选精排。
+按 design/1010：事件与对象事实两路材料，语义和词面入候选，可及性只调整接近项的顺序。
 """
 
-from .pipeline import RecallPipeline, retrieval_text
+from .pipeline import RecallPipeline, material_source_hash, retrieval_text
 from .providers import (
     BgeReranker,
     EmbeddingProvider,
@@ -14,6 +13,7 @@ from .providers import (
     RecallVectorStore,
     RerankerProvider,
     SentenceTransformerEmbedding,
+    versioned_collection_name,
 )
 
 __all__ = [
@@ -26,5 +26,7 @@ __all__ = [
     "RecallVectorStore",
     "RerankerProvider",
     "SentenceTransformerEmbedding",
+    "material_source_hash",
     "retrieval_text",
+    "versioned_collection_name",
 ]

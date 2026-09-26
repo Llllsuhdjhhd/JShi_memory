@@ -48,9 +48,10 @@ class EnrichmentResult(BaseModel):
     roles: list[ExtractedRole] = Field(default_factory=list)
     keywords: list[str] = Field(default_factory=list)
     location: str | None = None
-    # memory 模式：事件级主体情感 + 每个对象一句事实（name → fact）。
+    # memory 模式：事件级主体情感；对象表现的 L1 文本（name → L1）；完整级数在 object_levels。
     emotion: EmotionalModel | None = None
     object_snapshots: dict[str, str] = Field(default_factory=dict)
+    object_levels: dict[str, dict[str, str]] = Field(default_factory=dict)
     object_white_paintings: dict[str, RoleSnapshot] = Field(default_factory=dict)
 
 
@@ -185,6 +186,7 @@ class EventEnrichmentSkill:
 
         emotion: EmotionalModel | None = None
         object_snapshots: dict[str, str] = {}
+        object_levels: dict[str, dict[str, str]] = {}
         object_white_paintings: dict[str, RoleSnapshot] = {}
         if memory_mode:
             raw_emo = data.get("emotion") or {}
@@ -206,9 +208,19 @@ class EventEnrichmentSkill:
                     name = (od.get("name") or "").strip()
                     if not name:
                         continue
-                    fact = (od.get("fact") or od.get("summary") or "").strip()
-                    if fact:
-                        object_snapshots[name] = fact
+                    raw_fact = od.get("fact")
+                    levels = self._parse_summaries(raw_fact if isinstance(raw_fact, dict) else od.get("levels"))
+                    if levels:
+                        ordered = sorted(levels, key=lambda key: int(key[1:]))
+                        object_levels[name] = levels
+                        object_snapshots[name] = levels[ordered[0]]
+                        continue
+                    if isinstance(raw_fact, str) and raw_fact.strip():
+                        object_snapshots[name] = raw_fact.strip()
+                        continue
+                    summary = (od.get("summary") or "").strip()
+                    if summary:
+                        object_snapshots[name] = summary
 
         keywords: list[str] = []
         location: str | None = None
@@ -229,6 +241,7 @@ class EventEnrichmentSkill:
             location=location,
             emotion=emotion,
             object_snapshots=object_snapshots,
+            object_levels=object_levels,
             object_white_paintings=object_white_paintings,
         )
 

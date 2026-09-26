@@ -16,6 +16,8 @@ from typing import Protocol, runtime_checkable
 
 from pydantic import BaseModel, Field
 
+from .models.interlocutor import InterlocutorAttribution
+
 
 class MemoryExperience(BaseModel):
     """一段经历：统一所有记忆类型的载体。
@@ -35,8 +37,7 @@ class MemoryExperience(BaseModel):
     )
     interlocutor: str | None = Field(
         default=None,
-        description="说话/互动对象 id（本段主体对话的对象；区别于 objects 的泛提及）。"
-        "None = 主体自述/系统段。用于召回时按说话人软纠偏（design/1010 防串线）。",
+        description="本经历段的对话/互动对象 object_id；只描述历史输入段，不描述当前查询",
     )
     source_ids: tuple[str, ...] = Field(
         default_factory=tuple, description="来源链：事实 / 活动 / 认知 id，必带"
@@ -51,7 +52,7 @@ class MemoryExperience(BaseModel):
 
     sub_segments: list[SubSegment] = Field(
         default_factory=list,
-        description="整批合并时的段级记录（segment_id + 原文 + 对象映射），"
+        description="整批合并时的段级记录（segment_id + 原文 + 对象映射 + 对话对象），"
         "供封存事件按内容归属对象，避免整批对象并集串扰。",
     )
 
@@ -62,7 +63,7 @@ class SubSegment(BaseModel):
     segment_id: str
     text: str
     objects: dict[str, str] = Field(default_factory=dict)
-    interlocutor: str | None = None  # 该段的说话/互动对象；None = 主体自述/系统段
+    interlocutor_object_id: str | None = None
 
 
 class MemoryBatch(BaseModel):
@@ -89,35 +90,58 @@ class BackendIngestResult(BaseModel):
 
 
 class RecalledFragment(BaseModel):
-    """回忆返回的单条记忆（recall 预留）。"""
+    """回忆交回的一条材料（design/1010）。
+
+    ``type`` 取 ``event`` / ``object_event_fact`` / ``unclosed``。
+    ``content`` 是放进预算的完整一级，不截断。``signals`` 保留各路原始信号。
+    """
 
     event_id: str
-    text: str = Field(..., description="原文（content_raw）")
+    text: str = Field(..., description="事件原文，或对象事实的最长一级")
     content: str = Field(
         default="",
-        description="按 summary_level 选出的摘要文本，供预算 / 组装（design/1010 §8.2）",
+        description="本次预算选中的完整一级；未截断",
     )
+    type: str = "event"
     kind: str | None = None
     object_id: str | None = None
-    interlocutor: str | None = None  # 说话/互动对象（比 object_id 更准，驱动软纠偏）
+    interlocutor: str | None = Field(
+        default=None,
+        description="历史事件只有一个明确对话对象时返回其 object_id；多对象或未知时为空",
+    )
+    interlocutor_object_ids: list[str] = Field(
+        default_factory=list,
+        description="历史事件各来源段的对话对象 object_id 去重列表",
+    )
+    interlocutor_attributions: list[InterlocutorAttribution] = Field(
+        default_factory=list,
+        description="历史对话对象与来源经历段的对应关系",
+    )
     source_ids: list[str] = Field(default_factory=list)
-    score: float = 0.0
+    score: float = Field(
+        default=0.0,
+        description="排序分；指定对象时为原始相关度乘对象角色权重",
+    )
     summary_level: str | None = None
+    representation_level: str | None = None
+    signals: dict[str, float] = Field(default_factory=dict)
     occurred_at: datetime | None = None
 
 
 class RecallTraceItem(BaseModel):
     """单条回忆命中条目（回忆轨迹落库用）。
 
-    携带 ``object_id`` / ``source_ids`` 等归属字段，便于回溯"这条记忆属于谁"，
-    是诊断说话人串线（张冠李戴）的核心可观测载体。
+    携带 ``object_id`` / ``source_ids`` 等归属字段，便于回溯这条记忆涉及哪些对象。
     """
 
     event_id: str
     object_id: str | None = None
-    interlocutor: str | None = None  # 说话/互动对象（诊断张冠李戴的关键字段）
+    type: str = "event"
+    kind: str | None = None
     score: float = 0.0
     summary_level: str | None = None
+    representation_level: str | None = None
+    signals: dict[str, float] = Field(default_factory=dict)
     source_ids: list[str] = Field(default_factory=list)
     text: str = ""
     content: str = ""
@@ -160,6 +184,11 @@ class MemoryBackendPort(Protocol):
         query: str,
         *,
         object_id: str | None = None,
+        object_ids: tuple[str, ...] | None = None,
+        interlocutor_object_id: str | None = None,
+        time_range: tuple[datetime, datetime] | None = None,
+        budget_chars: int | None = None,
+        expand_raw: bool = False,
         level: int = 1,
         limit: int | None = None,
         anchor_event_ids: tuple[str, ...] = (),

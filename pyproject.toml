@@ -37,6 +37,7 @@ line-length = 100
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["src"]
 norecursedirs = ["_archive", ".git", "outputs", "node_modules"]
 markers = [
     "live_llm: exercises real REMS_LLM API and local embeddings (set REMS_RUN_LIVE_METABOLISM_TEST=1).",

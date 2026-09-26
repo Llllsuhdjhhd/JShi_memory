@@ -8,11 +8,12 @@ from datetime import datetime, timedelta
 import pytest
 
 from rems.config import REMSConfig
-from rems.models.metabolism import UnclosedEvent
+from rems.models.interlocutor import InterlocutorAttribution
+from rems.models.metabolism import BufferSentence, UnclosedEvent
 from rems.port import MemoryExperience
 from rems.services.event_service import EventService
 from rems.services.metabolism_service import MetabolismService
-from rems.skills.boundary_detection import BoundaryDetectionSkill
+from rems.skills.boundary_detection import BoundaryDetectionSkill, BoundaryResult, CompletedFragment
 from rems.skills.event_enrichment import EventEnrichmentSkill
 from rems.skills.role_extraction import RoleExtractionSkill
 from rems.storage.database import Database
@@ -59,6 +60,51 @@ class TestProcessInput:
 
         events = metabolism_service.process_input("partial text")
         assert events == []
+
+    def test_split_of_multi_interlocutor_unclosed_event_keeps_sentence_mapping(
+        self, metabolism_service: MetabolismService, fake_llm: FakeLLM,
+    ):
+        first = InterlocutorAttribution(segment_id="seg-a", object_id="OBJ-A")
+        second = InterlocutorAttribution(segment_id="seg-b", object_id="OBJ-B")
+        unclosed = UnclosedEvent(
+            id="UC-multi-speaker",
+            content_fragments=["甲段。", "乙段。"],
+            interlocutor_attributions=[first, second],
+            buffer_items=[
+                BufferSentence(
+                    text="甲段。", residual_id="UC-multi-speaker",
+                    interlocutor_attributions=[first],
+                ),
+                BufferSentence(
+                    text="乙段。", residual_id="UC-multi-speaker",
+                    interlocutor_attributions=[second],
+                ),
+            ],
+        )
+        metabolism_service._repo.save_unclosed_event(unclosed)
+        loaded = metabolism_service._repo.get_unclosed_events()
+        buffer = metabolism_service._load_buffer(loaded)
+        fake_llm.push_response({"summaries": {"L1": "甲段"}, "roles": []})
+        fake_llm.push_response("甲段装饰")
+        fake_llm.push_response({"summaries": {"L1": "乙段"}, "roles": []})
+        fake_llm.push_response("乙段装饰")
+
+        events = metabolism_service._apply_boundary_result(
+            BoundaryResult(completed_events=[
+                CompletedFragment(content_raw="甲段。", source_indices=[1]),
+                CompletedFragment(content_raw="乙段。", source_indices=[2]),
+            ]),
+            loaded,
+            buffer=buffer,
+        )
+
+        by_text = {event.content_raw: event for event in events}
+        assert [(item.segment_id, item.object_id) for item in by_text["甲段。"].interlocutor_attributions] == [
+            ("seg-a", "OBJ-A"),
+        ]
+        assert [(item.segment_id, item.object_id) for item in by_text["乙段。"].interlocutor_attributions] == [
+            ("seg-b", "OBJ-B"),
+        ]
 
     def test_force_save(self, metabolism_service: MetabolismService, fake_llm: FakeLLM):
         # enrichment
@@ -182,19 +228,17 @@ class TestAbandonedUnclosedSeal:
         assert len(leftover) == 1
         assert fragment in leftover[0].merged_content
 
-    def test_interlocutor_change_does_not_seal(
+    def test_recent_unclosed_is_not_sealed_by_new_input(
         self, metabolism_service: MetabolismService, fake_llm: FakeLLM,
     ):
         now = datetime.now()
         metabolism_service._repo.save_unclosed_event(UnclosedEvent(
             id="UC-a",
             content_fragments=["甲还在说周末计划"],
-            interlocutor="OBJ-A",
             created_at=now,
             updated_at=now,
             last_hit_time=now,
         ))
-        # 边界把旧残影 + 新输入都留在未完成；说话人已换也不应先封存旧条。
         fake_llm.push_response({
             "completed_events": [],
             "new_unclosed_indices": [1, 2],
@@ -204,7 +248,6 @@ class TestAbandonedUnclosedSeal:
             subject_id="jshi-1",
             text="乙说你好",
             objects={"乙": "OBJ-B"},
-            interlocutor="OBJ-B",
             source_ids=("s1",),
             occurred_at=now,
         )
@@ -242,14 +285,13 @@ class TestAbandonedUnclosedSeal:
         leftover = metabolism_service._repo.get_unclosed_events()
         assert len(leftover) == 1
 
-    def test_recent_same_interlocutor_stays_unclosed(
+    def test_recent_unclosed_keeps_content(
         self, metabolism_service: MetabolismService, fake_llm: FakeLLM,
     ):
         now = datetime.now()
         metabolism_service._repo.save_unclosed_event(UnclosedEvent(
             id="UC-keep",
             content_fragments=["还在商量出门"],
-            interlocutor="OBJ-A",
             created_at=now,
             updated_at=now,
             last_hit_time=now,
@@ -262,7 +304,6 @@ class TestAbandonedUnclosedSeal:
             subject_id="jshi-1",
             text="然后呢",
             objects={"甲": "OBJ-A"},
-            interlocutor="OBJ-A",
             source_ids=("s1",),
             occurred_at=now,
         )
@@ -270,4 +311,4 @@ class TestAbandonedUnclosedSeal:
         assert events == []
         leftover = metabolism_service._repo.get_unclosed_events()
         assert len(leftover) == 1
-        assert leftover[0].interlocutor == "OBJ-A"
+        assert "商量出门" in leftover[0].merged_content

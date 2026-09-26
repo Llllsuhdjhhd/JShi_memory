@@ -4,7 +4,6 @@ import logging
 
 from ..config import REMSConfig
 from ..llm.provider import LLMProvider
-from ..llm.prompts import BOUNDARY_SYSTEM, BOUNDARY_USER
 from ..models.metabolism import UnclosedEvent
 
 logger = logging.getLogger(__name__)

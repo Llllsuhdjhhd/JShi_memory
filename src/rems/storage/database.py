@@ -131,6 +131,8 @@ class ShadowRecord(Base):
     subject_id = Column(String, default="")
     content = Column(Text, nullable=False, default="")
     updated_at = Column(DateTime, nullable=False)
+    # 按发生顺序的缓存句：[{"text": "...", "residual_id": "UC-..."}]
+    buffer_items = Column(JSON, default=list)
 
 
 class UnclosedEventRecord(Base):
@@ -139,12 +141,13 @@ class UnclosedEventRecord(Base):
     id = Column(String, primary_key=True)
     subject_id = Column(String, default="")
     content_fragments = Column(JSON, default=list)
+    interlocutor_attributions = Column(JSON, default=list)
+    buffer_items = Column(JSON, default=list)
     identified_roles = Column(JSON, default=list)
     logical_gaps = Column(Text, nullable=True)
     created_at = Column(DateTime, nullable=False)
     updated_at = Column(DateTime, nullable=False)
     last_hit_time = Column(DateTime, nullable=False)
-    interlocutor = Column(String, nullable=True)
     # 80/20 强制分裂：前缀事件链（自远而近）。UC 闭环为事件时由 MetabolismService 继承给目标事件。
     split_prefix_event_ids = Column(JSON, default=list)
     # 审计：评估器判定 oversized 但修复失败时置为 True；不触发强制封存。
@@ -345,13 +348,15 @@ class Database:
             ],
             "unclosed_events": [
                 ("split_prefix_event_ids", "TEXT DEFAULT '[]'"),
+                ("interlocutor_attributions", "TEXT DEFAULT '[]'"),
+                ("buffer_items", "TEXT DEFAULT '[]'"),
                 ("oversized", "BOOLEAN DEFAULT 0"),
                 ("subject_id", "TEXT DEFAULT ''"),
-                ("interlocutor", "TEXT"),
                 ("formation_role", "TEXT DEFAULT 'residual'"),
             ],
             "shadow": [
                 ("subject_id", "TEXT DEFAULT ''"),
+                ("buffer_items", "TEXT DEFAULT '[]'"),
             ],
             "roles": [
                 ("subject_id", "TEXT DEFAULT ''"),

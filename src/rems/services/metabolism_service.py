@@ -13,11 +13,12 @@ from typing import Any, Optional
 
 from ..config import REMSConfig
 from ..models.event import Event, EventRoleEntry
-from ..models.metabolism import Shadow, UnclosedEvent
+from ..models.interlocutor import InterlocutorAttribution
+from ..models.metabolism import BufferSentence, Shadow, UnclosedEvent
 from ..models.role import Role
 from ..port import MemoryExperience
 from ..services.event_service import EventService
-from ..utils.text import segment_text_hits
+from ..utils.text import segment_sentences, segment_text_hits
 from ..skills.boundary_detection import BoundaryDetectionSkill, BoundaryResult
 from ..skills.shadow_compaction import ShadowCompactionSkill
 from ..skills.boundary_split import (
@@ -46,6 +47,78 @@ def _objects_for_event(
         if segment_text_hits(sub.text or "", content):
             hits.update(sub.objects)
     return hits or dict(memory.objects or {})
+
+
+def _unique_interlocutors(
+    *groups: list[InterlocutorAttribution] | tuple[InterlocutorAttribution, ...],
+) -> list[InterlocutorAttribution]:
+    unique: dict[tuple[str, str], InterlocutorAttribution] = {}
+    for group in groups:
+        for item in group:
+            if item.segment_id and item.object_id:
+                unique.setdefault((item.segment_id, item.object_id), item)
+    return list(unique.values())
+
+
+def _interlocutors_for_event(
+    content: str | None,
+    memory: MemoryExperience | None,
+) -> list[InterlocutorAttribution]:
+    """Return historical interlocutors from the input subsegments represented in content."""
+    if memory is None or not content:
+        return []
+    subs = getattr(memory, "sub_segments", None) or []
+    found = [
+        InterlocutorAttribution(segment_id=sub.segment_id, object_id=sub.interlocutor_object_id)
+        for sub in subs
+        if sub.interlocutor_object_id
+        and segment_text_hits(sub.text or "", content)
+    ]
+    if not subs and memory.interlocutor:
+        found.append(InterlocutorAttribution(
+            segment_id=memory.segment_id or "unknown-segment",
+            object_id=memory.interlocutor,
+        ))
+    return _unique_interlocutors(found)
+
+
+def _interlocutors_from_buffer(
+    buffer: list[BufferSentence], indices: list[int] | None = None,
+) -> list[InterlocutorAttribution]:
+    selected = (
+        [buffer[index - 1] for index in indices if 1 <= index <= len(buffer)]
+        if indices is not None
+        else buffer
+    )
+    return _unique_interlocutors(
+        *(item.interlocutor_attributions for item in selected)
+    )
+
+
+def _interlocutors_in_buffer_content(
+    content: str | None, buffer: list[BufferSentence],
+) -> list[InterlocutorAttribution]:
+    if not content:
+        return []
+    return _unique_interlocutors(*(
+        item.interlocutor_attributions
+        for item in buffer
+        if segment_text_hits(item.text, content)
+    ))
+
+
+def _buffer_items_for_content(
+    content: str | None,
+    buffer: list[BufferSentence],
+    indices: list[int] | None = None,
+) -> list[BufferSentence]:
+    if indices:
+        selected = [buffer[index - 1] for index in indices if 1 <= index <= len(buffer)]
+        if selected:
+            return selected
+    if not content:
+        return []
+    return [item for item in buffer if segment_text_hits(item.text, content)]
 
 
 class MetabolismService:
@@ -212,12 +285,23 @@ class MetabolismService:
             unclosed_events=tuple(unclosed),
         )
 
+        buffer = self._load_buffer(unclosed)
+        buffer.extend(
+            BufferSentence(
+                text=sentence,
+                interlocutor_attributions=_interlocutors_for_event(sentence, memory),
+            )
+            for sentence in segment_sentences(raw_input)
+        )
+
         def _run_boundary():
             if ingest_session is not None and getattr(ingest_session, "turn", 0) >= 1:
                 return ingest_session.detect_boundary_followup(
                     shadow_content, raw_input, unclosed,
                 )
-            return self._boundary.detect(shadow_content, raw_input, unclosed)
+            return self._boundary.detect(
+                shadow_content, raw_input, unclosed, buffer_items=buffer,
+            )
 
         result, report = run_skill_with_eval(
             _run_boundary,
@@ -233,13 +317,22 @@ class MetabolismService:
                 type(self._boundary_remediator).__name__ if self._boundary_remediator else None,
             )
 
-        sealed = self._apply_boundary_result(
-            result, unclosed,
-            input_id=input_id,
-            known_roles_hint=known_roles_hint,
-            pre_role_entries=pre_role_entries,
-            memory=memory,
-        )
+        if result.disentangle:
+            sealed = self._apply_disentangle(
+                result, buffer, unclosed,
+                input_id=input_id,
+                known_roles_hint=known_roles_hint,
+                pre_role_entries=pre_role_entries,
+                memory=memory,
+            )
+        else:
+            sealed = self._apply_boundary_result(
+                result, unclosed, buffer=buffer,
+                input_id=input_id,
+                known_roles_hint=known_roles_hint,
+                pre_role_entries=pre_role_entries,
+                memory=memory,
+            )
         sealed = abandoned + sealed
         self._raise_dormant_same_object(sealed)
         return sealed
@@ -248,10 +341,216 @@ class MetabolismService:
     # Internal helpers
     # ------------------------------------------------------------------
 
+    def _load_buffer(self, unclosed: list[UnclosedEvent]) -> list[BufferSentence]:
+        """按发生顺序取出尚未封存的句子。编号只留在程序侧。"""
+        live = {ue.id for ue in unclosed}
+        stored = self._repo.get_shadow().buffer_items
+        if stored:
+            by_id = {ue.id: ue for ue in unclosed}
+            kept: list[BufferSentence] = []
+            for item in stored:
+                if not item.text or (item.residual_id is not None and item.residual_id not in live):
+                    continue
+                ue = by_id.get(item.residual_id or "")
+                fallback_attributions: list[InterlocutorAttribution] = []
+                if ue and not item.interlocutor_attributions:
+                    if ue.buffer_items:
+                        norm = "".join(item.text.split())
+                        fallback_attributions = _unique_interlocutors(*(
+                            source.interlocutor_attributions
+                            for source in ue.buffer_items
+                            if "".join(source.text.split()) == norm
+                        ))
+                kept.append(item.model_copy(update={
+                    "interlocutor_attributions": _unique_interlocutors(
+                        item.interlocutor_attributions,
+                        fallback_attributions,
+                    ),
+                }))
+            if kept or not unclosed:
+                return kept
+        items: list[BufferSentence] = []
+        for ue in unclosed:
+            if ue.buffer_items:
+                items.extend(item.model_copy(update={"residual_id": ue.id}) for item in ue.buffer_items)
+                continue
+            parts = segment_sentences(ue.merged_content)
+            if not parts and ue.merged_content:
+                parts = [ue.merged_content]
+            for text in parts:
+                items.append(BufferSentence(
+                    text=text,
+                    residual_id=ue.id,
+                    interlocutor_attributions=list(ue.interlocutor_attributions),
+                ))
+        return items
+
+    def _length_accepted(self, length: int) -> bool:
+        """ev_len ≤ L < k·ev_len。ev_len 为 0 时不设尺度。"""
+        ev_len = int(self._config.event_min_chars or 0)
+        if ev_len <= 0:
+            return True
+        factor = float(self._config.event_len_factor or 2)
+        return ev_len <= length < factor * ev_len
+
+    def _dominant_residual_id(
+        self,
+        indices: list[int],
+        buffer: list[BufferSentence],
+    ) -> str | None:
+        counts: dict[str, int] = {}
+        for index in indices:
+            if not 1 <= index <= len(buffer):
+                continue
+            residual_id = buffer[index - 1].residual_id
+            if residual_id:
+                counts[residual_id] = counts.get(residual_id, 0) + 1
+        if not counts:
+            return None
+        return max(counts, key=lambda key: (counts[key], key))
+
+    def _allocate_residual_id(
+        self,
+        indices: list[int],
+        buffer: list[BufferSentence],
+        taken: set[str],
+    ) -> str:
+        dominant = self._dominant_residual_id(indices, buffer)
+        if dominant and dominant not in taken:
+            taken.add(dominant)
+            return dominant
+        new_id = f"UC-{secrets.token_hex(4)}"
+        taken.add(new_id)
+        return new_id
+
+    def _apply_disentangle(
+        self,
+        result: BoundaryResult,
+        buffer: list[BufferSentence],
+        unclosed: list[UnclosedEvent],
+        input_id: str | None = None,
+        known_roles_hint: list[Role] | None = None,
+        pre_role_entries: list[EventRoleEntry] | None = None,
+        memory: MemoryExperience | None = None,
+    ) -> list[Event]:
+        """按模型的句子分组封存。稳定编号由句子来源决定，不用模型的临时 id。"""
+        sealed: list[Event] = []
+        sealed_idx: set[int] = set()
+        residual_of: dict[int, str] = {}
+        taken: set[str] = set()
+        previous = {ue.id: ue for ue in unclosed}
+
+        for frag in result.completed_events:
+            indices = [i for i in frag.source_indices if 1 <= i <= len(buffer)]
+            if not indices:
+                continue
+            if not self._length_accepted(len(frag.content_raw)):
+                residual_id = self._allocate_residual_id(indices, buffer, taken)
+                for index in indices:
+                    residual_of[index] = residual_id
+                continue
+            event = self._event_svc.seal_event(
+                frag.content_raw,
+                seal_reason="closed",
+                **self._seal_memory_kwargs(
+                    memory,
+                    content=frag.content_raw,
+                    input_id=input_id,
+                    known_roles_hint=known_roles_hint,
+                    pre_role_entries=pre_role_entries,
+                    interlocutor_attributions=_interlocutors_from_buffer(buffer, indices),
+                ),
+            )
+            sealed.append(event)
+            sealed_idx.update(indices)
+
+        for item in result.new_unclosed:
+            indices = [
+                i for i in item.source_indices
+                if 1 <= i <= len(buffer) and i not in sealed_idx
+            ]
+            if not indices:
+                continue
+            residual_id = self._allocate_residual_id(indices, buffer, taken)
+            for index in indices:
+                residual_of.setdefault(index, residual_id)
+
+        loose_id: str | None = None
+        for index in result.unclaimed_indices:
+            if index in sealed_idx or index in residual_of or not 1 <= index <= len(buffer):
+                continue
+            previous_id = buffer[index - 1].residual_id
+            if previous_id and previous_id not in taken:
+                residual_of[index] = previous_id
+                taken.add(previous_id)
+                continue
+            if loose_id is None:
+                loose_id = f"UC-{secrets.token_hex(4)}"
+                taken.add(loose_id)
+            residual_of[index] = loose_id
+
+        rebuilt: list[BufferSentence] = []
+        for index, sentence in enumerate(buffer, start=1):
+            if index in sealed_idx:
+                continue
+            residual_id = residual_of.get(index) or sentence.residual_id
+            if not residual_id:
+                if loose_id is None:
+                    loose_id = f"UC-{secrets.token_hex(4)}"
+                residual_id = loose_id
+            rebuilt.append(BufferSentence(
+                text=sentence.text,
+                residual_id=residual_id,
+                interlocutor_attributions=list(sentence.interlocutor_attributions),
+            ))
+
+        grouped: dict[str, list[str]] = {}
+        grouped_interlocutors: dict[str, list[InterlocutorAttribution]] = {}
+        grouped_buffer_items: dict[str, list[BufferSentence]] = {}
+        for sentence in rebuilt:
+            grouped.setdefault(sentence.residual_id or "", []).append(sentence.text)
+            key = sentence.residual_id or ""
+            grouped_interlocutors.setdefault(key, []).extend(sentence.interlocutor_attributions)
+            grouped_buffer_items.setdefault(key, []).append(sentence)
+        for ue in list(unclosed):
+            self._repo.delete_unclosed_event(ue.id)
+        now = self._ingest_time(memory)
+        subject = memory.subject_id if memory is not None else ""
+        for residual_id, texts in grouped.items():
+            if not residual_id or not texts:
+                continue
+            old = previous.get(residual_id)
+            same = old is not None and list(old.content_fragments) == texts
+            self._repo.save_unclosed_event(UnclosedEvent(
+                id=residual_id,
+                subject_id=(old.subject_id if old and old.subject_id else subject),
+                content_fragments=texts,
+                interlocutor_attributions=_unique_interlocutors(
+                    grouped_interlocutors.get(residual_id, []),
+                ),
+                buffer_items=grouped_buffer_items.get(residual_id, []),
+                logical_gaps=old.logical_gaps if old else None,
+                split_prefix_event_ids=list(old.split_prefix_event_ids) if old else [],
+                created_at=old.created_at if old else now,
+                updated_at=now,
+                last_hit_time=old.last_hit_time if same and old else now,
+                formation_role="residual",
+            ))
+        self._repo.update_shadow(Shadow(
+            content="\n".join(sentence.text for sentence in rebuilt),
+            updated_at=now,
+            subject_id=subject,
+            buffer_items=rebuilt,
+        ))
+        self._check_physical_redline()
+        return sealed
+
     def _apply_boundary_result(
         self,
         result: BoundaryResult,
         unclosed: list[UnclosedEvent],
+        *,
+        buffer: list[BufferSentence],
         input_id: str | None = None,
         known_roles_hint: list[Role] | None = None,
         pre_role_entries: list[EventRoleEntry] | None = None,
@@ -308,6 +607,7 @@ class MetabolismService:
                     prefix=inherited_prefix_chain,
                     memory=memory,
                     last_hit=ue.last_hit_time if same and ue is not None else None,
+                    buffer_items=_buffer_items_for_content(content, buffer, frag.source_indices),
                 ))
                 continue
 
@@ -321,6 +621,14 @@ class MetabolismService:
                     input_id=input_id,
                     known_roles_hint=known_roles_hint,
                     pre_role_entries=pre_role_entries,
+                    interlocutor_attributions=_unique_interlocutors(
+                        (
+                            _interlocutors_from_buffer(buffer, frag.source_indices)
+                            if frag.source_indices
+                            else _interlocutors_in_buffer_content(content, buffer)
+                        ),
+                        _interlocutors_for_event(content, memory),
+                    ),
                 ),
             )
             sealed.append(event)
@@ -376,6 +684,7 @@ class MetabolismService:
                 memory=memory,
                 logical_gaps=nu.logical_gaps,
                 oversized=is_oversized,
+                buffer_items=_buffer_items_for_content(nu.content, buffer, nu.source_indices),
             ))
 
         for text in result.pending_texts:
@@ -385,6 +694,7 @@ class MetabolismService:
                 role="rejudge",
                 prefix=[],
                 memory=memory,
+                buffer_items=_buffer_items_for_content(text, buffer),
             ))
 
         # 更新残影记录（为保持一致性，每次代谢后同步更新）
@@ -432,6 +742,10 @@ class MetabolismService:
                     input_id=input_id,
                     known_roles_hint=known_roles_hint,
                     pre_role_entries=pre_role_entries,
+                    interlocutor_attributions=_unique_interlocutors(
+                        *(ue.interlocutor_attributions for ue in unclosed),
+                        _interlocutors_for_event(combined, memory),
+                    ),
                 ),
             )
             sealed.append(event)
@@ -449,6 +763,7 @@ class MetabolismService:
                         input_id=input_id,
                         known_roles_hint=known_roles_hint,
                         pre_role_entries=pre_role_entries,
+                        interlocutor_attributions=ue.interlocutor_attributions,
                     ),
                 )
                 # 反向链：force_save 也要登记 successor。
@@ -475,6 +790,7 @@ class MetabolismService:
         input_id: str | None,
         known_roles_hint: list[Role] | None,
         pre_role_entries: list[EventRoleEntry] | None,
+        interlocutor_attributions: list[InterlocutorAttribution] | None = None,
     ) -> dict:
         """记忆路径（memory 非 None）传主体/对象/来源/时间/origin；旧路径传角色提示。
 
@@ -483,6 +799,10 @@ class MetabolismService:
         """
         if memory is not None:
             objects = _objects_for_event(content, memory)
+            attributions = _unique_interlocutors(
+                _interlocutors_for_event(content, memory),
+                interlocutor_attributions or [],
+            )
             return {
                 "input_id": memory.segment_id,
                 "subject_id": memory.subject_id,
@@ -490,11 +810,13 @@ class MetabolismService:
                 "source_ids": memory.source_ids,
                 "occurred_at": memory.occurred_at,
                 "origin": memory.origin,
+                "interlocutor_attributions": attributions,
             }
         return {
             "input_id": input_id,
             "known_roles": known_roles_hint,
             "pre_role_entries": pre_role_entries,
+            "interlocutor_attributions": list(interlocutor_attributions or []),
         }
 
     # ------------------------------------------------------------------
@@ -546,7 +868,6 @@ class MetabolismService:
 
         单条字数变长不在边界检测前封存，先交给边界和 80/20 切开。
         闲置启用时：字数 > 0.5×上限且闲置达到部分天数，或闲置达到硬天数。
-        说话人更换不触发封存。
         """
         char_limit = int(self._config.unclosed_char_limit or 0)
         idle_on = bool(self._config.unclosed_idle_seal_enabled)
@@ -647,6 +968,7 @@ class MetabolismService:
                 input_id=input_id,
                 known_roles_hint=known_roles_hint,
                 pre_role_entries=pre_role_entries,
+                interlocutor_attributions=ue.interlocutor_attributions,
             ),
         )
         if ue.split_prefix_event_ids and self._event_repo is not None:
@@ -762,6 +1084,8 @@ class MetabolismService:
         last_hit: datetime | None = None,
         logical_gaps: str | None = None,
         oversized: bool = False,
+        interlocutor_attributions: list[InterlocutorAttribution] | None = None,
+        buffer_items: list[BufferSentence] | None = None,
     ) -> UnclosedEvent:
         now = self._ingest_time(memory)
         hit = last_hit or now
@@ -770,17 +1094,42 @@ class MetabolismService:
             subject = ue.subject_id
         elif memory is not None:
             subject = memory.subject_id
-        interlocutor = ue.interlocutor if ue is not None else None
-        if memory is not None and getattr(memory, "interlocutor", None):
-            interlocutor = memory.interlocutor
+        event_id = ue.id if ue is not None else f"UC-{secrets.token_hex(4)}"
+        selected_buffer_items = list(buffer_items or [])
+        if not selected_buffer_items and ue is not None and ue.buffer_items:
+            selected_buffer_items = _buffer_items_for_content(content, ue.buffer_items)
+        if not selected_buffer_items:
+            parts = segment_sentences(content)
+            if not parts and content:
+                parts = [content]
+            selected_buffer_items = [
+                BufferSentence(
+                    text=part,
+                    interlocutor_attributions=_interlocutors_for_event(part, memory),
+                )
+                for part in parts
+            ]
+        selected_buffer_items = [
+            item.model_copy(update={"residual_id": event_id})
+            for item in selected_buffer_items
+        ]
+        mapped_interlocutors = _unique_interlocutors(
+            *(item.interlocutor_attributions for item in selected_buffer_items),
+            interlocutor_attributions or (
+                ue.interlocutor_attributions
+                if ue is not None and not ue.buffer_items and content == ue.merged_content
+                else []
+            ),
+        )
         return UnclosedEvent(
-            id=ue.id if ue is not None else f"UC-{secrets.token_hex(4)}",
+            id=event_id,
             subject_id=subject,
             content_fragments=[content],
+            interlocutor_attributions=mapped_interlocutors,
+            buffer_items=selected_buffer_items,
             logical_gaps=logical_gaps if logical_gaps is not None else (ue.logical_gaps if ue else None),
             split_prefix_event_ids=list(prefix or []),
             oversized=oversized,
-            interlocutor=interlocutor,
             created_at=ue.created_at if ue is not None else now,
             updated_at=now,
             last_hit_time=hit,
@@ -831,6 +1180,12 @@ class MetabolismService:
                         input_id=input_id,
                         known_roles_hint=known_roles_hint,
                         pre_role_entries=pre_role_entries,
+                        interlocutor_attributions=(
+                            _interlocutors_in_buffer_content(content, ue.buffer_items)
+                            if ue is not None and ue.buffer_items
+                            else ue.interlocutor_attributions if ue and content == ue.merged_content
+                            else []
+                        ),
                     ),
                 )
                 sealed.append(event)

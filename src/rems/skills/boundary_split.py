@@ -70,6 +70,9 @@ class BoundaryForceThresholdEvaluator(SkillEvaluator):
     def evaluate(self, skill_input: Any, skill_output: Any) -> EvalReport:
         if not isinstance(skill_output, BoundaryResult):
             return EvalReport.success()
+        # 解交织的长短由模型在 ev_len 与 k·ev_len 之间决定，不再走 80/20 切开。
+        if skill_output.disentangle:
+            return EvalReport.success()
 
         ctx: Optional[BoundarySkillContext] = (
             skill_input if isinstance(skill_input, BoundarySkillContext) else None

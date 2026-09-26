@@ -27,11 +27,12 @@ from rems.config import REMSConfig, StorageConfig
 from rems.recall import (
     HashEmbedding,
     QdrantRecallVectorStore,
+    RecallPipeline,
     SentenceTransformerEmbedding,
-    retrieval_text,
+    versioned_collection_name,
 )
 from rems.storage.database import Database
-from rems.storage.repository import EventRepository
+from rems.storage.repository import EventRepository, RoleRepository
 
 
 def main() -> int:
@@ -79,37 +80,41 @@ def main() -> int:
     if args.model:
         config.embedding.model_name = args.model
 
+    embedding_model = (
+        "hash" if config.embedding.provider == "hash" else config.embedding.model_name
+    )
     embedding = (
         HashEmbedding()
         if config.embedding.provider == "hash"
         else SentenceTransformerEmbedding(config.embedding.model_name)
     )
     vector_store = QdrantRecallVectorStore(
-        config.storage.qdrant_collection,
+        versioned_collection_name(
+            config.storage.qdrant_collection,
+            config.recall_embedding_version,
+        ),
         url=config.storage.qdrant_url,
         path=config.storage.qdrant_path,
     )
 
     db = Database(config.storage.database_url)
     event_repo = EventRepository(db)
+    pipe = RecallPipeline(
+        embedding,
+        vector_store,
+        event_repo,
+        role_repo=RoleRepository(db),
+        embedding_model=embedding_model,
+        embedding_version=config.recall_embedding_version,
+    )
 
     events = event_repo.list_all(exclude_tombstoned=True)
-    count = 0
     for event in events:
-        text = retrieval_text(event)
-        vec = embedding.embed_documents([text])[0]
-        vector_store.upsert(
-            event.event_id,
-            vec,
-            payload={
-                "subject_id": event.subject_id,
-                "object_ids": [r.role_id for r in event.role_list if not r.is_subject],
-                "create_time": event.create_time.timestamp(),
-            },
-        )
-        count += 1
+        pipe.index_event(event)
 
-    print(f"Reindexed {count} events → Qdrant collection '{vector_store._collection}'")
+    print(
+        f"Reindexed {len(events)} events → Qdrant collection '{vector_store._collection}'"
+    )
     return 0
 
 

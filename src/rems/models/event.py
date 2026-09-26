@@ -6,6 +6,8 @@ from typing import Optional
 
 from pydantic import BaseModel, Field
 
+from .interlocutor import InterlocutorAttribution
+
 # 事件与情感量化领域模型；对齐《REMS 记忆系统规范解析》第 1 章（L0/L1~Ln、角色快照、
 # 8 维基础情绪、抽象字段、墓碑）及白描遗忘逻辑。
 
@@ -167,6 +169,10 @@ class Event(BaseModel):
     actual_max_level: int = 0  # 熔断后的实际最高摘要层级。
 
     role_list: list[EventRoleEntry] = Field(default_factory=list)  # 当次事件涉及角色与情感快照（1.1.4）。
+    interlocutor_attributions: list[InterlocutorAttribution] = Field(
+        default_factory=list,
+        description="历史对话对象及来源经历段；一个封存事件可包含多个来源段/对话对象",
+    )
 
     is_abstract: bool = False  # 架构级区分基本/抽象事件（1.1.5、3.1）。
     is_abstracted: bool = False  # 是否已被更高阶认知吸收（1.1.5）。
@@ -217,10 +223,6 @@ class Event(BaseModel):
     # Optional recall metadata (BM25 / literary profile); persisted as recall_metadata JSON.
     keywords: list[str] = Field(default_factory=list)
     location: str | None = None
-    # 说话/互动对象 id（本事件主体对话的对象；区别于 role_list 泛提及）。
-    # 用于召回时按说话人软纠偏（design/1010 防串线）；None = 主体自述/无归属。
-    # 与 keywords/location 一样走 recall_metadata JSON，免 schema 迁移。
-    interlocutor: str | None = None
 
     def model_post_init(self, __context: object) -> None:
         if not self.event_length:

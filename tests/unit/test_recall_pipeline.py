@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from rems.models.event import Event
+from rems.models.interlocutor import InterlocutorAttribution
 from rems.models.metabolism import UnclosedEvent
 from rems.models.object_entry import ObjectMemoryEntry
 from rems.port import RecalledFragment
@@ -38,6 +39,40 @@ def _mk(event_repo, text, summaries, subject_id="jshi-1", **kw):
 
 
 class TestRecall:
+    def test_historical_interlocutor_is_returned_and_drives_70_30_weight(
+        self, recall_pipeline
+    ):
+        pipe, event_repo, _obj, _meta = recall_pipeline
+        from rems.models.event import EventRoleEntry
+
+        historical_speaker = _mk(
+            event_repo,
+            "甲和乙讨论计划",
+            {"L1": "讨论计划"},
+            role_list=[EventRoleEntry(role_id="OBJ-A"), EventRoleEntry(role_id="OBJ-B")],
+            interlocutor_attributions=[
+                InterlocutorAttribution(segment_id="seg-a", object_id="OBJ-B"),
+            ],
+        )
+        merely_involved = _mk(
+            event_repo,
+            "乙和甲讨论计划",
+            {"L1": "讨论计划"},
+            role_list=[EventRoleEntry(role_id="OBJ-A"), EventRoleEntry(role_id="OBJ-B")],
+        )
+        pipe.index_event(historical_speaker)
+        pipe.index_event(merely_involved)
+
+        fragments = pipe.recall(
+            "jshi-1", "讨论计划", object_id="OBJ-A",
+            object_ids=("OBJ-A", "OBJ-B"), interlocutor_object_id="OBJ-B",
+        )
+
+        by_id = {item.event_id: item for item in fragments}
+        assert by_id[historical_speaker.event_id].interlocutor == "OBJ-B"
+        assert by_id[historical_speaker.event_id].interlocutor_object_ids == ["OBJ-B"]
+        assert by_id[historical_speaker.event_id].score > by_id[merely_involved.event_id].score
+
     def test_semantic_recall_returns_fragment(self, recall_pipeline):
         pipe, event_repo, _obj, _meta = recall_pipeline
         ev = _mk(event_repo, "今天看到美丽的落日", {"L1": "看到落日"})
@@ -102,13 +137,13 @@ class TestRecall:
             id="UC-plan",
             subject_id="jshi-1",
             content_fragments=["甲说周末出门，还没定哪天"],
-            interlocutor="OBJ-A",
+            identified_roles=["OBJ-A"],
         ))
         meta_repo.save_unclosed_event(UnclosedEvent(
             id="UC-other",
             subject_id="jshi-1",
             content_fragments=["乙在讲另一件事"],
-            interlocutor="OBJ-B",
+            identified_roles=["OBJ-B"],
         ))
 
         frags = pipe.recall("jshi-1", "周末怎么安排", object_id="OBJ-A")
@@ -117,7 +152,7 @@ class TestRecall:
         assert "UC-other" not in ids
         uc = next(f for f in frags if f.event_id == "UC-plan")
         assert uc.kind == "unclosed"
-        assert uc.interlocutor == "OBJ-A"
+        assert uc.object_id == "OBJ-A"
         assert "还没定哪天" in uc.content
 
     def test_unclosed_only_still_returns(self, recall_pipeline):
@@ -126,7 +161,7 @@ class TestRecall:
             id="UC-only",
             subject_id="jshi-1",
             content_fragments=["我们商量出门但还没结果"],
-            interlocutor="OBJ-A",
+            identified_roles=["OBJ-A"],
         ))
         frags = pipe.recall("jshi-1", "出门", object_id="OBJ-A")
         assert [f.event_id for f in frags] == ["UC-only"]
@@ -139,7 +174,7 @@ class TestRecall:
             id="UC-trip",
             subject_id="jshi-1",
             content_fragments=["周末出门的事还没定"],
-            interlocutor="OBJ-A",
+            identified_roles=["OBJ-A"],
         ))
         frags = pipe.recall("jshi-1", "周末出门定了没")
         assert "UC-trip" in {f.event_id for f in frags}

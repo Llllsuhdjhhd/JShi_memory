@@ -22,6 +22,12 @@ class RecallRequest(BaseModel):
     subject_id: str
     query: str
     object_id: str | None = None
+    object_ids: list[str] = Field(default_factory=list)
+    interlocutor_object_id: str | None = None
+    time_start: str | None = None
+    time_end: str | None = None
+    budget_chars: int | None = None
+    expand_raw: bool = False
     level: int = 1
     limit: int | None = None
     anchor_event_ids: list[str] = Field(default_factory=list)
@@ -63,12 +69,25 @@ def ingest(req: IngestRequest):
 @router.post("/recall")
 def recall(req: RecallRequest):
     pipeline = get_pipeline()
+    time_range = None
+    if req.time_start and req.time_end:
+        from datetime import datetime
+
+        time_range = (
+            datetime.fromisoformat(req.time_start),
+            datetime.fromisoformat(req.time_end),
+        )
     return [
         f.model_dump(mode="json")
         for f in pipeline.recall(
             req.subject_id,
             req.query,
             object_id=req.object_id,
+            object_ids=tuple(req.object_ids) or None,
+            interlocutor_object_id=req.interlocutor_object_id,
+            time_range=time_range,
+            budget_chars=req.budget_chars,
+            expand_raw=req.expand_raw,
             level=req.level,
             limit=req.limit,
             anchor_event_ids=tuple(req.anchor_event_ids),

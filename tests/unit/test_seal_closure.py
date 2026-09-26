@@ -165,6 +165,25 @@ def test_white_painting_ignores_personality(config, fake_llm: FakeLLM):
     assert empty.object_snapshots == {}
 
 
+def test_object_levels_keep_l1_as_the_stored_line(config, fake_llm: FakeLLM):
+    skill = EventEnrichmentSkill(fake_llm, config)
+    fake_llm.push_response({
+        "summaries": {"L1": "倒水"},
+        "emotion": {"joy": 0.1},
+        "objects": [{
+            "name": "小米",
+            "fact": {
+                "L1": "小米喝了42℃的水，说刚好。",
+                "L2": "小米说42℃的水刚好。",
+                "L3": "小米说水刚好。",
+            },
+        }],
+    })
+    result = skill.enrich("小米说刚好。", memory_objects={"小米": "OBJ-1"})
+    assert result.object_snapshots == {"小米": "小米喝了42℃的水，说刚好。"}
+    assert result.object_levels["小米"]["L3"] == "小米说水刚好。"
+
+
 def test_new_event_raises_dormant_same_object(config, db, fake_llm: FakeLLM, vector_store):
     event_repo = EventRepository(db)
     meta_repo = MetabolismRepository(db)
@@ -217,7 +236,6 @@ def test_short_event_stays_formed_until_it_grows(
     assert events == []
     held = metabolism_service._repo.get_unclosed_events()
     assert len(held) == 1
-    assert held[0].formation_role == "formed"
     assert held[0].merged_content == "小王来了。"
 
     extra = ("他" * 910) + "。"
@@ -234,7 +252,7 @@ def test_short_event_stays_formed_until_it_grows(
     assert metabolism_service._repo.get_unclosed_events() == []
 
 
-def test_no_form_does_not_become_event_or_residual(
+def test_no_form_returns_to_memory_buffer(
     metabolism_service: MetabolismService, fake_llm: FakeLLM,
 ):
     fake_llm.push_response({
@@ -244,7 +262,9 @@ def test_no_form_does_not_become_event_or_residual(
     })
     events = metabolism_service.process_input("好的。")
     assert events == []
-    assert metabolism_service._repo.get_unclosed_events() == []
+    held = metabolism_service._repo.get_unclosed_events()
+    assert len(held) == 1
+    assert held[0].merged_content == "好的。"
 
 
 def test_unclaimed_sentence_waits_for_rejudge(
@@ -260,8 +280,36 @@ def test_unclaimed_sentence_waits_for_rejudge(
     assert len(events) == 1
     pending = metabolism_service._repo.get_unclosed_events()
     assert len(pending) == 1
-    assert pending[0].formation_role == "rejudge"
     assert "乙问晚饭" in pending[0].merged_content
+
+
+def test_memory_buffer_hides_residual_id_and_program_keeps_it(
+    metabolism_service: MetabolismService, fake_llm: FakeLLM,
+):
+    fake_llm.push_response({
+        "events": [],
+        "residual": [{"id": "R1", "indices": [1, 2]}],
+    })
+    metabolism_service.process_input("甲说周末。乙问晚饭。")
+    held = metabolism_service._repo.get_unclosed_events()
+    assert len(held) == 1
+    stable_id = held[0].id
+    assert stable_id != "R1"
+
+    fake_llm.push_response({
+        "events": [],
+        "residual": [{"id": "R9", "indices": [1, 2, 3]}],
+    })
+    metabolism_service.process_input("甲还没定。")
+    user = fake_llm.calls[-1]["messages"][1]["content"]
+    assert stable_id not in user
+    assert "已有残影" not in user
+    assert "[1] 甲说周末。" in user
+    assert "[2] 乙问晚饭。" in user
+    assert "[3] 甲还没定。" in user
+    again = metabolism_service._repo.get_unclosed_events()
+    assert len(again) == 1
+    assert again[0].id == stable_id
 
 
 def test_knowledge_tables_exist_and_start_empty(db):

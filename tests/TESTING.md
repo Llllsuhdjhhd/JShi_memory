@@ -1,99 +1,50 @@
-# REMS 测试体系（2026.06 后）
+# JShi_memory 测试说明
 
-2026.06 升级后，向量检索改为 **Qdrant 三频段单流**，活跃池改为 **Tier-1 A-Res**，PerfMonitor 双通道隔离。旧测试里大量「双流 Stream A/B + Chroma」假设已失效，测试目录按三层拆分。
+本仓库为匠石提供可替换的记忆后端。回忆行为以 `design/1010-回忆设计.md` 为准，匠石调用边界以 `src/rems/port.py` 和邻接 JShi 仓库的 `src/jshi/memory/port.py` 为准。
 
-## 目录结构
+## 测试分层
 
-```
-tests/
-├── conftest.py              # 单元测试：hash 嵌入 + Qdrant :memory:
-├── unit/                    # 快测：无 LLM、无 data/，CI 必跑
-├── integration/             # 短输入 live LLM（可选 REMS_RUN_LIVE_*）
-├── scenarios/               # 长文本场景（红楼梦等），分块 ingest
-│   ├── conftest.py          # repo_root、live 门禁、workspace fixture
-│   ├── common/              # 场景共用：工作区、LLM 日志、回忆 hook、快照
-│   └── hongloumeng/         # 红楼梦：dataset + runner + CLI
-├── reports/                 # 人工整理的 live 跑批报告（非自动生成）
-└── TESTING.md               # 本文件
-```
+| 层 | 路径 | 用途 | 是否需要外部服务 |
+|---|---|---|---|
+| 单元 | `tests/unit/` | 模型、仓储、写入封存、回忆检索和预算 | 否；使用 SQLite 临时库、内存 Qdrant、HashEmbedding 和 FakeLLM |
+| 双仓契约 | `tests/integration/test_jshi_recall_contract.py` | 核对 JShi `MemoryPort` 的回忆参数和结果字段转换 | 否；需要 `JShi` 与 `JShi_memory` 两仓并列 |
+| 集成 / 场景 | `tests/integration/`、`tests/scenarios/` | 验证需真实模型或较长文本的端到端行为 | 视具体用例而定；不作为离线单元测试前置条件 |
+| 归档 | `tests/_archive/` | 留存旧实验和诊断材料 | 不纳入默认 pytest 收集 |
 
-## 三层职责
+## 建立 Miniconda 测试环境
 
-| 层级 | 目的 | 依赖 | 运行频率 |
-|------|------|------|----------|
-| **unit** | 算法与装配正确性 | FakeLLM / hash 嵌入 | 每次 commit |
-| **integration** | 真实 LLM + 短句 | `.env` API key | 发版前 / 手动 |
-| **scenarios** | 长叙事、跨块状态、诊断 | `data/` + API key | 调参 / 回归 |
-
-## 红楼梦：每次载入一块
-
-数据源：`data/hongloumeng_dataset.json`（约 1300+ 块，每块 300–2000 字）。
-
-### 状态机
-
-- 工作目录：`tests/scenarios/hongloumeng/outputs/<run_name>/`
-- `simulation_state.json`：`last_chunk_idx`（已 ingest 的最后一块 id）
-- 默认行为：**接着上次继续** ingest 下一块；`--reset` 清空工作区从头来
-
-### CLI（推荐入口）
+仓库提供 `environment-test.yml`。在项目根目录运行：
 
 ```powershell
-# 仓库根目录
-python tests/scenarios/hongloumeng/run_chunk.py              #  ingest 下一块
-python tests/scenarios/hongloumeng/run_chunk.py --count 3    #  连续 3 块
-python tests/scenarios/hongloumeng/run_chunk.py --chunk-id 5   #  指定第 5 块（仍写 state）
-python tests/scenarios/hongloumeng/run_chunk.py --reset --count 1
-python tests/scenarios/hongloumeng/run_chunk.py --run-name debug_0429 --offline  # FakeLLM 冒烟
+conda env create -f environment-test.yml
+conda activate jshi-memory-test
 ```
 
-### pytest 入口
+该环境使用 Python 3.12。单元测试走 `HashEmbedding`，不需要下载 sentence-transformers 模型或连接 LLM。
+
+## 常用命令
 
 ```powershell
-# 数据集结构（无 LLM）
-pytest tests/scenarios/hongloumeng/test_dataset.py -q
+# 回忆与写入的离线单元测试
+pytest tests/unit -q
 
-# 离线一块（FakeLLM + hash，CI 可跑）
-pytest tests/scenarios/hongloumeng/test_chunk_runner.py::test_offline_ingest_one_chunk -q
+# 只运行回忆重构契约测试
+pytest tests/unit/test_recall_v1.py tests/unit/test_recall_design_contract.py -q
 
-# Live 一块（需 API key + REMS_RUN_LIVE_METABOLISM_TEST=1）
-$env:REMS_RUN_LIVE_METABOLISM_TEST = "1"
-pytest tests/scenarios/hongloumeng/test_chunk_runner.py -m live_llm -v -s
+# 与并列 JShi 仓库的离线接口测试
+pytest tests/integration/test_jshi_recall_contract.py -q
 ```
 
-### 每块 ingest 后自动产出
+JShi 双仓测试会在邻接目录不存在 `JShi/src` 时明确跳过。它不会调用 `JSHI_MEMORY_BACKEND=rems3` 启动真实 pipeline，也不会连接模型服务。
 
-| 文件 | 内容 |
-|------|------|
-| `chunk_<id>_report.json` | 事件数、角色数、Tier-1 池大小、抽象数、recall_log 行 |
-| `chunk_<id>_recall_trace.json` | 三频段检索命中、意图权重、回忆块条目 |
-| `llm_calls/chunk_<id>_*.json` | LLM 请求/响应（live 模式） |
+## 回忆验收重点
 
-## 2026.06 诊断关注点（替代旧双流）
+- 主体范围始终受 `subject_id` 限定；对象和时间只在调用方传入时成为硬条件。
+- 事件语义向量和对象事实语义向量都只用 L1；词面命中不替代语义信号。
+- 结果保留材料类型、对象编号、表示级别和原始检索信号。
+- 可及性只能调整相关度接近的结果；强线索仍能命中低可及性材料。
+- 总预算选择完整表示，不截断内容；明确请求展开时也必须完整放入预算。
+- 命中加强已有记忆；不重写原文、不合成答案、不创建新的记忆单元。
+- JShi 当前回忆端口传单个 `object_id`、`level`、片段 `limit` 和锚点；未提供结构化时间范围或字符预算。
 
-1. **Tri-band**：`intent_weights (α,β,γ)`、各 band 命中、融合 score
-2. **Tier-1**：`active_pool` 预过滤前后命中数、`sample_key` 排名
-3. **Bypass**：是否触发全库扫描、触发前后 top score
-4. **代谢**：Shadow / UC 条数、封存事件数、split_prefix 链
-5. **抽象**：`recall_log` 支持度、新抽象 `origin`、ASF 传播（叶子 asf_i）
-
-旧脚本已移至 [`tests/_archive/hongloumeng/`](../_archive/hongloumeng/)。**新跑批请用 `run_chunk.py` + `runner.py`。**
-
-## 环境变量
-
-| 变量 | 含义 |
-|------|------|
-| `REMS_RUN_LIVE_METABOLISM_TEST=1` | 允许 live_llm 场景测试 |
-| `REMS_LIVE_ALLOW_FAKE_EMBEDDING=1` | live 时用 hash 嵌入（省下载模型） |
-| `REMS_LLM__API_KEY` | LLM 密钥（`.env`） |
-
-## CI 建议
-
-```yaml
-# 必跑
-pytest tests/unit/ tests/test_abstraction_service.py -q
-pytest tests/scenarios/hongloumeng/test_dataset.py -q
-pytest tests/scenarios/hongloumeng/test_chunk_runner.py::test_offline_ingest_one_chunk -q
-
-# 可选 nightly（secrets.REMS_LLM__API_KEY）
-pytest tests/scenarios/hongloumeng/test_chunk_runner.py -m live_llm -q
-```
+详细验收矩阵和待决接口规则见 `design/1610-测试与验收.md`。

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from datetime import datetime
 
 from .config import REMSConfig
 from .llm.provider import LLMProvider
@@ -28,6 +29,7 @@ from .recall import (
     HashEmbedding,
     NullReranker,
     QdrantRecallVectorStore,
+    versioned_collection_name,
     RecallPipeline,
     SentenceTransformerEmbedding,
 )
@@ -131,7 +133,10 @@ class REMSPipeline:
         else:
             embedding = SentenceTransformerEmbedding(config.embedding.model_name)
         vector_store = QdrantRecallVectorStore(
-            config.storage.qdrant_collection,
+            versioned_collection_name(
+                config.storage.qdrant_collection,
+                config.recall_embedding_version,
+            ),
             url=config.storage.qdrant_url,
             path=config.storage.qdrant_path,
         )
@@ -157,13 +162,25 @@ class REMSPipeline:
             recency_top_k=config.recall_recency_top_k,
             factor_alpha=config.recall_factor_alpha,
             mood_beta=config.recall_mood_beta,
-            object_affinity_enabled=config.recall_object_affinity_enabled,
-            object_affinity_boost=config.recall_object_affinity_boost,
-            object_affinity_penalty=config.recall_object_affinity_penalty,
             event_fatigue=config.event_fatigue,
             meta_repo=meta_repo,
             include_unclosed=config.recall_include_unclosed,
             unclosed_same_object_score=config.recall_unclosed_same_object_score,
+            role_repo=role_repo,
+            semantic_min=config.recall_semantic_min,
+            lexical_min=config.recall_lexical_min,
+            relevance_close=config.recall_relevance_close,
+            default_budget_chars=(
+                config.recall_budget_chars
+                if config.recall_budget_chars > 0
+                else config.physical_redline
+            ),
+            embedding_model=(
+                "hash"
+                if config.embedding.provider == "hash"
+                else config.embedding.model_name
+            ),
+            embedding_version=config.recall_embedding_version,
         )
 
         # ---- 技能与领域服务 ----
@@ -247,21 +264,22 @@ class REMSPipeline:
                         segment_id=e.segment_id or f"seg-{len(sub_segments)+1:03d}",
                         text=e.text,
                         objects=dict(e.objects),
-                        interlocutor=getattr(e, "interlocutor", None) or None,
+                        interlocutor_object_id=e.interlocutor,
                     )
                 )
             memory = MemoryExperience(
                 subject_id=batch.subject_id,
                 text=combined_text,
                 objects=merged_objects,
+                interlocutor=(
+                    valid[0].interlocutor
+                    if len({e.interlocutor for e in valid}) == 1
+                    else None
+                ),
                 source_ids=tuple(merged_sources),
                 segment_id="+".join(e.segment_id for e in valid),
                 origin=valid[0].origin,
                 sub_segments=sub_segments,
-                interlocutor=next(
-                    (getattr(e, "interlocutor", None) for e in valid if getattr(e, "interlocutor", None)),
-                    None,
-                ),
             )
             try:
                 sealed = self.metabolism_service.process_input(
@@ -302,17 +320,6 @@ class REMSPipeline:
                     for s in segment_sentences(segment_text)
                 )
 
-            # 说话/互动对象归属（interlocutor）：按事件内容命中的子段取该段说话对象；
-            # 无命中回退到批级。与 stored_marks 的段级匹配共用同一套 ``_segment_hits``。
-            seg_interlocutors = {
-                e.segment_id: (getattr(e, "interlocutor", None) or None)
-                for e in valid
-            }
-            batch_interlocutor = next(
-                (getattr(e, "interlocutor", None) for e in valid if getattr(e, "interlocutor", None)),
-                None,
-            )
-
             for ev in sealed:
                 hits = [
                     e.segment_id for e in valid
@@ -324,17 +331,6 @@ class REMSPipeline:
                     result.stored_marks.setdefault(
                         "+".join(e.segment_id for e in valid), [],
                     ).append(ev.event_id)
-
-                # interlocutor：命中段里第一个有归属的段说话对象；无则回退批级；仍无则留 None。
-                il = next((seg_interlocutors[seg] for seg in hits if seg_interlocutors.get(seg)), None)
-                if il is None:
-                    il = batch_interlocutor
-                if il:
-                    ev.interlocutor = il
-                    try:
-                        self.event_repo.save(ev)
-                    except Exception as exc:  # noqa: BLE001
-                        logger.warning("interlocutor save failed for %s: %s", ev.event_id, exc)
 
             if self.stored_marks_repo is not None:
                 for seg, ids in result.stored_marks.items():
@@ -359,22 +355,35 @@ class REMSPipeline:
         query: str,
         *,
         object_id: str | None = None,
+        object_ids: tuple[str, ...] | None = None,
+        interlocutor_object_id: str | None = None,
+        time_range: tuple[datetime, datetime] | None = None,
+        budget_chars: int | None = None,
+        expand_raw: bool = False,
         level: int = 1,
         limit: int | None = None,
         anchor_event_ids: tuple[str, ...] = (),
     ) -> tuple[RecalledFragment, ...]:
-        """实现 MemoryBackendPort.recall（记忆恢复 + 预算管理 + 可选 recall_traces 落库）。"""
+        """实现 MemoryBackendPort.recall。预算选级在回忆管线内完成，不再截断原文。"""
         if self.recall_pipeline is None:
             return ()
         fragments = self.recall_pipeline.recall(
             subject_id,
             query,
             object_id=object_id,
+            object_ids=object_ids,
+            interlocutor_object_id=(
+                interlocutor_object_id
+                # The current JShi adapter lists the interlocutor first in object_ids.
+                or (object_ids[0] if object_ids else None)
+            ),
+            time_range=time_range,
+            budget_chars=budget_chars,
+            expand_raw=expand_raw,
             level=level,
             limit=limit,
             anchor_event_ids=anchor_event_ids,
         )
-        out = self.apply_recall_budget(subject_id, object_id, fragments)
         self._record_recall_trace(
             subject_id,
             query,
@@ -382,9 +391,9 @@ class REMSPipeline:
             level=level,
             limit=limit,
             anchor_event_ids=anchor_event_ids,
-            fragments=out,
+            fragments=fragments,
         )
-        return out
+        return fragments
 
     def apply_recall_budget(
         self,
@@ -458,7 +467,7 @@ class REMSPipeline:
             content = (frag.content or frag.text or "")[: used]
             total += len(content)
             out_items.append({
-                "event_id": frag.event_id, "object_id": frag.object_id, "interlocutor": frag.interlocutor,
+                "event_id": frag.event_id, "object_id": frag.object_id,
                 "kind": frag.kind, "level": s["level"], "budget": s["budget"], "used": used,
                 "content": content, "score": frag.score,
             })
@@ -478,7 +487,6 @@ class REMSPipeline:
             content=text,
             kind="portrait",
             object_id=object_id,
-            interlocutor=object_id,
             # 对话人的肖像=核心上下文，优先级高于普通事件条目，保证在预算内优先纳入。
             score=100.0,
             summary_level=p.max_level,
@@ -507,9 +515,12 @@ class REMSPipeline:
                 RecallTraceItem(
                     event_id=f.event_id,
                     object_id=f.object_id,
-                    interlocutor=f.interlocutor,
+                    type=f.type,
+                    kind=f.kind,
                     score=f.score,
                     summary_level=f.summary_level,
+                    representation_level=f.representation_level,
+                    signals=dict(f.signals or {}),
                     source_ids=list(f.source_ids or []),
                     text=f.text or "",
                     content=f.content or "",

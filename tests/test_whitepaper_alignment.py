@@ -3,8 +3,7 @@
 升级历史：
     - boundary 输出字段从旧的 ``remaining_shadow`` 改为 ``new_unclosed_indices``
       （白皮书 §4.1：残影 = 未完成事件拼接，不再独立持久化）。
-    - 摘要预算从 boundary prompt 移到 ``EventEnrichmentSkill``，本测试验证 boundary
-      prompt 显式带"残影 / 当前输入"区间标记（P1-9）。
+    - 边界提示词只提交按发生顺序排列的 Memory Buffer，不标注上一轮残影分组。
     - ``EventService.seal_event`` 签名变更：摘要由 enrichment 单次调用产出，
       不再接受 ``pre_summaries``；构造签名换成 ``EventEnrichmentSkill`` + ``RoleService``。
 """
@@ -75,8 +74,8 @@ def test_boundary_detect_returns_new_unclosed_only(config):
     assert not hasattr(result, "remaining_shadow")
 
 
-def test_boundary_prompt_marks_shadow_and_current_ranges(config):
-    """P1-9：prompt 必须显式标注残影 / 当前输入的句子区间，否则模型无法分辨边界。"""
+def test_boundary_prompt_is_one_memory_buffer(config):
+    """输入只有按发生顺序排列的 Memory Buffer，不标注上一轮残影分组。"""
     llm = _DummyJSONLLM(
         {
             "completed_events": [],
@@ -88,8 +87,11 @@ def test_boundary_prompt_marks_shadow_and_current_ranges(config):
     skill.detect("旧残影第一句。", "新输入第一句。新输入第二句。")
     user_prompt = llm.last_messages[1]["content"]
 
-    assert "已有残影" in user_prompt
-    assert "本轮新输入" in user_prompt
+    assert "## Memory Buffer" in user_prompt
+    assert "[1] 旧残影第一句。" in user_prompt
+    assert "[2] 新输入第一句。" in user_prompt
+    assert "已有残影" not in user_prompt
+    assert "本轮新输入" not in user_prompt
 
 
 def test_role_extraction_prompt_includes_snapshot_budget(config):

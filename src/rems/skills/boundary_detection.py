@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 from ..config import REMSConfig
 from ..llm.provider import LLMProvider
 from ..llm.prompts import BOUNDARY_SYSTEM, BOUNDARY_USER, build_user_mode_block
-from ..models.metabolism import UnclosedEvent
+from ..models.metabolism import BufferSentence, UnclosedEvent
 from ..utils.text import (
     segment_sentences,
     format_indexed_text,
@@ -27,6 +27,8 @@ logger = logging.getLogger(__name__)
 class CompletedFragment(BaseModel):
     content_raw: str
     continuation_of: Optional[str] = None
+    # 本轮缓存中的 1-based 序号。解交织结果用它回写稳定编号，不信模型自填的 continues。
+    source_indices: list[int] = Field(default_factory=list)
     # 分裂标记：True 表示该已闭环片段是对某条过长未完成事件的 80% 前缀。
     # ``split_id`` 与同一 BoundaryResult 中某条 NewUnclosed.split_id 配对。
     is_split_prefix: bool = False
@@ -38,6 +40,7 @@ class CompletedFragment(BaseModel):
 class NewUnclosed(BaseModel):
     content: str
     logical_gaps: Optional[str] = None
+    source_indices: list[int] = Field(default_factory=list)
     # 分裂尾段标记：若非 None，则指向同一 ``BoundaryResult`` 中
     # 某条 ``is_split_prefix=True`` 的 ``CompletedFragment``。
     split_id: Optional[str] = None
@@ -49,6 +52,9 @@ class BoundaryResult(BaseModel):
     new_unclosed: list[NewUnclosed] = Field(default_factory=list)
     no_form_texts: list[str] = Field(default_factory=list)
     pending_texts: list[str] = Field(default_factory=list)
+    # True：本轮按 Memory Buffer 解交织。编号由程序维护，未划走的句子退回缓存。
+    disentangle: bool = False
+    unclaimed_indices: list[int] = Field(default_factory=list)
 
 
 class BoundaryDetectionSkill:
@@ -172,13 +178,19 @@ class BoundaryDetectionSkill:
         shadow_content: str,
         current_input: str,
         unclosed_events: list[UnclosedEvent] | None = None,
+        buffer_items: list[BufferSentence] | None = None,
     ) -> BoundaryResult:
-        ctx = self.build_index_context(shadow_content, current_input, unclosed_events)
+        if buffer_items is not None:
+            sentences = [item.text for item in buffer_items if item.text]
+        else:
+            ctx = self.build_index_context(shadow_content, current_input, unclosed_events)
+            sentences = ctx["sentences"]
+        ev_len = int(self._config.event_min_chars or 0)
+        factor = float(self._config.event_len_factor or 2)
         user_msg = BOUNDARY_USER.format(
-            formed_lines=ctx["formed_lines"],
-            residual_lines=ctx["residual_lines"],
-            indexed_input=ctx["indexed_input"],
-            range_hint=ctx["range_hint"],
+            memory_buffer=format_indexed_text(sentences) or "（无）",
+            ev_len=ev_len,
+            k=f"{factor:g}",
         )
         system_msg = build_user_mode_block(self._config) + BOUNDARY_SYSTEM
 
@@ -189,12 +201,7 @@ class BoundaryDetectionSkill:
                 {"role": "user", "content": user_msg},
             ],
         )
-        return self.parse_response(
-            data,
-            ctx["sentences"],
-            shadow_count=ctx["shadow_count"],
-            formed_indices=ctx["formed_indices"],
-        )
+        return self.parse_response(data, sentences, shadow_count=0, formed_indices=set())
 
     @staticmethod
     def _line_label(start: int, end: int) -> str:
@@ -309,8 +316,9 @@ class BoundaryDetectionSkill:
                 continue
             completed.append(CompletedFragment(
                 content_raw=content,
-                continuation_of=self._continues_id(item.get("continues", item.get("continuation_of"))),
+                continuation_of=None,
                 content_includes_source=True,
+                source_indices=list(indices),
             ))
 
         new_unc: list[NewUnclosed] = []
@@ -327,27 +335,24 @@ class BoundaryDetectionSkill:
                 continue
             new_unc.append(NewUnclosed(
                 content=content,
-                continuation_of=self._continues_id(item.get("continues")),
+                continuation_of=None,
+                source_indices=list(indices),
             ))
 
         no_form_idx = [
             i for i in normalize_indices(data.get("no_form") or [])
             if 1 <= i <= n_sent and i not in claimed
         ]
-        claimed.update(no_form_idx)
-        no_form_texts = [sentences[i - 1] for i in no_form_idx]
-
         missing = [
             i for i in range(1, n_sent + 1)
-            if i not in claimed and i not in formed_indices
+            if i not in claimed and i not in formed_indices and i not in no_form_idx
         ]
-        pending = [decode_indices(sentences, missing)] if missing else []
-        pending = [text for text in pending if text]
+        unclaimed = list(dict.fromkeys([*no_form_idx, *missing]))
         return BoundaryResult(
             completed_events=completed,
             new_unclosed=new_unc,
-            no_form_texts=no_form_texts,
-            pending_texts=pending,
+            disentangle=True,
+            unclaimed_indices=unclaimed,
         )
 
     def parse_response(

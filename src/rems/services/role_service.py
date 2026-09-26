@@ -116,21 +116,25 @@ class RoleService:
         subject_id: str,
         event: Event,
         fact: str,
+        levels: dict[str, str] | None = None,
     ) -> None:
-        """记忆路径白描：每个对象、每条事件追加一句事实，绑在 event_id 上。
+        """记忆路径白描：每个对象、每条事件追加这一次的表现，绑在 event_id 上。
 
-        用「我」的视角写这一次发生了什么。不写三级快照，不写长期性格。
+        ``fact`` 是 L1。若给了 ``levels``，L1/L2/L3 分别写入既有三列：
+        这三列在记忆路径上是同一表现的不同分辨率，L1 最长，L3 最短。
+        不写长期性格，不写对象情绪。
         """
         text = (fact or "").strip()
         if not text:
             return
+        ladder = levels or {}
         wp = WhitePaintingEntry(
             subject_id=subject_id,
             event_id=event.event_id,
             role_summary=text,
-            l1_mention=None,
-            l2_interaction=None,
-            l3_decision=None,
+            l1_mention=(ladder.get("L1") or "").strip() or None,
+            l2_interaction=(ladder.get("L2") or "").strip() or None,
+            l3_decision=(ladder.get("L3") or "").strip() or None,
             emotional_model=EmotionalModel(),
             importance=Importance.C,
             create_time=event.create_time,

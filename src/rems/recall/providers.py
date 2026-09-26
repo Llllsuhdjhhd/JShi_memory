@@ -24,10 +24,20 @@ class RerankerProvider(Protocol):
     def rerank(self, query: str, candidates: Sequence[str]) -> list[float]: ...
 
 
+def versioned_collection_name(base: str, version: int) -> str:
+    """嵌入版本变了就换集合名，旧集合留在原地。"""
+    suffix = f"_emb{int(version)}"
+    if base.endswith(suffix):
+        return base
+    return f"{base}{suffix}"
+
+
 class RecallVectorStore(Protocol):
     """回忆向量库接口（Qdrant 本地 / 远程 / 内存均可插拔）。"""
 
     def upsert(self, event_id: str, vector: list[float], payload: dict) -> None: ...
+
+    def get(self, logical_id: str) -> dict | None: ...
 
     def search(
         self,
@@ -35,6 +45,8 @@ class RecallVectorStore(Protocol):
         *,
         top_k: int,
         payload_filter: dict | None = None,
+        any_of: dict[str, list] | None = None,
+        ranges: dict[str, tuple[float, float]] | None = None,
     ) -> list[dict]: ...
 
     def delete(self, event_id: str) -> None: ...
@@ -152,14 +164,15 @@ class QdrantRecallVectorStore:
         except Exception:  # noqa: BLE001
             exists = False
         if exists:
-            try:
-                info = self._client.get_collection(self._collection)
-                if int(info.config.params.vectors.size) == dim:
-                    self._dim = dim
-                    return
-                self._client.delete_collection(self._collection)
-            except Exception:  # noqa: BLE001
-                pass
+            info = self._client.get_collection(self._collection)
+            size = int(info.config.params.vectors.size)
+            if size != dim:
+                raise RuntimeError(
+                    f"集合 {self._collection} 的向量维度是 {size}，当前嵌入维度是 {dim}。"
+                    "请提高 recall_embedding_version 后使用新集合，旧集合保留。"
+                )
+            self._dim = dim
+            return
         self._client.create_collection(
             collection_name=self._collection,
             vectors_config=models.VectorParams(size=dim, distance=models.Distance.COSINE),
@@ -182,26 +195,56 @@ class QdrantRecallVectorStore:
                 ],
             )
 
+    def get(self, logical_id: str) -> dict | None:
+        with self._lock:
+            try:
+                if not self._client.collection_exists(self._collection):
+                    return None
+            except Exception:  # noqa: BLE001
+                return None
+            found = self._client.retrieve(
+                collection_name=self._collection,
+                ids=[self._point_id(logical_id)],
+                with_payload=True,
+                with_vectors=False,
+            )
+            if not found or not found[0].payload:
+                return None
+            return dict(found[0].payload)
+
     def search(
         self,
         vector: list[float],
         *,
         top_k: int,
         payload_filter: dict | None = None,
+        any_of: dict[str, list] | None = None,
+        ranges: dict[str, tuple[float, float]] | None = None,
     ) -> list[dict]:
         with self._lock:
             from qdrant_client import models
 
             self._ensure_collection(len(vector))
-            qfilter = None
-            if payload_filter:
-                conditions = []
-                for key, value in payload_filter.items():
-                    conditions.append(models.FieldCondition(
-                        key=key,
-                        match=models.MatchValue(value=value),
-                    ))
-                qfilter = models.Filter(must=conditions)
+            conditions = []
+            for key, value in (payload_filter or {}).items():
+                conditions.append(models.FieldCondition(
+                    key=key,
+                    match=models.MatchValue(value=value),
+                ))
+            for key, values in (any_of or {}).items():
+                if not values:
+                    continue
+                conditions.append(models.FieldCondition(
+                    key=key,
+                    match=models.MatchAny(any=list(values)),
+                ))
+            for key, bounds in (ranges or {}).items():
+                start, end = bounds
+                conditions.append(models.FieldCondition(
+                    key=key,
+                    range=models.Range(gte=start, lte=end),
+                ))
+            qfilter = models.Filter(must=conditions) if conditions else None
             hits: list[dict] = []
             if hasattr(self._client, "query_points"):
                 resp = self._client.query_points(
@@ -235,8 +278,16 @@ class QdrantRecallVectorStore:
 
     def delete(self, event_id: str) -> None:
         with self._lock:
-            point_id = hashlib.md5(event_id.encode("utf-8")).hexdigest()
+            try:
+                if not self._client.collection_exists(self._collection):
+                    return
+            except Exception:  # noqa: BLE001
+                return
             self._client.delete(
                 collection_name=self._collection,
-                points_selector=[point_id],
+                points_selector=[self._point_id(event_id)],
             )
+
+    @staticmethod
+    def _point_id(logical_id: str) -> str:
+        return hashlib.md5(logical_id.encode("utf-8")).hexdigest()

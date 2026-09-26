@@ -84,6 +84,7 @@ class TestIngestBatch:
                 subject_id="jshi-1",
                 text="今天看到美丽的落日",
                 objects={"阿明": "OBJ-AMING"},
+                interlocutor="OBJ-AMING",
                 source_ids=("FACT-1",),
                 segment_id="seg-001",
                 origin="external",
@@ -103,6 +104,10 @@ class TestIngestBatch:
         assert ev.origin == "external"
         assert ev.seal_reason == "closed"
         assert ev.source_ids == ["FACT-1"]
+        assert [
+            (item.segment_id, item.object_id)
+            for item in ev.interlocutor_attributions
+        ] == [("seg-001", "OBJ-AMING")]
         assert ev.emotion is not None
         assert ev.emotion.emotion.joy == pytest.approx(0.8)
 
@@ -124,6 +129,101 @@ class TestIngestBatch:
         assert wps[0].l3_decision is None
         assert "性格" not in wps[0].role_summary
         assert marks_repo.get("seg-001") == [ev.event_id]
+
+    def test_merged_segments_keep_each_historical_interlocutor(
+        self, memory_pipeline, fake_llm: FakeLLM
+    ):
+        pipeline, event_repo, _role_repo, _marks_repo = memory_pipeline
+        fake_llm.push_response({
+            "completed_events": [{"content_raw_indices": [1, 2], "continuation_of": None}],
+            "new_unclosed_indices": [],
+        })
+        fake_llm.push_response({
+            "summaries": {"L1": "两段经历"},
+            "emotion": {"joy": 0.2},
+            "objects": [],
+        })
+        batch = MemoryBatch(
+            subject_id="jshi-1",
+            experiences=(
+                MemoryExperience(
+                    subject_id="jshi-1", text="和甲商量计划。",
+                    objects={"甲": "OBJ-A"}, interlocutor="OBJ-A",
+                    segment_id="seg-a",
+                ),
+                MemoryExperience(
+                    subject_id="jshi-1", text="又和乙确认时间。",
+                    objects={"乙": "OBJ-B"}, interlocutor="OBJ-B",
+                    segment_id="seg-b",
+                ),
+            ),
+        )
+
+        result = pipeline.ingest_batch(batch)
+
+        assert result.errors == []
+        assert len(result.sealed_event_ids) == 1
+        event = event_repo.get(result.sealed_event_ids[0])
+        assert event is not None
+        assert [
+            (item.segment_id, item.object_id)
+            for item in event.interlocutor_attributions
+        ] == [("seg-a", "OBJ-A"), ("seg-b", "OBJ-B")]
+
+    def test_unclosed_event_keeps_interlocutors_across_ingest_batches(
+        self, memory_pipeline, fake_llm: FakeLLM
+    ):
+        pipeline, event_repo, _role_repo, _marks_repo = memory_pipeline
+        fake_llm.push_response({
+            "completed_events": [],
+            "new_unclosed_indices": [1],
+        })
+        first = pipeline.ingest_batch(MemoryBatch(
+            subject_id="jshi-1",
+            experiences=(MemoryExperience(
+                subject_id="jshi-1",
+                text="约甲见面，但日期还没定。",
+                objects={"甲": "OBJ-A"},
+                interlocutor="OBJ-A",
+                segment_id="seg-a",
+            ),),
+        ))
+        assert first.sealed_event_ids == []
+        unclosed = pipeline.meta_repo.get_unclosed_events()[0]
+        assert [(item.segment_id, item.object_id) for item in unclosed.interlocutor_attributions] == [
+            ("seg-a", "OBJ-A"),
+        ]
+
+        fake_llm.push_response({
+            "completed_events": [{
+                "content_raw_indices": [1, 2],
+                "continuation_of": unclosed.id,
+            }],
+            "new_unclosed_indices": [],
+        })
+        fake_llm.push_response({
+            "summaries": {"L1": "约好周六见面"},
+            "emotion": {"joy": 0.1},
+            "objects": [],
+        })
+        second = pipeline.ingest_batch(MemoryBatch(
+            subject_id="jshi-1",
+            experiences=(MemoryExperience(
+                subject_id="jshi-1",
+                text="后来和乙确认了周六见面。",
+                objects={"乙": "OBJ-B"},
+                interlocutor="OBJ-B",
+                segment_id="seg-b",
+            ),),
+        ))
+
+        assert second.errors == []
+        event = event_repo.get(second.sealed_event_ids[0])
+        assert event is not None
+        assert {
+            (item.segment_id, item.object_id)
+            for item in event.interlocutor_attributions
+        } == {("seg-a", "OBJ-A"), ("seg-b", "OBJ-B")}
 
     def test_subject_memory_no_objects(self, memory_pipeline, fake_llm: FakeLLM):
         pipeline, event_repo, role_repo, _ = memory_pipeline

@@ -19,6 +19,7 @@ from ..models.event import (
     Importance,
 )
 from ..models.object_entry import ObjectMemoryEntry
+from ..models.interlocutor import InterlocutorAttribution
 from ..models.role import Role
 from ..skills.event_enrichment import EnrichmentResult, EventEnrichmentSkill
 from ..skills.role_extraction import ExtractedRole, RoleExtractionSkill
@@ -88,6 +89,7 @@ class EventService:
         source_ids: tuple[str, ...] = (),
         occurred_at: datetime | None = None,
         origin: str | None = None,
+        interlocutor_attributions: list[InterlocutorAttribution] | None = None,
     ) -> Event:
         """Create, enrich, persist and index a new basic event.
 
@@ -254,6 +256,7 @@ class EventService:
             summary_lengths=enrichment.summary_lengths,
             actual_max_level=enrichment.actual_max_level,
             role_list=resolved_role_entries,
+            interlocutor_attributions=list(interlocutor_attributions or []),
             status=EventStatus.ACTIVE,
             decoration=decoration,
             input_id=input_id,
@@ -304,6 +307,7 @@ class EventService:
                     subject_id=subject_id,
                     event=event,
                     fact=fact,
+                    levels=(getattr(enrichment, "object_levels", None) or {}).get(name),
                 )
         if not memory_mode and self._vector is not None:
             # 旧路径兼容：仅当显式注入了旧向量库才索引（新架构索引走 recall_pipeline，design/1010）。

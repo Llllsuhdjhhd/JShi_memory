@@ -5,8 +5,22 @@ from typing import Optional
 
 from pydantic import BaseModel, Field
 
+from .interlocutor import InterlocutorAttribution
+
 # 代谢中间态与回忆上下文包：残影 Shadow、未完成事件库条目、RecallBlock、ContextPackage。
 # 见《REMS 记忆系统规范解析》第 4.1（残影与剥离）、4.4（回忆与上下文组装）、第 5 章多场景输入。
+
+
+class BufferSentence(BaseModel):
+    """One sentence in the Memory Buffer, in original occurrence order.
+
+    ``residual_id`` 是程序保存的稳定残影编号，只用于输出后的状态更新。
+    它不写入边界检测的提示词。
+    """
+
+    text: str
+    residual_id: str | None = None
+    interlocutor_attributions: list[InterlocutorAttribution] = Field(default_factory=list)
 
 
 class Shadow(BaseModel):
@@ -19,6 +33,8 @@ class Shadow(BaseModel):
     content: str = ""
     subject_id: str = ""  # 归属匠石（design/810；单主体，恒同值）
     updated_at: datetime = Field(default_factory=datetime.now)
+    # 按发生顺序保存的缓存句。空列表表示尚未写入，调用方从残影条目回放。
+    buffer_items: list[BufferSentence] = Field(default_factory=list)
 
     @property
     def length(self) -> int:
@@ -31,7 +47,7 @@ class UnclosedEvent(BaseModel):
     未完成事件：叙事上已启动但缺关键结果或上下文的事实对象（白皮书 4.1）。
     所有的未完成事件拼接在一起构成了系统的“残影”。封存条件不只是语义闭环：
     单条字数触及 ``unclosed_char_limit``，或满足闲置规则（半限×3 天 / 满 7 天）时
-    也会按原文封存。说话人更换不触发封存。
+    也会按原文封存。
 
     分裂链路字段（2026-05 新增）：
         ``split_prefix_event_ids`` —— 若本 UC 是边界模型执行 80/20 强制分裂的"尾段"，
@@ -46,13 +62,16 @@ class UnclosedEvent(BaseModel):
     id: str
     subject_id: str = ""  # 归属匠石（design/810；单主体，恒同值）
     content_fragments: list[str] = Field(default_factory=list)
+    interlocutor_attributions: list[InterlocutorAttribution] = Field(default_factory=list)
+    buffer_items: list[BufferSentence] = Field(
+        default_factory=list,
+        description="未完成经历的逐句来源映射；续批或后续切分时保留历史对话对象归属",
+    )
     identified_roles: list[str] = Field(default_factory=list)
     logical_gaps: Optional[str] = None
     created_at: datetime = Field(default_factory=datetime.now)
     updated_at: datetime = Field(default_factory=datetime.now)
     last_hit_time: datetime = Field(default_factory=datetime.now)
-    # 挂起时的说话/互动对象（召回软纠偏用）；不因更换而封存。
-    interlocutor: str | None = None
 
     # 分裂链路：前缀事件 id（按从远到近的顺序）。
     split_prefix_event_ids: list[str] = Field(default_factory=list)

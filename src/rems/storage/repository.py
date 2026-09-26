@@ -5,7 +5,7 @@ from typing import Optional
 # 仓储层：Event/Role/Metabolism 的 CRUD 与 ORM ↔ Pydantic 模型转换。
 
 from ..models.event import EmotionalModel, Event, EventRoleEntry, EventStatus
-from ..models.metabolism import Shadow, UnclosedEvent
+from ..models.metabolism import BufferSentence, Shadow, UnclosedEvent
 from ..models.object_entry import ObjectMemoryEntry
 from ..models.role import Role, WhitePaintingEntry
 from datetime import datetime
@@ -71,7 +71,10 @@ class EventRepository:
                 recall_metadata={
                     "keywords": list(getattr(event, "keywords", None) or []),
                     "location": getattr(event, "location", None),
-                    "interlocutor": getattr(event, "interlocutor", None) or None,
+                    "interlocutor_attributions": [
+                        item.model_dump(mode="json")
+                        for item in event.interlocutor_attributions
+                    ],
                 },
             )
             s.merge(record)
@@ -266,6 +269,9 @@ class EventRepository:
             summary_lengths=r.summary_lengths or {},
             actual_max_level=r.actual_max_level or 0,
             role_list=role_list,
+            interlocutor_attributions=list(
+                (getattr(r, "recall_metadata", None) or {}).get("interlocutor_attributions") or []
+            ),
             is_abstract=r.is_abstract,
             is_abstracted=r.is_abstracted,
             status=EventStatus(r.status),
@@ -284,7 +290,6 @@ class EventRepository:
             origin="external" if (getattr(r, "origin", None) or "") in ("", "normal") else r.origin,
             keywords=list((getattr(r, "recall_metadata", None) or {}).get("keywords") or []),
             location=getattr(r, "location", None) or (getattr(r, "recall_metadata", None) or {}).get("location"),
-            interlocutor=(getattr(r, "recall_metadata", None) or {}).get("interlocutor") or None,
             emotion=EmotionalModel(**r.emotion) if (getattr(r, "emotion", None) or None) else None,
             forgetting_factor=float(getattr(r, "forgetting_factor", 1.0) or 1.0),
             seal_reason=getattr(r, "seal_reason", None) or "closed",
@@ -496,24 +501,34 @@ class MetabolismRepository:
             record = s.query(ShadowRecord).first()
             if not record:
                 return Shadow()
+            raw_items = getattr(record, "buffer_items", None) or []
+            items = [
+                BufferSentence.model_validate(item)
+                for item in raw_items
+                if isinstance(item, dict) and item.get("text")
+            ]
             return Shadow(
                 content=record.content,
                 updated_at=record.updated_at,
                 subject_id=getattr(record, "subject_id", "") or "",
+                buffer_items=items,
             )
 
     def update_shadow(self, shadow: Shadow) -> None:
         with self._db.session() as s:
             record = s.query(ShadowRecord).first()
+            payload = [item.model_dump() for item in shadow.buffer_items]
             if record:
                 record.content = shadow.content
                 record.updated_at = shadow.updated_at
                 record.subject_id = shadow.subject_id
+                record.buffer_items = payload
             else:
                 s.add(ShadowRecord(
                     content=shadow.content,
                     updated_at=shadow.updated_at,
                     subject_id=shadow.subject_id,
+                    buffer_items=payload,
                 ))
             s.commit()
 
@@ -523,12 +538,16 @@ class MetabolismRepository:
                 id=event.id,
                 subject_id=event.subject_id,
                 content_fragments=event.content_fragments,
+                interlocutor_attributions=[
+                    item.model_dump(mode="json")
+                    for item in event.interlocutor_attributions
+                ],
+                buffer_items=[item.model_dump(mode="json") for item in event.buffer_items],
                 identified_roles=event.identified_roles,
                 logical_gaps=event.logical_gaps,
                 created_at=event.created_at,
                 updated_at=event.updated_at,
                 last_hit_time=event.last_hit_time,
-                interlocutor=event.interlocutor,
                 split_prefix_event_ids=list(event.split_prefix_event_ids or []),
                 oversized=bool(event.oversized),
                 formation_role=event.formation_role or "residual",
@@ -556,12 +575,15 @@ class MetabolismRepository:
             id=r.id,
             subject_id=getattr(r, "subject_id", "") or "",
             content_fragments=r.content_fragments or [],
+            interlocutor_attributions=list(
+                getattr(r, "interlocutor_attributions", None) or []
+            ),
+            buffer_items=list(getattr(r, "buffer_items", None) or []),
             identified_roles=r.identified_roles or [],
             logical_gaps=r.logical_gaps,
             created_at=r.created_at,
             updated_at=r.updated_at,
             last_hit_time=r.last_hit_time,
-            interlocutor=getattr(r, "interlocutor", None) or None,
             split_prefix_event_ids=list(getattr(r, "split_prefix_event_ids", None) or []),
             oversized=bool(getattr(r, "oversized", False) or False),
             formation_role=getattr(r, "formation_role", None) or "residual",
@@ -672,7 +694,7 @@ class StoredMarksRepository:
 class RecallTraceRepository:
     """recall_traces 表读写：一次 recall 调用一行（输入 + 命中条目）。
 
-    用于回溯召回质量与说话人归属（诊断张冠李戴）；只作观测，不影响召回结果。
+    用于回溯召回质量；只作观测，不影响召回结果。
     """
 
     def __init__(self, db: Database):

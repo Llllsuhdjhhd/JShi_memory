@@ -181,9 +181,9 @@ def test_fragment_object_id_uses_event_not_query(recall_pipeline):
     pipe.index_event(a)
     pipe.index_event(b)
 
-    # 查询对象=lux（过滤参数），但两条都被召回时，片段对象必须是事件自己的对象
-    frags = pipe.recall("jshi-1", "讨论 生存 袭击", object_id="OBJ-LUX", reinforce=False)
-    by_id = {f.event_id: f.object_id for f in frags}
+    # 未指定对象时两条都可召回，片段上的对象是事件自己的对象。
+    frags = pipe.recall("jshi-1", "讨论 生存 袭击", reinforce=False)
+    by_id = {f.event_id: f.object_id for f in frags if f.type == "event"}
     assert by_id[a.event_id] == "OBJ-LUGUANG"
     assert by_id[b.event_id] == "OBJ-LUX"
 
