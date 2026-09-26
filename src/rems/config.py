@@ -430,9 +430,12 @@ class REMSConfig(BaseSettings):
     recall_profile: str = "tri_band"
     recall_bm25_enabled: bool = False
     recall_bm25_top_k: int = 40
-    recall_recency_enabled: bool = False
+    # Recent guaranteed lane + accessibility-sampled long-term semantic lane.
+    recall_recency_enabled: bool = True
     recall_recency_window_events: int = 80
     recall_recency_top_k: int = 40
+    recall_long_term_probability_floor: float = Field(default=0.05, ge=0.0, lt=1.0)
+    recall_access_half_life_days: float = Field(default=60.0, gt=0.0)
     # RRF channel names for the active profile (empty = backend default).
     recall_rrf_channels: list[str] = Field(default_factory=list)
     # hybrid_literary: ask enrichment for keywords / location (optional JSON fields).

@@ -1,12 +1,14 @@
-"""回忆检索管线：两路材料、原始检索信号、对象角色加权与预算选级。
+"""回忆检索管线：近期保底、长期概率抽样、原始相关度与预算选级。
 
-对象角色权重参与排序分；可及性只在加权分接近时调整顺序。
+可及性概率仅决定长期事件是否进入语义检索；不修改向量相关度分数。
 """
 
 from __future__ import annotations
 
 import hashlib
 import logging
+import math
+import random
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -87,6 +89,7 @@ class _Candidate:
     event: Event | None = None
     object_role_weight: float = 1.0
     interlocutor_attributions: list[InterlocutorAttribution] = field(default_factory=list)
+    is_recent_lane: bool = False
 
     @property
     def relevance(self) -> float:
@@ -199,7 +202,7 @@ def select_representation(
 
 
 class RecallPipeline:
-    """语义与词面入候选，对象和时间只在调用方传入时限制集合。"""
+    """用近期保底与长期概率两路确定语义检索范围，再合并词面候选。"""
 
     def __init__(
         self,
@@ -217,9 +220,10 @@ class RecallPipeline:
         reinforce_multiplier: float = 1.5,
         reinforce_cap: float = 300.0,
         intent_classifier: RuleIntentClassifier | None = None,
-        recency_enabled: bool = False,
+        recency_enabled: bool = True,
         recency_window_events: int = 80,
         recency_top_k: int = 40,
+        long_term_probability_floor: float = 0.05,
         factor_alpha: float = 0.5,
         mood_beta: float = 0.2,
         event_fatigue: float = 1.0,
@@ -250,6 +254,10 @@ class RecallPipeline:
         self._recency_enabled = recency_enabled
         self._recency_window_events = recency_window_events
         self._recency_top_k = recency_top_k
+        self._long_term_probability_floor = min(
+            max(float(long_term_probability_floor), 0.0), 0.99,
+        )
+        self._rng = random.Random()
         self._factor_alpha = factor_alpha
         self._mood_beta = mood_beta
         # 事件记忆疲态：与遗忘率协同（乘进 effective factor）；<1 时更快"忘记"。
@@ -299,15 +307,44 @@ class RecallPipeline:
             ev for ev in self._candidate_events(subject_id)
             if self._in_time_range(ev, time_range) and self._matches_objects(subject_id, ev, wanted)
         ]
-        semantic = (
-            self._semantic_signals(subject_id, q, wanted, time_range) if use_semantic else {}
-        )
+        recent_event_ids: set[str] = set()
+        semantic: dict[tuple[str, str, str], float] = {}
+        if use_semantic:
+            query_vector = self._embedding.embed_query(q)
+            if self._recency_enabled:
+                recent_events, long_term_events = self._split_semantic_pools(events, now)
+                recent_event_ids = {ev.event_id for ev in recent_events}
+                if recent_events:
+                    semantic.update(self._semantic_signals(
+                        subject_id, q, wanted, time_range,
+                        query_vector=query_vector,
+                        event_ids=tuple(ev.event_id for ev in recent_events),
+                        top_k=max(1, self._recency_top_k),
+                    ))
+                if long_term_events:
+                    long_term_signals = self._semantic_signals(
+                        subject_id, q, wanted, time_range,
+                        query_vector=query_vector,
+                        event_ids=tuple(ev.event_id for ev in long_term_events),
+                        top_k=self._top_k,
+                    )
+                    for key, score in long_term_signals.items():
+                        semantic[key] = max(semantic.get(key, 0.0), score)
+                logger.debug(
+                    "recall semantic pools: eligible=%d recent=%d long_term_selected=%d",
+                    len(events), len(recent_events), len(long_term_events),
+                )
+            elif events:
+                semantic = self._semantic_signals(
+                    subject_id, q, wanted, time_range, query_vector=query_vector,
+                )
         candidates: list[_Candidate] = []
         for ev in events:
             candidates.extend(self._event_candidates(
                 ev, q, wanted, semantic, time_range, now,
                 interlocutor_object_id=interlocutor_object_id,
                 use_semantic=use_semantic, use_lexical=use_lexical,
+                recent_event_ids=recent_event_ids,
             ))
         candidates.extend(self._unclosed_candidates(
             subject_id, q, wanted, time_range,
@@ -316,6 +353,8 @@ class RecallPipeline:
         ))
         admitted = [c for c in candidates if self._admitted(c, use_semantic, use_lexical)]
         ordered = self._arrange(admitted, wanted)
+        if recent_event_ids:
+            ordered = self._reserve_recent_candidate(ordered, wanted)
         fragments = self._fill_budget(ordered, budget, expand_raw=expand_raw, limit=limit)
         if reinforce:
             seen: set[str] = set()
@@ -458,21 +497,30 @@ class RecallPipeline:
         query: str,
         wanted: tuple[str, ...],
         time_range: tuple[datetime, datetime] | None,
+        *,
+        query_vector: list[float] | None = None,
+        event_ids: tuple[str, ...] | None = None,
+        top_k: int | None = None,
     ) -> dict[tuple[str, str, str], float]:
-        vector = self._embedding.embed_query(query)
+        if event_ids is not None and not event_ids:
+            return {}
+        vector = query_vector if query_vector is not None else self._embedding.embed_query(query)
         ranges = None
         if time_range is not None:
             start, end = time_range
             ranges = {"occurred_at": (start.timestamp(), end.timestamp())}
         hits = self._vector_store.search(
             vector,
-            top_k=self._top_k,
+            top_k=self._top_k if top_k is None else top_k,
             payload_filter={
                 "subject_id": subject_id,
                 "embedding_model": self._embedding_model,
                 "embedding_version": self._embedding_version,
             },
-            any_of={"object_ids": list(wanted)} if wanted else None,
+            any_of={
+                **({"object_ids": list(wanted)} if wanted else {}),
+                **({"event_id": list(event_ids)} if event_ids is not None else {}),
+            } or None,
             ranges=ranges,
         )
         scores: dict[tuple[str, str, str], float] = {}
@@ -504,6 +552,7 @@ class RecallPipeline:
         interlocutor_object_id: str | None,
         use_semantic: bool,
         use_lexical: bool,
+        recent_event_ids: set[str],
     ) -> list[_Candidate]:
         access = self._effective_factor(ev, now)
         temporal = 1.0 if time_range is not None else None
@@ -539,6 +588,7 @@ class RecallPipeline:
             occurred_at=ev.occurred_at or ev.create_time,
             event=ev,
             object_role_weight=event_object_role_weight,
+            is_recent_lane=ev.event_id in recent_event_ids,
         )]
         for role in ev.role_list:
             if role.is_subject:
@@ -572,6 +622,7 @@ class RecallPipeline:
                     and interlocutor_object_id in historical_interlocutor_ids
                     else _INVOLVED_OBJECT_WEIGHT
                 ),
+                is_recent_lane=ev.event_id in recent_event_ids,
             ))
         return out
 
@@ -656,6 +707,34 @@ class RecallPipeline:
             *order_by_relevance(rest, self._relevance_close),
         ]
 
+    @staticmethod
+    def _reserve_recent_candidate(
+        ordered: list[_Candidate], wanted: tuple[str, ...],
+    ) -> list[_Candidate]:
+        """Reserve the first eligible recent result without changing vector scores."""
+        if not ordered:
+            return ordered
+        if not wanted:
+            preferred_start, preferred_end = 0, len(ordered)
+        else:
+            fact_count = sum(c.material_type == "object_event_fact" for c in ordered)
+            preferred_start, preferred_end = (0, fact_count) if fact_count else (0, len(ordered))
+            if fact_count and not any(c.is_recent_lane for c in ordered[:fact_count]):
+                preferred_start = fact_count
+                preferred_end = len(ordered)
+        recent_index = next(
+            (idx for idx in range(preferred_start, preferred_end) if ordered[idx].is_recent_lane),
+            None,
+        )
+        if recent_index is None or recent_index == preferred_start:
+            return ordered
+        return [
+            *ordered[:preferred_start],
+            ordered[recent_index],
+            *ordered[preferred_start:recent_index],
+            *ordered[recent_index + 1 :],
+        ]
+
     def _fill_budget(
         self,
         ordered: list[_Candidate],
@@ -693,6 +772,7 @@ class RecallPipeline:
                 signals["object_role_weight"] = cand.object_role_weight
             if cand.temporal is not None:
                 signals["temporal"] = cand.temporal
+            signals["recent_lane"] = 1.0 if cand.is_recent_lane else 0.0
             text = cand.raw if cand.material_type == "event" else (cand.levels.get("L1") or cand.raw)
             attributions = cand.interlocutor_attributions or (
                 cand.event.interlocutor_attributions if cand.event is not None else []
@@ -776,6 +856,30 @@ class RecallPipeline:
         k = max(1, self._recency_top_k)
         ordered = sorted(events, key=lambda ev: ev.create_time, reverse=True)[:window]
         return {ev.event_id: idx + 1 for idx, ev in enumerate(ordered[:k])}
+
+    def _split_semantic_pools(
+        self, events: list[Event], now: datetime,
+    ) -> tuple[list[Event], list[Event]]:
+        """Keep the newest N eligible events searchable; sample older events by accessibility."""
+        if not events:
+            return [], []
+        ordered = sorted(events, key=lambda ev: ev.create_time, reverse=True)
+        recent_count = max(0, int(self._recency_window_events))
+        recent = ordered[:recent_count]
+        long_term = [
+            ev for ev in ordered[recent_count:]
+            if self._rng.random() < self._search_probability(self._effective_factor(ev, now))
+        ]
+        return recent, long_term
+
+    def _search_probability(self, accessibility: float) -> float:
+        """Map the unbounded accessibility factor into a bounded Bernoulli probability."""
+        access = max(float(accessibility), 0.0)
+        if math.isnan(access):
+            access = 0.0
+        normalized = 1.0 if math.isinf(access) else access / (1.0 + access)
+        floor = self._long_term_probability_floor
+        return floor + (1.0 - floor) * normalized
 
     def _effective_factor(self, ev: Event, now: datetime) -> float:
         age_days = max((now - ev.create_time).total_seconds() / 86400.0, 0.0)

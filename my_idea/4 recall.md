@@ -346,6 +346,12 @@ $$\text{K}_{current} = \max\left(\text{mincomparek}, \lfloor \frac{\text{basecom
 
 实现见 `src/rems/retrieval/`。文学场景推荐 `recall_profile=hybrid_literary`（BM25 + 近因 + tri-band 多路 RRF）。默认 `tri_band` 与改造前行为等价。诊断：`recall_trace.json` 的 `recall_backend` 字段；离线对比 `tests/scenarios/hongloumeng/compare_recall_profiles.py`。
 
+#### 当前事件级语义回忆通道
+
+`src/rems/recall/pipeline.py` 的事件回忆采用“近期保底 + 长期概率”候选策略：对象与显式时间条件先缩小事件集合；最近 `recall_recency_window_events` 条事件始终进入近期语义检索，较早事件按当前可及性因子抽样进入长期语义检索。长期事件的初始搜索概率为 `p_floor + (1-p_floor) × A/(1+A)`，其中 `p_floor` 由 `recall_long_term_probability_floor` 配置，默认 `0.05`；`A = event_fatigue × forgetting_factor × 2^(-age_days / recall_access_half_life_days)`。事件封存时，`forgetting_factor` 由 `activation_energy` 映射得到；成功回忆后按 `recall_reinforce_multiplier` 增强，并受 `recall_forgetting_factor_cap` 限制。该概率映射和 60 天默认半衰期是初始参数，需用回忆样例校准。
+
+概率只控制语义向量检索的候选范围，不改变向量相似度，也不裁掉词面检索；因此老事件仍可通过明确词面线索命中。近期通道中若有通过相关度门槛的结果，会保留一个近期结果优先位；剩余结果仍按既有相关度和对象角色规则排序。容量压力下的物理删除仍是独立的后续生命周期策略。
+
 #### 4.7.3 情感极值免死金牌（PTSD Immunity）
 
 现有 §1.1.3 的摘要熔断与 §1.1.4 的 L1 骨架化在极端情感事件上会造成关键细节的不可逆丢失。情感极值免死金牌机制阻断这一路径，模拟"闪光灯记忆"的永久固化：
