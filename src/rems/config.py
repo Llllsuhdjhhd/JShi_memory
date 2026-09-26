@@ -133,7 +133,7 @@ class REMSConfig(BaseSettings):
     context_window: int = 88000
     chars_per_token: float = 1.5
 
-    # 记忆主体（匠石）：恒为单个主体值；30 侧在 MemoryBatch 提供（design/210）。
+    # 记忆主体（匠石）：恒为单个主体值；30 侧在 MemoryBatch 提供（docs/memory.md）。
     subject_id: str = ""
 
     llm: LLMConfig = Field(default_factory=LLMConfig)
@@ -189,7 +189,7 @@ class REMSConfig(BaseSettings):
     portrait_fatigue: float = 1.0
     event_fatigue: float = 1.0
 
-    # ---- Recall budget management（回忆预算管理，design/1010 §8.5）----
+    # ---- Recall budget management（回忆预算管理，docs/recall.md（预算））----
     # 预算 = 本次回忆的总字数，与回忆等级相关。回忆分 recall_level_count 级，各级字数递增
     # (L1=最短=recall_magic_num，之后逐级 ×recall_level_growth，L{count}=最长)。
     # 分配：条目按(评分)排序，贪心——能装最高级就装最高级，装不下下降级，再装不下丢弃；
@@ -204,7 +204,7 @@ class REMSConfig(BaseSettings):
     recall_include_unclosed: bool = True
     recall_unclosed_same_object_score: float = 90.0
     # 进入候选的语义、词面门槛，以及相关度视为接近、才允许可及性改序的幅度。
-    # 数值只放在配置里，不写进 design/1010。
+    # 数值只放在配置里，不写进 docs/recall.md。
     recall_semantic_min: float = 0.35
     recall_lexical_min: float = 0.05
     recall_relevance_close: float = 0.08
@@ -265,7 +265,7 @@ class REMSConfig(BaseSettings):
     # 但"认知层"的默认路径不再做盲目强制封存——只做评估 → 修复 → 保留 oversized UC。
     # 是否「可疑」由角色抽取与 RoleService 仲裁判断。
     unclosed_force_ratio: float = 1.2
-    # ---- 未完成事件封存条件（按单条 UC 字数，非残影总长；design/610）----
+    # ---- 未完成事件封存条件（按单条 UC 字数，非残影总长；docs/memory.md）----
     # 字数上限魔法数。单条未完成事件字数 ≥ 该值 → 按原文封存。
     # 匠石可通过环境变量 REMS_UNCLOSED_CHAR_LIMIT 覆盖；0 = 关闭字数触发。
     unclosed_char_limit: int = 2000

@@ -28,7 +28,7 @@ class WhitePaintingEntry(BaseModel):
     subject_id: str = ""  # 记忆主体（匠石）作用域。
     event_id: str  # 来源基本事件，便于溯源（白描 ↔ 事件关系）。
     role_summary: str  # 该角色在此事件中的白描摘要（多取 L2 互动层）。
-    # 匠石视角的分级白描（design/610）：L1 提及 / L2 互动 / L3 决策意图。
+    # 匠石视角的分级白描（docs/memory.md）：L1 提及 / L2 互动 / L3 决策意图。
     l1_mention: str | None = None
     l2_interaction: str | None = None
     l3_decision: str | None = None

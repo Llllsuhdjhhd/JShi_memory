@@ -1,4 +1,4 @@
-"""Backfill helpers for legacy memory data (design/1010)."""
+"""Backfill helpers for legacy memory data (docs/recall.md)."""
 
 from __future__ import annotations
 

@@ -149,7 +149,7 @@ class EventService:
         resolved_role_entries = list(role_entries or [])
 
         if memory_mode:
-            # 记忆路径（design/410/610）：角色列表 = 主体恒在 + 对象映射表；
+            # 记忆路径（docs/memory.md）：角色列表 = 主体恒在 + 对象映射表；
             # 不抽取、不建档、不建角色系统；对象无情感。
             subject_emotion = enrichment.emotion or EmotionalModel()
             resolved_role_entries = [
@@ -280,7 +280,7 @@ class EventService:
             except Exception:
                 logger.debug("EMA evolution skipped due to error", exc_info=True)
 
-        # design/1010：arousal → 初始记忆强度（遗忘因子）。
+        # docs/recall.md：arousal → 初始记忆强度（遗忘因子）。
         # 用 EMA 演化后的最终 activation_energy；中性 0.5 → 1.0。
         if memory_mode:
             event.forgetting_factor = initial_forgetting_factor(
@@ -310,7 +310,7 @@ class EventService:
                     levels=(getattr(enrichment, "object_levels", None) or {}).get(name),
                 )
         if not memory_mode and self._vector is not None:
-            # 旧路径兼容：仅当显式注入了旧向量库才索引（新架构索引走 recall_pipeline，design/1010）。
+            # 旧路径兼容：仅当显式注入了旧向量库才索引（新架构索引走 recall_pipeline，docs/recall.md）。
             self._index_event(event)
 
         logger.info(

@@ -1,4 +1,4 @@
-"""人物肖像压缩 Skill（design/1010 §8.4 portrait）。
+"""人物肖像压缩 Skill（docs/project-overview.md（肖像））。
 
 - ``generate_object_summary``：一次记忆落位涉及多个对象时，为**每个对象**生成一条人物摘要
   （主体对该对象的记忆）。

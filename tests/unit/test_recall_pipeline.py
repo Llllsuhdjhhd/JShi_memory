@@ -1,4 +1,4 @@
-"""回忆管线（design/1010）单元测试：多路召回、对象过滤、档位、记忆恢复。"""
+"""回忆管线（docs/recall.md）单元测试：多路召回、对象过滤、档位、记忆恢复。"""
 
 from __future__ import annotations
 

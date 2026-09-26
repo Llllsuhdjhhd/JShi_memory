@@ -91,5 +91,5 @@ class FakeEmbeddingFunction:
 
 @pytest.fixture
 def vector_store(config, db):
-    # 新架构不再使用旧向量库（design/810：向量占位；回忆索引走 recall_pipeline）。
+    # 新架构不再使用旧向量库（docs/memory.md：向量占位；回忆索引走 recall_pipeline）。
     return None

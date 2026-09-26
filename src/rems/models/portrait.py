@@ -1,6 +1,6 @@
 """人物肖像模型：per-object 10 级渐进人物摘要 + 记忆疲态可见性。
 
-规格（design/1010 §8.4 之后的 portrait 子项）：
+规格（docs/project-overview.md 之后的 portrait 子项）：
 - 10 级，从最简(L1)到最详细(Ln)，每级是上一级 growth(默认2) 倍；
 - L1 = min(portrait_magic_num, 总长 / growth^(max_levels-1))；
 - 某级预算 > 总长 即停，保留该级原长度；最多 max_levels 级；

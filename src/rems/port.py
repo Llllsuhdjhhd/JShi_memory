@@ -1,7 +1,7 @@
 """MemoryBackendPort：匠石记忆后端的稳定接口（对齐匠石《记忆层契约》）。
 
 本模块只定义端口形状与数据模型，不实现引擎逻辑；实现见 REMSPipeline /
-MetabolismService / EventService 等（详见 design/210 输入协议）。
+MetabolismService / EventService 等（详见 docs/memory.md 输入协议）。
 
 硬约束：
 - 无抽象事件（不做频繁子集挖掘、ASF、抽象合成）；
@@ -90,7 +90,7 @@ class BackendIngestResult(BaseModel):
 
 
 class RecalledFragment(BaseModel):
-    """回忆交回的一条材料（design/1010）。
+    """回忆交回的一条材料（docs/recall.md）。
 
     ``type`` 取 ``event`` / ``object_event_fact`` / ``unclosed``。
     ``content`` 是放进预算的完整一级，不截断。``signals`` 保留各路原始信号。

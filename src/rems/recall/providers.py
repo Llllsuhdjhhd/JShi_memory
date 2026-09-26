@@ -1,4 +1,4 @@
-"""回忆可插拔 provider（design/1010 §9.1）：Embedding / Reranker / VectorStore 接口与本地实现。"""
+"""回忆可插拔 provider（docs/project-overview.md）：Embedding / Reranker / VectorStore 接口与本地实现。"""
 
 from __future__ import annotations
 

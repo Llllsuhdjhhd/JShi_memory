@@ -849,7 +849,7 @@ class RecallPipeline:
         return {}
 
     def _recency_route(self, events: list[Event]) -> dict[str, int]:
-        """近因通道：窗口内按 create_time 降序给 RRF 排名（design/1010 §3）。"""
+        """近因通道：窗口内按 create_time 降序给 RRF 排名（docs/recall.md）。"""
         if not events:
             return {}
         window = max(1, self._recency_window_events)

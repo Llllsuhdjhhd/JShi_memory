@@ -246,7 +246,7 @@ class EventRepository:
             s.commit()
 
     def update_forgetting_factor(self, event_id: str, factor: float) -> None:
-        """记忆单元级遗忘因子更新（回忆命中的记忆恢复，design/1010）。"""
+        """记忆单元级遗忘因子更新（回忆命中的记忆恢复，docs/recall.md）。"""
         with self._db.session() as s:
             r = s.get(EventRecord, event_id)
             if r is None:
@@ -591,7 +591,7 @@ class MetabolismRepository:
 
 
 # =====================================================================
-# Object memory timeline（design/410/810；无情感，只存摘要轨迹）
+# Object memory timeline（docs/memory.md；无情感，只存摘要轨迹）
 # =====================================================================
 
 class ObjectTimelineRepository:
@@ -647,7 +647,7 @@ class ObjectTimelineRepository:
 
 
 # =====================================================================
-# stored_marks 台账（design/210/810；30 侧推进游标用，纯台账）
+# stored_marks 台账（docs/memory.md；30 侧推进游标用，纯台账）
 # =====================================================================
 
 class StoredMarksRepository:
@@ -688,7 +688,7 @@ class StoredMarksRepository:
 
 
 # =====================================================================
-# recall_traces（design/1010 可观测：本次回忆输入 + 命中条目）
+# recall_traces（docs/recall.md 可观测：本次回忆输入 + 命中条目）
 # =====================================================================
 
 class RecallTraceRepository:
@@ -759,7 +759,7 @@ class RecallTraceRepository:
 
 
 # =====================================================================
-# 人物肖像（design/1010 §8.4 portrait）：ObjectPortrait + portrait_summaries
+# 人物肖像（docs/project-overview.md（肖像））：ObjectPortrait + portrait_summaries
 # =====================================================================
 
 class PortraitRepository:

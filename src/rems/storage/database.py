@@ -105,7 +105,7 @@ class WhitePaintingRecord(Base):
     role_id = Column(String, ForeignKey("roles.role_id"), nullable=False, index=True)
     event_id = Column(String, ForeignKey("events.event_id"), nullable=False)
     role_summary = Column(Text, nullable=False)
-    # 匠石视角分级白描（design/610）：L1 提及 / L2 互动 / L3 决策意图。
+    # 匠石视角分级白描（docs/memory.md）：L1 提及 / L2 互动 / L3 决策意图。
     l1_mention = Column(Text, nullable=True)
     l2_interaction = Column(Text, nullable=True)
     l3_decision = Column(Text, nullable=True)
@@ -156,7 +156,7 @@ class UnclosedEventRecord(Base):
 
 
 class ObjectMemoryEntryRecord(Base):
-    """对象记忆时间线（替代 roles + white_painting_entries；无情感，见 design/410/810）。"""
+    """对象记忆时间线（替代 roles + white_painting_entries；无情感，见 docs/memory.md）。"""
 
     __tablename__ = "object_memory_entries"
 
@@ -170,7 +170,7 @@ class ObjectMemoryEntryRecord(Base):
 
 
 class StoredMarkRecord(Base):
-    """stored_marks 台账：segment_id（经历段 id）→ 本轮封存事件 id 列表（30 推进游标与台账用，见 design/210/810）。"""
+    """stored_marks 台账：segment_id（经历段 id）→ 本轮封存事件 id 列表（30 推进游标与台账用，见 docs/memory.md）。"""
 
     __tablename__ = "stored_marks"
 
@@ -204,7 +204,7 @@ class RecallTraceRecord(Base):
 
 
 class PortraitRecord(Base):
-    """per-object 人物肖像：10 级渐进人物摘要（design/1010 §8.4 portrait）。"""
+    """per-object 人物肖像：10 级渐进人物摘要（docs/project-overview.md（肖像））。"""
 
     __tablename__ = "object_portraits"
 

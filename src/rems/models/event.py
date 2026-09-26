@@ -146,7 +146,7 @@ class CompressionBudget(BaseModel):
 class EventRoleEntry(BaseModel):
     # 单个角色在一次事件中的瞬时记录（之后会被写入角色白描时间线）。
     role_id: str
-    is_subject: bool = False  # True = 匠石（主体）；情感只属于主体（design/410）
+    is_subject: bool = False  # True = 匠石（主体）；情感只属于主体（docs/memory.md）
     importance: Importance = Importance.C
     role_snapshot: RoleSnapshot = Field(default_factory=RoleSnapshot)
     emotional_model: EmotionalModel = Field(default_factory=EmotionalModel)
@@ -157,11 +157,11 @@ class EventRoleEntry(BaseModel):
 
 class Event(BaseModel):
     event_id: str = Field(default_factory=generate_event_id)
-    subject_id: str = ""  # 记忆单元归属主体（匠石）；由 ingest_batch 注入（design/810）
+    subject_id: str = ""  # 记忆单元归属主体（匠石）；由 ingest_batch 注入（docs/memory.md）
     create_time: datetime = Field(default_factory=datetime.now)
-    input_id: Optional[str] = None  # 记录产生此事件的经历段 segment_id（30 侧；design/210）
-    source_ids: list[str] = Field(default_factory=list)  # 来源链（design/210）
-    occurred_at: Optional[datetime] = None  # 经历发生时间；空 = 摄入时刻（design/210/810）
+    input_id: Optional[str] = None  # 记录产生此事件的经历段 segment_id（30 侧；docs/memory.md）
+    source_ids: list[str] = Field(default_factory=list)  # 来源链（docs/memory.md）
+    occurred_at: Optional[datetime] = None  # 经历发生时间；空 = 摄入时刻（docs/memory.md）
     content_raw: str  # L0：基本事件为已闭环事实原文；抽象事件为自子事件归纳的合成描述（白皮书 1.1.2、3.1）。
 
     summaries: dict[str, str] = Field(default_factory=dict)  # L1~Ln 递归摘要（白皮书 1.1.3）。
@@ -211,10 +211,10 @@ class Event(BaseModel):
     # 事件来源：external | internal | dream（字符串，保留扩展；legacy normal 视为 external）。
     origin: str = "external"
 
-    # 事件级主体情感（匠石在事件中的情感；对象无情感，见 design/410）。
+    # 事件级主体情感（匠石在事件中的情感；对象无情感，见 docs/memory.md）。
     emotion: Optional[EmotionalModel] = None
 
-    # 记忆单元级遗忘因子（情感 arousal 初始化，随时间衰减；回忆命中强化，见 design/610/1010）。
+    # 记忆单元级遗忘因子（情感 arousal 初始化，随时间衰减；回忆命中强化，见 docs/memory.md、docs/recall.md）。
     forgetting_factor: float = 1.0
 
     # 封存原因：closed 自然闭环 / split 资源切开的前段 / truncated 搁置或无法切开。

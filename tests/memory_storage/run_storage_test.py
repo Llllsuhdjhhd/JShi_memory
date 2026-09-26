@@ -150,7 +150,7 @@ def mark_ingested(conv_path: Path, turns: list[dict[str, Any]], run_id: str) -> 
 def build_experiences(
     turns: list[dict[str, Any]], subject_id: str
 ) -> list[MemoryExperience]:
-    """每轮对话 → 一段经历（design/210）：主体恒为匠石，deepseek 为对谈对象。"""
+    """每轮对话 → 一段经历（docs/memory.md）：主体恒为匠石，deepseek 为对谈对象。"""
     exps: list[MemoryExperience] = []
     for i, t in enumerate(turns, 1):
         exps.append(MemoryExperience(

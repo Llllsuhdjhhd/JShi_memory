@@ -1,4 +1,4 @@
-"""Recall query intent classification (rule-based; design/1010 §3 step 1).
+"""Recall query intent classification (rule-based; docs/recall.md step 1).
 
 第一版不调 LLM：词典子串命中 + 已知对象名匹配，输出 :class:`RecallIntent`。
 对象名来自输入映射（如 {"deepseek": "OBJ-DEEPSEEK"}），由调用方提供。

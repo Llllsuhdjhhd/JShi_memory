@@ -1,6 +1,6 @@
-"""回忆模块（design/1010）：可插拔 provider + 检索管线。
+"""回忆模块（docs/recall.md）：可插拔 provider + 检索管线。
 
-按 design/1010：事件与对象事实两路材料，语义和词面入候选，可及性只调整接近项的顺序。
+按 docs/recall.md：事件与对象事实两路材料，语义和词面入候选，可及性只调整接近项的顺序。
 """
 
 from .pipeline import RecallPipeline, material_source_hash, retrieval_text

@@ -1,9 +1,9 @@
 """REMSPipeline：匠石记忆后端（REMS3 fork）新编排。
 
 - **记忆写入**：``ingest_batch``（MemoryBackendPort）——逐 input 代谢封存，写对象时间线 /
-  stored_marks / 向量索引（design/210、610、810、1010）；
-- **回忆读取**：``recall``（MemoryBackendPort）——RecallPipeline 多路召回（design/1010）；
-- **信念修正**：``tombstone``——保留墓碑标记，只降可见性、不删原文（design/10）。
+  stored_marks / 向量索引（docs/memory.md、docs/recall.md）；
+- **回忆读取**：``recall``（MemoryBackendPort）——RecallPipeline 多路召回（docs/recall.md）；
+- **信念修正**：``tombstone``——保留墓碑标记，只降可见性、不删原文（docs/project-overview.md）。
 """
 
 from __future__ import annotations
@@ -104,7 +104,7 @@ class REMSPipeline:
     # ------------------------------------------------------------------
     @classmethod
     def from_config(cls, config: REMSConfig | None = None) -> "REMSPipeline":
-        """工厂：装配存储、技能、领域服务与回忆 provider（插拔式，design/1010 §9.1）。"""
+        """工厂：装配存储、技能、领域服务与回忆 provider（插拔式，docs/project-overview.md）。"""
         if config is None:
             config = REMSConfig()
 
@@ -198,7 +198,7 @@ class REMSPipeline:
             config,
             llm,
             event_repo,
-            None,  # 旧向量库不再使用（design/810：向量占位 → 回忆由 recall_pipeline 索引）
+            None,  # 旧向量库不再使用（docs/memory.md：向量占位 → 回忆由 recall_pipeline 索引）
             enrichment_skill,
             role_service=role_service,
             emotion_evolver=emotion_evolver,
@@ -235,7 +235,7 @@ class REMSPipeline:
         )
 
     # ------------------------------------------------------------------
-    # 记忆写入端口（design/210/610）
+    # 记忆写入端口（docs/memory.md）
     # ------------------------------------------------------------------
 
     def ingest_batch(self, batch: MemoryBatch) -> BackendIngestResult:
@@ -348,7 +348,7 @@ class REMSPipeline:
         return result
 
     # ------------------------------------------------------------------
-    # 回忆端口（design/1010）
+    # 回忆端口（docs/recall.md）
     # ------------------------------------------------------------------
 
     def recall(
@@ -549,7 +549,7 @@ class REMSPipeline:
             logger.warning("recall_trace save failed: %s", exc)
 
     # ------------------------------------------------------------------
-    # 人物肖像（design/1010 §8.4 portrait）
+    # 人物肖像（docs/project-overview.md（肖像））
     # ------------------------------------------------------------------
 
     def portrait(self, subject_id: str, object_id: str) -> dict | None:

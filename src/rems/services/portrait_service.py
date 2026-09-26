@@ -1,4 +1,4 @@
-"""人物肖像服务（design/1010 §8.4 portrait）。
+"""人物肖像服务（docs/project-overview.md（肖像））。
 
 负责 per-object 10 级渐进人物摘要：
 - 等级化：``compute_level_budgets``（L1=max(魔法数100, 总长/2^9)，每级 growth 倍，超总长即停、截到总长、最多 10 级）；

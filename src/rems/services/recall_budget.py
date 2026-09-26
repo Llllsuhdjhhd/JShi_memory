@@ -1,4 +1,4 @@
-"""回忆预算管理（design/1010 §8.5）。
+"""回忆预算管理（docs/recall.md（预算））。
 
 预算 = 本次回忆的总字数，与回忆等级相关。
 - 回忆分 `recall_level_count`（默认 6）级，各级字数递增：L1=最短=recall_magic_num，之后逐级 ×growth，L{count}=最长。

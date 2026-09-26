@@ -31,7 +31,7 @@ class Shadow(BaseModel):
     """
 
     content: str = ""
-    subject_id: str = ""  # 归属匠石（design/810；单主体，恒同值）
+    subject_id: str = ""  # 归属匠石（docs/memory.md；单主体，恒同值）
     updated_at: datetime = Field(default_factory=datetime.now)
     # 按发生顺序保存的缓存句。空列表表示尚未写入，调用方从残影条目回放。
     buffer_items: list[BufferSentence] = Field(default_factory=list)
@@ -60,7 +60,7 @@ class UnclosedEvent(BaseModel):
     """
 
     id: str
-    subject_id: str = ""  # 归属匠石（design/810；单主体，恒同值）
+    subject_id: str = ""  # 归属匠石（docs/memory.md；单主体，恒同值）
     content_fragments: list[str] = Field(default_factory=list)
     interlocutor_attributions: list[InterlocutorAttribution] = Field(default_factory=list)
     buffer_items: list[BufferSentence] = Field(

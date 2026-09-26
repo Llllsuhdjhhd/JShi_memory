@@ -1,4 +1,4 @@
-"""Acceptance tests for the JShi-facing recall design (design/1010)."""
+"""Acceptance tests for the JShi-facing recall design (docs/recall.md)."""
 
 from __future__ import annotations
 
