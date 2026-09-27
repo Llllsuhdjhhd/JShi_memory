@@ -409,6 +409,18 @@ class RoleRepository:
                 q = q.limit(limit)
             return [self._to_wp_entry(e) for e in q.all()]
 
+    def list_white_painting_object_ids(self, subject_id: str) -> tuple[str, ...]:
+        """Find objects with white paintings for a periodic portrait scan."""
+        with self._db.session() as s:
+            rows = (
+                s.query(WhitePaintingRecord.role_id)
+                .filter(WhitePaintingRecord.subject_id == subject_id)
+                .distinct()
+                .order_by(WhitePaintingRecord.role_id)
+                .all()
+            )
+            return tuple(row[0] for row in rows)
+
     def get_white_painting_by_event(self, role_id: str, event_id: str) -> WhitePaintingEntry | None:
         with self._db.session() as s:
             record = (
@@ -826,6 +838,27 @@ class PortraitRepository:
                 r = s.get(PortraitSummaryRecord, sid)
                 if r:
                     r.incorporated = True
+            s.commit()
+
+    def save_portrait_and_mark(self, portrait: ObjectPortrait, summary_ids: list[str]) -> None:
+        """Save a white-painting portrait and consume its evidence atomically."""
+        with self._db.session() as s:
+            s.merge(PortraitRecord(
+                subject_id=portrait.subject_id,
+                object_id=portrait.object_id,
+                name=portrait.name,
+                levels={k: v.model_dump(mode="json") for k, v in portrait.levels.items()},
+                max_level=portrait.max_level,
+                total_content_len=portrait.total_content_len,
+                compression_ratio=portrait.compression_ratio,
+                fatigue=portrait.fatigue,
+                created_at=portrait.created_at,
+                updated_at=portrait.updated_at,
+            ))
+            for summary_id in summary_ids:
+                record = s.get(PortraitSummaryRecord, summary_id)
+                if record is not None:
+                    record.incorporated = True
             s.commit()
 
     # ---- convert ----

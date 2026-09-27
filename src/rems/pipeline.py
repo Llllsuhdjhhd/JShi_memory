@@ -44,7 +44,6 @@ from .services.recall_budget import RecallBudgetManager
 from .services.role_service import RoleService
 from .skills.boundary_detection import BoundaryDetectionSkill
 from .skills.event_enrichment import EventEnrichmentSkill
-from .skills.portrait_compression import PortraitCompressionSkill
 from .skills.role_extraction import RoleExtractionSkill
 from .storage.database import Database
 from .storage.repository import (
@@ -122,8 +121,7 @@ class REMSPipeline:
         portrait_service: PortraitService | None = None
         if config.portrait_enabled:
             portrait_repo = PortraitRepository(db)
-            portrait_skill = PortraitCompressionSkill(llm, config)
-            portrait_service = PortraitService(config, portrait_repo, portrait_skill)
+            portrait_service = PortraitService(config, portrait_repo)
 
         recall_budget = RecallBudgetManager(config) if config.recall_budget_enabled else None
 

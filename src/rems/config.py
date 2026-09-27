@@ -44,6 +44,8 @@ class TaskModelMapping(BaseModel):
     role_extraction: str = "deepseek-v4-flash"
     # 事件充实：一次调用产出摘要 + 角色；与 summary 同主模型时便于在 DashScope 侧统一配额。
     event_enrichment: str = "deepseek-v4-flash"
+    person_portrait: str = "deepseek-v4-flash"
+    experience_portrait: str = "deepseek-v4-flash"
     abstraction: str = "deepseek-v4-flash"
     # 抽象前叙事同一性自检；可与 abstraction 共用模型。
     narrative_coherence: str = "deepseek-v4-flash"
@@ -167,26 +169,25 @@ class REMSConfig(BaseSettings):
     recall_trace_max_items: int = 60
 
     # ---- Portrait（人物肖像：per-object 10 级渐进人物摘要 + 记忆疲态）----
-    # 等级化：L1 = max(portrait_magic_num, 总长 / growth^(max_levels-1)) —— 取较长，保证最短级(L1)
-    #        至少达到魔法数(默认100)、保持有效性；Lk = L1 * growth^(k-1)；
-    # 某级预算 > 总长 即停（该级保留原长度=截到总长），最多 portrait_max_levels 级。
-    # 压缩率 = 汇总原始字数 / 最长一级字数（模型压缩，忽略/简化/调整）。
+    # 白描批量刷新路径：L1 最完整，后续逐级压缩，达到 summary_fuse_min_chars 即停。
+    # 压缩率 = 汇总原始字数 / L1 字数。
     portrait_enabled: bool = True
-    portrait_magic_num: int = 100       # L1 基准魔法数
     portrait_max_levels: int = 10
-    portrait_growth: float = 2.0        # 每级是上一级倍数
-    # 触发：对象「待画像摘要」累计字数 >= context_window / portrait_trigger_divisor 时执行肖像动作。
-    portrait_trigger_divisor: int = 600
-    # 组合/压缩方式：incremental（已有肖像最长级 + 新摘要 压缩）| full（所有摘要 重建）。
-    # "auto"：当累计总长 ≤ context_window * portrait_full_mode_context_ratio（默认 1/6 上下文）时用 full，
-    #        否则用 incremental（内容多了就不整包重建）。
-    portrait_compose_mode: str = "auto"
-    portrait_full_mode_context_ratio: float = 1.0 / 6.0
+    portrait_growth: float = 2.0        # 下一级目标长度约为上一级的 1/growth
+    portrait_max_chars: int = 8000       # 人物肖像最长级的默认字数上限
+    # 由周期任务调用刷新入口后检查：新增白描达到条数，或距上次肖像更新时间达到小时数。
+    portrait_white_painting_trigger_count: int = 10
+    portrait_white_painting_trigger_hours: int = 24
     # 记忆疲态：分成两个值，**不能共用一个**——
     #   portrait_fatigue：人物肖像摘要，由整体负担 + 对象负担合成（综合）。
     #   event_fatigue：事件，仅由整体记忆负担决定（不看对象负担）。
     # 均默认 1（无遗忘）；<1 时按概率让部分内容概率不可见（期望可见占比 ≈ fatigue），保留偶然性。
     portrait_fatigue: float = 1.0
+    # Experience 人物路径：白描先累积，再由模型形成简短的相处经验肖像。
+    experience_person_trigger_count: int = 10
+    experience_person_trigger_chars: int = 1200
+    experience_person_max_chars: int = 400
+    experience_person_brief_chars: int = 120
     event_fatigue: float = 1.0
 
     # ---- Recall budget management（回忆预算管理，docs/recall.md（预算））----

@@ -269,6 +269,65 @@ class PortraitSummaryRecord(Base):
     created_at = Column(DateTime, nullable=False)
 
 
+class PersonExperiencePortraitRecord(Base):
+    """Interaction experience kept separate from descriptive object portraits."""
+
+    __tablename__ = "person_experience_portraits"
+
+    object_id = Column(String, primary_key=True)
+    subject_id = Column(String, nullable=False, index=True)
+    content = Column(Text, nullable=False)
+    brief = Column(Text, nullable=False)
+    shape = Column(JSON, default=dict)
+    version = Column(Integer, default=1)
+    total_content_len = Column(Integer, default=0)
+    created_at = Column(DateTime, nullable=False)
+    updated_at = Column(DateTime, nullable=False)
+
+
+class PersonExperienceEvidenceRecord(Base):
+    """White paintings awaiting or already used in interaction experience."""
+
+    __tablename__ = "person_experience_evidence"
+
+    summary_id = Column(String, primary_key=True)
+    subject_id = Column(String, nullable=False, index=True)
+    object_id = Column(String, nullable=False, index=True)
+    text = Column(Text, nullable=False)
+    source_event_id = Column(String, nullable=True)
+    weight = Column(Float, default=0.5)
+    incorporated = Column(Boolean, default=False)
+    created_at = Column(DateTime, nullable=False)
+
+
+class PersonExperienceRevisionRecord(Base):
+    """Append-only record of each portrait decision and the evidence it reviewed."""
+
+    __tablename__ = "person_experience_revisions"
+
+    revision_id = Column(String, primary_key=True)
+    subject_id = Column(String, nullable=False, index=True)
+    object_id = Column(String, nullable=False, index=True)
+    version = Column(Integer, nullable=False)
+    kind = Column(String, nullable=False)
+    reason = Column(Text, nullable=False, default="")
+    revised_claims = Column(JSON, default=list)
+    evidence_event_ids = Column(JSON, default=list)
+    snapshot = Column(JSON, default=dict)
+    created_at = Column(DateTime, nullable=False)
+
+
+class PersonExperienceReviewRecord(Base):
+    """Avoid retrying the same insufficient evidence batch on every scan."""
+
+    __tablename__ = "person_experience_reviews"
+
+    object_id = Column(String, primary_key=True)
+    subject_id = Column(String, nullable=False, index=True)
+    evidence_signature = Column(String, nullable=False)
+    reviewed_at = Column(DateTime, nullable=False)
+
+
 # ------------------------------------------------------------------
 # Database facade
 # ------------------------------------------------------------------
@@ -366,6 +425,10 @@ class Database:
                 ("l1_mention", "TEXT"),
                 ("l2_interaction", "TEXT"),
                 ("l3_decision", "TEXT"),
+            ],
+            "person_experience_portraits": [
+                ("shape", "TEXT DEFAULT '{}'"),
+                ("version", "INTEGER DEFAULT 1"),
             ],
         }
 

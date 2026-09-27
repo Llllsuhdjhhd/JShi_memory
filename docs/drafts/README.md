@@ -18,4 +18,7 @@
 
 ## 现有议题
 
+- [经验形成与经验召回框架](experience.md)：Event 到长期认识的设计原则。
+- [经验模块程序框架](experience-module.md)：人物肖像、Dream 接口与双路召回的设计及实现边界。
+- [匠石长期经验对接说明](experience-integration.md)：现有接口、结果形状与匠石侧对接步骤。
 - [回忆可及性、时间衰减与重复强化](recall-accessibility.md)：在现有两通道机制上梳理情绪、时间与命中强化的验证方案。

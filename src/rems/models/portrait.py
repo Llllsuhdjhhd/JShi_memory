@@ -1,9 +1,7 @@
-"""人物肖像模型：per-object 10 级渐进人物摘要 + 记忆疲态可见性。
+"""人物肖像模型：per-object 最多 10 级摘要 + 记忆疲态可见性。
 
 规格（docs/project-overview.md 之后的 portrait 子项）：
-- 10 级，从最简(L1)到最详细(Ln)，每级是上一级 growth(默认2) 倍；
-- L1 = min(portrait_magic_num, 总长 / growth^(max_levels-1))；
-- 某级预算 > 总长 即停，保留该级原长度；最多 max_levels 级；
+- 新的白描批量刷新路径以 L1 为最完整级，后续逐级压缩，足够短即停；
 - 压缩率 = 汇总原始字数 / 最长一级字数；
 - 记忆疲态 fatigue ∈ (0,1]，默认 1（无遗忘）；<1 时按概率让部分摘要/事件概率不可见（期望可见占比 ≈ fatigue），
   且被隐藏部分仍带偶然性（低权重也有非零可见概率）。
@@ -17,7 +15,7 @@ from pydantic import BaseModel, Field
 
 
 class PortraitLevelInfo(BaseModel):
-    """一级人物摘要：级别名 + 文本 + 预算/实际字数。"""
+    """一级人物肖像：级别名 + 文本 + 预算/实际字数。"""
 
     level: str            # "L1".."L10"
     text: str
@@ -26,13 +24,13 @@ class PortraitLevelInfo(BaseModel):
 
 
 class ObjectPortrait(BaseModel):
-    """per-object 人物肖像：从最简到最详细的多级渐进人物摘要。"""
+    """per-object 人物肖像：L1 最完整，后续逐级压缩。"""
 
     subject_id: str = ""
     object_id: str
     name: str | None = None
     levels: dict[str, PortraitLevelInfo] = Field(default_factory=dict)  # {"L1": ...}
-    max_level: str = ""            # 当前最长级（Lk 中 k 最大者）
+    max_level: str = ""            # 指向当前最完整级；新路径为 L1
     total_content_len: int = 0     # 累积总长（增量累积，不每次重算）
     compression_ratio: float = 0.0  # 汇总原始字数 / 最长一级字数
     fatigue: float = 1.0           # 记忆疲态（可见性期望占比）
@@ -41,7 +39,7 @@ class ObjectPortrait(BaseModel):
 
     @property
     def longest_level(self) -> PortraitLevelInfo | None:
-        """当前最长（最详细）的一级，作为"已有内容"用于增量压缩。"""
+        """当前最完整的一级，作为增量更新或召回材料。"""
         if not self.max_level:
             return None
         return self.levels.get(self.max_level)
