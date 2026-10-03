@@ -55,7 +55,7 @@ class WhitePaintingPortraitBuilder:
     def refresh(
         self, subject_id: str, object_id: str, *, force: bool = False
     ) -> WhitePaintingPortraitSyncResult:
-        """Call from a periodic job; count can also make a call immediately due."""
+        """Refresh once pending white paintings reach the char (or optional count/time) trigger."""
         if not subject_id.strip() or not object_id.strip():
             raise ValueError("subject_id and object_id are required")
         portrait = self._portraits.get_portrait(object_id)
@@ -101,6 +101,11 @@ class WhitePaintingPortraitBuilder:
         )
         if not pending or self._llm is None:
             return status
+        pending_chars = sum(len(item.text) for item in pending)
+        chars_due = (
+            self._config.portrait_white_painting_trigger_chars > 0
+            and pending_chars >= self._config.portrait_white_painting_trigger_chars
+        )
         count_due = (
             self._config.portrait_white_painting_trigger_count > 0
             and len(pending) >= self._config.portrait_white_painting_trigger_count
@@ -108,7 +113,13 @@ class WhitePaintingPortraitBuilder:
         hours = self._config.portrait_white_painting_trigger_hours
         baseline = portrait.updated_at if portrait is not None else pending[0].created_at
         time_due = hours > 0 and self._clock() - baseline >= timedelta(hours=hours)
-        trigger = "manual" if force else "count" if count_due else "time" if time_due else None
+        trigger = (
+            "manual" if force
+            else "chars" if chars_due
+            else "count" if count_due
+            else "time" if time_due
+            else None
+        )
         if trigger is None:
             return status
 
@@ -117,15 +128,21 @@ class WhitePaintingPortraitBuilder:
             if portrait is not None and portrait.longest_level is not None else ""
         )
         max_chars = self._config.portrait_max_chars
+        fuse = self._config.summary_fuse_min_chars
+        max_levels = self._config.portrait_max_levels
         source = [
             {"event_id": item.source_event_id, "white_painting": item.text}
             for item in pending
         ]
-        first = self._llm.complete_json("person_portrait", [
+        data = self._llm.complete_json("person_portrait", [
             {"role": "system", "content": (
-                "根据已有白描整理人物肖像。L1 是最完整的人物描述；保留有依据的人物信息、"
-                "关系和变化，整理语句，不要写成相处建议，不要虚构。"
-                "输出 JSON：{\"text\":\"人物肖像\"}。"
+                "根据已有肖像和新增白描整理人物肖像，输出同一肖像的多级分辨率。\n"
+                "L1 是最完整的人物描述：保留有依据的人物信息、关系和变化，写成通顺的叙述，"
+                "不要写成相处建议，不要虚构。已有肖像中未被新白描推翻的内容保留。\n"
+                "L2 起每一级只压缩上一级，约为上一级的一半；删次要句子，人名、数字和专名保持原样，"
+                "不从白描里找回上一级已删去的细节。\n"
+                f"某一级不超过 {fuse} 字就停止，不再写下一级；最多 {max_levels} 级。\n"
+                "只输出一个 JSON 对象：{\"levels\": {\"L1\": \"…\", \"L2\": \"…\"}}。"
             )},
             {"role": "user", "content": (
                 f"已有肖像：{previous or '无'}\n"
@@ -133,7 +150,10 @@ class WhitePaintingPortraitBuilder:
                 f"L1 最多 {max_chars} 字。"
             )},
         ])
-        l1 = str(first.get("text") or "").strip()
+        raw_levels = data.get("levels") if isinstance(data, dict) else None
+        if not isinstance(raw_levels, dict):
+            return status
+        l1 = str(raw_levels.get("L1") or "").strip()
         if not l1 or len(l1) > max_chars:
             return status
 
@@ -141,23 +161,14 @@ class WhitePaintingPortraitBuilder:
             level="L1", text=l1, budget=max_chars, actual_len=len(l1)
         )}
         current = l1
-        for number in range(2, self._config.portrait_max_levels + 1):
-            if len(current) <= self._config.summary_fuse_min_chars:
+        for number in range(2, max_levels + 1):
+            if len(current) <= fuse:
                 break
-            budget = max(1, int(len(current) / self._config.portrait_growth))
-            data = self._llm.complete_json("person_portrait", [
-                {"role": "system", "content": (
-                    "将上一层人物肖像继续保真压缩。保留最重要的人物信息，"
-                    "不要加入新事实或相处建议。输出 JSON：{\"text\":\"压缩文本\"}。"
-                )},
-                {"role": "user", "content": (
-                    f"上一层：{current}\nL{number} 最多 {budget} 字。"
-                )},
-            ])
-            shorter = str(data.get("text") or "").strip()
-            if not shorter or len(shorter) > budget or len(shorter) >= len(current):
+            shorter = str(raw_levels.get(f"L{number}") or "").strip()
+            if not shorter or len(shorter) >= len(current):
                 break
             name = f"L{number}"
+            budget = max(1, int(len(current) / self._config.portrait_growth))
             levels[name] = PortraitLevelInfo(
                 level=name, text=shorter, budget=budget, actual_len=len(shorter)
             )

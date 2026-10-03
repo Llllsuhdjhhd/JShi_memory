@@ -159,6 +159,7 @@ class REMSPipeline:
             recency_enabled=config.recall_recency_enabled,
             recency_window_events=config.recall_recency_window_events,
             recency_top_k=config.recall_recency_top_k,
+            full_scan_event_limit=config.recall_max_capacity,
             long_term_probability_floor=config.recall_long_term_probability_floor,
             factor_alpha=config.recall_factor_alpha,
             mood_beta=config.recall_mood_beta,

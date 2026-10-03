@@ -10,9 +10,13 @@ import pytest
 from rems.config import REMSConfig
 from rems.models.interlocutor import InterlocutorAttribution
 from rems.models.metabolism import BufferSentence, UnclosedEvent
-from rems.port import MemoryExperience
+from rems.port import MemoryExperience, SubSegment
 from rems.services.event_service import EventService
-from rems.services.metabolism_service import MetabolismService
+from rems.services.metabolism_service import (
+    MetabolismService,
+    _new_buffer_items,
+    _objects_for_event,
+)
 from rems.skills.boundary_detection import BoundaryDetectionSkill, BoundaryResult, CompletedFragment
 from rems.skills.event_enrichment import EventEnrichmentSkill
 from rems.skills.role_extraction import RoleExtractionSkill
@@ -20,6 +24,53 @@ from rems.storage.database import Database
 from rems.storage.repository import EventRepository, MetabolismRepository
 
 from ..conftest import FakeLLM
+
+
+def test_batch_object_attribution_requires_source_evidence():
+    memory = MemoryExperience(
+        subject_id="jshi-1",
+        text="甲：修车。\n\n乙：养花。",
+        objects={"甲": "OBJ-A", "乙": "OBJ-B"},
+        sub_segments=[
+            SubSegment(segment_id="seg-a", text="甲：修车。", objects={"甲": "OBJ-A"}),
+            SubSegment(segment_id="seg-b", text="乙：养花。", objects={"乙": "OBJ-B"}),
+        ],
+    )
+    assert _objects_for_event("无法对应原文的边界输出", memory) == {}
+    buffer = _new_buffer_items(memory.text, memory)
+    assert [item.objects for item in buffer] == [{"甲": "OBJ-A"}, {"乙": "OBJ-B"}]
+    kwargs = MetabolismService._seal_memory_kwargs(
+        memory,
+        content="乙：养花。",
+        input_id=None,
+        known_roles_hint=None,
+        pre_role_entries=None,
+        buffer_items=[buffer[1]],
+    )
+    assert kwargs["objects"] == {"乙": "OBJ-B"}
+
+
+def test_unclosed_sentence_keeps_object_provenance_across_batches(metabolism_service):
+    old = UnclosedEvent(
+        id="UC-source-map",
+        subject_id="jshi-1",
+        content_fragments=["甲：修车。"],
+        buffer_items=[BufferSentence(text="甲：修车。", objects={"甲": "OBJ-A"})],
+    )
+    metabolism_service._repo.save_unclosed_event(old)
+    loaded = metabolism_service._repo.get_unclosed_event(old.id)
+    current = MemoryExperience(
+        subject_id="jshi-1", text="乙：养花。", objects={"乙": "OBJ-B"},
+    )
+    kwargs = MetabolismService._seal_memory_kwargs(
+        current,
+        content=loaded.merged_content,
+        input_id=None,
+        known_roles_hint=None,
+        pre_role_entries=None,
+        buffer_items=loaded.buffer_items,
+    )
+    assert kwargs["objects"] == {"甲": "OBJ-A"}
 
 
 @pytest.fixture()

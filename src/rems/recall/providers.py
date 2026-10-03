@@ -51,6 +51,8 @@ class RecallVectorStore(Protocol):
 
     def delete(self, event_id: str) -> None: ...
 
+    def list_event_logical_ids(self, event_id: str) -> list[str]: ...
+
 
 class HashEmbedding:
     """确定性 hash 嵌入：离线测试 / 无模型环境用。"""
@@ -211,6 +213,37 @@ class QdrantRecallVectorStore:
             if not found or not found[0].payload:
                 return None
             return dict(found[0].payload)
+
+    def list_event_logical_ids(self, event_id: str) -> list[str]:
+        """Return event and fact point keys currently stored for one event."""
+        with self._lock:
+            from qdrant_client import models
+
+            if not self._client.collection_exists(self._collection):
+                return []
+            condition = models.Filter(must=[models.FieldCondition(
+                key="event_id", match=models.MatchValue(value=event_id),
+            )])
+            found: list[str] = []
+            offset = None
+            while True:
+                points, offset = self._client.scroll(
+                    collection_name=self._collection,
+                    scroll_filter=condition,
+                    limit=100,
+                    offset=offset,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                for point in points:
+                    payload = point.payload or {}
+                    if payload.get("type") == "event":
+                        found.append(event_id)
+                    elif payload.get("type") == "object_event_fact" and payload.get("object_id"):
+                        found.append(f"{event_id}#fact#{payload['object_id']}")
+                if offset is None:
+                    break
+            return found
 
     def search(
         self,

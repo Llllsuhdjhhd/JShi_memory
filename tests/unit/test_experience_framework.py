@@ -14,6 +14,27 @@ from rems.models.portrait import ObjectPortrait, PortraitLevelInfo
 from rems.models.role import WhitePaintingEntry
 from rems.storage.repository import EventRepository, PortraitRepository, RoleRepository
 from rems.storage.database import Database
+from rems.experience.models import ContextualAdjustment
+from rems.experience.person_composer import render_person_experience
+
+
+def test_render_person_experience_strips_uncertainty_terminal_punctuation():
+    assert render_person_experience(
+        "先核对证据。",
+        (),
+        ("是否适用于别的场景尚无证据。",),
+    ) == "先核对证据；尚不确定：是否适用于别的场景尚无证据。"
+
+
+def test_render_person_experience_does_not_duplicate_context_suffix():
+    assert render_person_experience(
+        "按情境回应。",
+        (
+            ContextualAdjustment("在值班操作时", "给三条短步骤。"),
+            ContextualAdjustment("倾诉心情", "先听，不列清单。"),
+        ),
+        (),
+    ) == "按情境回应；在值班操作时，给三条短步骤；在倾诉心情时，先听，不列清单。"
 
 
 class MemoryGeneralStore:
@@ -284,7 +305,7 @@ def test_person_experience_revision_keeps_history_and_evidence(config, db, fake_
             "updated": "私事留到单独交谈",
             "reason": "公开场合谈私事出现反例",
         }],
-        "baseline": "阿青是熟悉的老同学，相处可以直接。",
+        "baseline": "阿青是熟悉的老同学，相处可以直接，私事除外。",
         "adjustments": [{"context": "涉及私事且有其他人在场", "approach": "留到单独交谈"}],
         "uncertainties": [],
         "brief": "与阿青相处直接，私事宜单独谈。",
@@ -300,18 +321,31 @@ def test_person_experience_revision_keeps_history_and_evidence(config, db, fake_
     assert revisions[0].baseline == "阿青是熟悉的老同学，相处可以直接。"
     assert revisions[0].adjustments == ()
 
+    # 已有肖像时「证据不足」= 本批不改，白描算已吸收。
     add("E3", "阿青再次建议有些私事另找时间单独谈。")
     fake_llm.push_response({"insufficient_evidence": True})
-    assert module.refresh_person("jshi-1", "OBJ-A").review_outcome == "invalid"
+    confirmed = module.refresh_person("jshi-1", "OBJ-A")
+    assert not confirmed.updated and confirmed.review_outcome == "confirm"
+    assert portraits.get_portrait("OBJ-A").version == 2
+    assert portraits.list_summaries("OBJ-A", incorporated=False) == []
+
+    # 缺字段是格式错误：记签名，同一批不再重试。
+    add("E3b", "阿青说单独谈时更自在。")
     fake_llm.push_response({
         "revision_kind": "confirm",
         "revision_reason": "新白描支持现有的私下交谈边界",
     })
     assert module.refresh_person("jshi-1", "OBJ-A").review_outcome == "invalid"
+    calls_after_invalid = len(fake_llm.calls)
+    assert module.refresh_person("jshi-1", "OBJ-A").review_outcome == "already_reviewed"
+    assert len(fake_llm.calls) == calls_after_invalid
     assert len(portraits.list_summaries("OBJ-A", incorporated=False)) == 1
+
+    # 标签与内容不符：按实际差异改标签，草稿照收。
+    add("E3c", "阿青约好下次单独喝茶。")
     fake_llm.push_response({
         "revision_kind": "confirm",
-        "revision_reason": "错误地改动旧基调",
+        "revision_reason": "标签写错，内容其实改了基调",
         "revised_claims": [],
         "baseline": "与阿青相处要保持距离。",
         "adjustments": [{"context": item.context, "approach": item.approach}
@@ -319,20 +353,9 @@ def test_person_experience_revision_keeps_history_and_evidence(config, db, fake_
         "uncertainties": list(portrait.uncertainties),
         "brief": portrait.brief,
     })
-    assert module.refresh_person("jshi-1", "OBJ-A").review_outcome == "invalid"
-    fake_llm.push_response({
-        "revision_kind": "confirm",
-        "revision_reason": "新白描支持现有的私下交谈边界",
-        "revised_claims": [],
-        "baseline": portrait.baseline,
-        "adjustments": [{"context": item.context, "approach": item.approach}
-                        for item in portrait.adjustments],
-        "uncertainties": list(portrait.uncertainties),
-        "brief": portrait.brief,
-    })
-    confirmed = module.refresh_person("jshi-1", "OBJ-A")
-    assert not confirmed.updated and confirmed.review_outcome == "confirm"
-    assert portraits.get_portrait("OBJ-A").version == 2
+    relabeled = module.refresh_person("jshi-1", "OBJ-A")
+    assert relabeled.updated and relabeled.review_outcome == "revise"
+    assert portraits.get_portrait("OBJ-A").version == 3
     assert portraits.list_summaries("OBJ-A", incorporated=False) == []
 
     add("E4", "阿青最近主动在其他人在场时提起近况。")
@@ -351,32 +374,36 @@ def test_person_experience_revision_keeps_history_and_evidence(config, db, fake_
     })
     uncertain = module.refresh_person("jshi-1", "OBJ-A")
     assert uncertain.updated and uncertain.review_outcome == "uncertain"
-    assert portraits.get_portrait("OBJ-A").version == 3
+    assert portraits.get_portrait("OBJ-A").version == 4
     assert tuple(item.kind for item in portraits.list_revisions("jshi-1", "OBJ-A")) == (
-        "initial", "revise", "confirm", "uncertain",
+        "initial", "revise", "confirm", "revise", "uncertain",
     )
 
     add("E5", "阿青又一次调整了谈话场合。")
     fake_llm.push_response({
         "revision_kind": "revise",
-        "revision_reason": "旧格式不再有效",
-        "revised_claims": ["旧认识"],
+        "revision_reason": "格式错误",
         "baseline": "阿青是熟悉的老同学。",
-        "adjustments": [], "uncertainties": [],
-        "brief": "与阿青熟悉。",
-    })
-    assert module.refresh_person("jshi-1", "OBJ-A").review_outcome == "invalid"
-    fake_llm.push_response({
-        "revision_kind": "revise",
-        "revision_reason": "想改动，但缺少被修正的旧认识",
-        "baseline": "阿青是熟悉的老同学。",
-        "adjustments": [], "uncertainties": [],
+        "adjustments": "不是数组", "uncertainties": [],
         "brief": "与阿青熟悉。",
     })
     invalid = module.refresh_person("jshi-1", "OBJ-A")
     assert invalid.review_outcome == "invalid"
     assert invalid.pending_white_paintings == 1
-    assert portraits.get_portrait("OBJ-A").version == 3
+    assert portraits.get_portrait("OBJ-A").version == 4
+
+    # revise 没写 revised_claims 也照收，只是审计信息少一些。
+    add("E5b", "阿青改在人少时说近况。")
+    fake_llm.push_response({
+        "revision_kind": "revise",
+        "revision_reason": "改在人少时说近况",
+        "baseline": "阿青是熟悉的老同学。",
+        "adjustments": [], "uncertainties": [],
+        "brief": "与阿青熟悉。",
+    })
+    accepted = module.refresh_person("jshi-1", "OBJ-A")
+    assert accepted.review_outcome == "revise"
+    assert portraits.get_portrait("OBJ-A").version == 5
 
 
 def test_extend_only_adds_to_existing_person_experience(config, db, fake_llm):
@@ -400,6 +427,7 @@ def test_extend_only_adds_to_existing_person_experience(config, db, fake_llm):
     paintings.add_white_painting_entry("OBJ-B", WhitePaintingEntry(
         subject_id="jshi-1", event_id="B2", role_summary="阿白在忙时希望先听简短结论。",
     ))
+    # 标为 extend 却改了基调：按实际差异记为 revise。
     fake_llm.push_response({
         "revision_kind": "extend", "revision_reason": "忙碌情境的新白描",
         "revised_claims": [],
@@ -407,21 +435,28 @@ def test_extend_only_adds_to_existing_person_experience(config, db, fake_llm):
         "adjustments": [{"context": "阿白忙碌", "approach": "先说结论"}],
         "uncertainties": [], "brief": "阿白忙时先说结论。",
     })
-    assert module.refresh_person("jshi-1", "OBJ-B").review_outcome == "invalid"
-    assert portraits.get_portrait("OBJ-B").version == 1
+    assert module.refresh_person("jshi-1", "OBJ-B").review_outcome == "revise"
+    assert portraits.get_portrait("OBJ-B").version == 2
 
+    paintings.add_white_painting_entry("OBJ-B", WhitePaintingEntry(
+        subject_id="jshi-1", event_id="B3", role_summary="阿白开会前只要一句话。",
+    ))
+    # 标为 revise 却只增不改：按实际差异记为 extend。
     fake_llm.push_response({
-        "revision_kind": "extend", "revision_reason": "忙碌情境的新白描",
+        "revision_kind": "revise", "revision_reason": "开会前的新白描",
         "revised_claims": [],
-        "baseline": "与阿白相处比较熟悉。",
-        "adjustments": [{"context": "阿白忙碌", "approach": "先说结论"}],
-        "uncertainties": [], "brief": "与阿白熟悉，忙时先说结论。",
+        "baseline": "与阿白相处应该保持距离。",
+        "adjustments": [
+            {"context": "阿白忙碌", "approach": "先说结论"},
+            {"context": "阿白开会前", "approach": "只说一句"},
+        ],
+        "uncertainties": [], "brief": "阿白忙时先说结论，开会前只说一句。",
     })
     result = module.refresh_person("jshi-1", "OBJ-B")
     assert result.updated and result.review_outcome == "extend"
-    assert portraits.get_portrait("OBJ-B").version == 2
+    assert portraits.get_portrait("OBJ-B").version == 3
     assert tuple(item.kind for item in portraits.list_revisions("jshi-1", "OBJ-B")) == (
-        "initial", "extend",
+        "initial", "revise", "extend",
     )
 
 
@@ -483,3 +518,44 @@ def test_person_and_general_lanes_share_one_budget(config, db, fake_llm):
     assert len(recalled.person) == 1
     assert len(recalled.general) == 1
     assert recalled.used_chars <= 240
+
+
+def test_backlog_is_absorbed_in_batches_and_length_is_only_a_target(config, db, fake_llm):
+    config.experience_person_trigger_count = 1
+    config.experience_person_trigger_chars = 0
+    config.experience_person_batch_chars = 30
+    config.experience_person_max_chars = 20
+    paintings = RoleRepository(db)
+    portraits = PersonExperienceRepository(db)
+    module = ExperienceModule.from_repositories(config, paintings, portraits, llm=fake_llm)
+    for index in range(5):
+        paintings.add_white_painting_entry("OBJ-L", WhitePaintingEntry(
+            subject_id="jshi-1", event_id=f"L{index}",
+            role_summary=f"第{index}次：老李在忙时只想听结论。",
+        ))
+    long_baseline = "与老李相处直接，" + "先给结论" * 20
+    fake_llm.push_response({
+        "revision_kind": "initial", "revised_claims": [],
+        "baseline": long_baseline, "adjustments": [], "uncertainties": [],
+        "brief": "老李忙时先说结论，" + "不绕弯" * 20,
+    })
+    for index in (1, 2):
+        fake_llm.push_response({
+            "revision_kind": "extend", "revision_reason": f"第{index}批补充忙碌情境",
+            "revised_claims": [], "baseline": long_baseline,
+            "adjustments": [{"context": f"忙碌第{index}批", "approach": "先说结论"}]
+            + [{"context": f"忙碌第{i}批", "approach": "先说结论"} for i in range(1, index)],
+            "uncertainties": [], "brief": f"老李忙时先说结论（{index}）",
+        })
+
+    result = module.refresh_person("jshi-1", "OBJ-L")
+
+    assert result.updated and result.pending_white_paintings == 0
+    assert len(fake_llm.calls) == 3
+    for call in fake_llm.calls:
+        evidence = call["messages"][1]["content"].split("新增白描：", 1)[1]
+        assert evidence.count("老李在忙时") <= 2
+    portrait = portraits.get_portrait("OBJ-L")
+    assert len(portrait.content) > config.experience_person_max_chars
+    assert portrait.version == 3
+    assert portraits.list_summaries("OBJ-L", incorporated=False) == []

@@ -36,17 +36,58 @@ logger = logging.getLogger(__name__)
 def _objects_for_event(
     content: str | None, memory: MemoryExperience | None
 ) -> dict[str, str]:
-    """整批合并时按事件内容归属对象：命中子段的对象并集，未命中回退全批对象池。"""
+    """Only attribute objects supplied by source segments represented in this event."""
     if memory is None:
         return {}
     subs = getattr(memory, "sub_segments", None)
-    if not content or not subs:
+    if not subs:
         return dict(memory.objects or {})
+    if not content:
+        return {}
     hits: dict[str, str] = {}
     for sub in subs:
         if segment_text_hits(sub.text or "", content):
             hits.update(sub.objects)
-    return hits or dict(memory.objects or {})
+    # The batch-wide map contains objects from unrelated segments. If the
+    # boundary output cannot be traced to a source, abstain instead of
+    # attaching every object in the batch to this event.
+    return hits
+
+
+def _objects_from_buffer(items: list[BufferSentence]) -> dict[str, str]:
+    objects: dict[str, str] = {}
+    for item in items:
+        objects.update(item.objects)
+    return objects
+
+
+def _new_buffer_items(raw_input: str, memory: MemoryExperience | None) -> list[BufferSentence]:
+    """Keep the original segment's object map on each buffered sentence."""
+    subs = getattr(memory, "sub_segments", None) if memory is not None else None
+    if subs:
+        return [
+            BufferSentence(
+                text=sentence,
+                objects=dict(sub.objects),
+                interlocutor_attributions=(
+                    [InterlocutorAttribution(
+                        segment_id=sub.segment_id,
+                        object_id=sub.interlocutor_object_id,
+                    )]
+                    if sub.interlocutor_object_id else []
+                ),
+            )
+            for sub in subs
+            for sentence in segment_sentences(sub.text)
+        ]
+    return [
+        BufferSentence(
+            text=sentence,
+            objects=_objects_for_event(sentence, memory),
+            interlocutor_attributions=_interlocutors_for_event(sentence, memory),
+        )
+        for sentence in segment_sentences(raw_input)
+    ]
 
 
 def _unique_interlocutors(
@@ -286,13 +327,7 @@ class MetabolismService:
         )
 
         buffer = self._load_buffer(unclosed)
-        buffer.extend(
-            BufferSentence(
-                text=sentence,
-                interlocutor_attributions=_interlocutors_for_event(sentence, memory),
-            )
-            for sentence in segment_sentences(raw_input)
-        )
+        buffer.extend(_new_buffer_items(raw_input, memory))
 
         def _run_boundary():
             if ingest_session is not None and getattr(ingest_session, "turn", 0) >= 1:
@@ -459,6 +494,7 @@ class MetabolismService:
                     known_roles_hint=known_roles_hint,
                     pre_role_entries=pre_role_entries,
                     interlocutor_attributions=_interlocutors_from_buffer(buffer, indices),
+                    buffer_items=_buffer_items_for_content(frag.content_raw, buffer, indices),
                 ),
             )
             sealed.append(event)
@@ -542,7 +578,7 @@ class MetabolismService:
             subject_id=subject,
             buffer_items=rebuilt,
         ))
-        self._check_physical_redline()
+        self._check_physical_redline(memory=memory)
         return sealed
 
     def _apply_boundary_result(
@@ -629,6 +665,7 @@ class MetabolismService:
                         ),
                         _interlocutors_for_event(content, memory),
                     ),
+                    buffer_items=_buffer_items_for_content(content, buffer, frag.source_indices),
                 ),
             )
             sealed.append(event)
@@ -706,7 +743,7 @@ class MetabolismService:
             subject_id=memory.subject_id if memory is not None else "",
         ))
 
-        self._check_physical_redline()
+        self._check_physical_redline(memory=memory)
 
         return sealed
 
@@ -746,6 +783,10 @@ class MetabolismService:
                         *(ue.interlocutor_attributions for ue in unclosed),
                         _interlocutors_for_event(combined, memory),
                     ),
+                    buffer_items=[
+                        *(item for ue in unclosed for item in ue.buffer_items),
+                        *_new_buffer_items(raw_input, memory),
+                    ],
                 ),
             )
             sealed.append(event)
@@ -764,6 +805,7 @@ class MetabolismService:
                         known_roles_hint=known_roles_hint,
                         pre_role_entries=pre_role_entries,
                         interlocutor_attributions=ue.interlocutor_attributions,
+                        buffer_items=ue.buffer_items,
                     ),
                 )
                 # 反向链：force_save 也要登记 successor。
@@ -791,14 +833,19 @@ class MetabolismService:
         known_roles_hint: list[Role] | None,
         pre_role_entries: list[EventRoleEntry] | None,
         interlocutor_attributions: list[InterlocutorAttribution] | None = None,
+        buffer_items: list[BufferSentence] | None = None,
     ) -> dict:
         """记忆路径（memory 非 None）传主体/对象/来源/时间/origin；旧路径传角色提示。
 
         整批合并时按 ``content`` 与各子段的重叠归属对象，避免整批对象并集串扰；
-        未匹配到子段时回退到全批对象池（保持旧行为兼容）。
+        未匹配到子段时不猜测对象，避免把整批对象写到单个事件。
         """
         if memory is not None:
-            objects = _objects_for_event(content, memory)
+            objects = (
+                _objects_from_buffer(buffer_items)
+                if buffer_items is not None
+                else _objects_for_event(content, memory)
+            )
             attributions = _unique_interlocutors(
                 _interlocutors_for_event(content, memory),
                 interlocutor_attributions or [],
@@ -820,7 +867,7 @@ class MetabolismService:
         }
 
     # ------------------------------------------------------------------
-    def _check_physical_redline(self) -> None:
+    def _check_physical_redline(self, *, memory: MemoryExperience | None = None) -> None:
         """总长越过物理红线时，把过长或已超时的整条未完成线按 truncated 封存。
 
         不改写残影，也不把残影字符串截尾。封存后按剩余未完成线重拼残影。
@@ -841,7 +888,7 @@ class MetabolismService:
                 continue
             event = self._seal_unclosed_as_event(
                 ue,
-                memory=None,
+                memory=memory,
                 input_id=None,
                 known_roles_hint=None,
                 pre_role_entries=None,
@@ -969,6 +1016,7 @@ class MetabolismService:
                 known_roles_hint=known_roles_hint,
                 pre_role_entries=pre_role_entries,
                 interlocutor_attributions=ue.interlocutor_attributions,
+                buffer_items=ue.buffer_items,
             ),
         )
         if ue.split_prefix_event_ids and self._event_repo is not None:
@@ -1105,6 +1153,7 @@ class MetabolismService:
             selected_buffer_items = [
                 BufferSentence(
                     text=part,
+                    objects=_objects_for_event(part, memory),
                     interlocutor_attributions=_interlocutors_for_event(part, memory),
                 )
                 for part in parts
@@ -1185,6 +1234,10 @@ class MetabolismService:
                             if ue is not None and ue.buffer_items
                             else ue.interlocutor_attributions if ue and content == ue.merged_content
                             else []
+                        ),
+                        buffer_items=(
+                            _buffer_items_for_content(content, ue.buffer_items)
+                            if ue is not None else None
                         ),
                     ),
                 )

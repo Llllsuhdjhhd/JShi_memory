@@ -175,9 +175,11 @@ class REMSConfig(BaseSettings):
     portrait_max_levels: int = 10
     portrait_growth: float = 2.0        # 下一级目标长度约为上一级的 1/growth
     portrait_max_chars: int = 8000       # 人物肖像最长级的默认字数上限
-    # 由周期任务调用刷新入口后检查：新增白描达到条数，或距上次肖像更新时间达到小时数。
-    portrait_white_painting_trigger_count: int = 10
-    portrait_white_painting_trigger_hours: int = 24
+    # 待整理白描累计字数达到阈值才刷新；条数与小时数为可选的附加触发（0 = 不用）。
+    # 一次模型调用产出全部层级，只读取上一版 L1 与新增白描。
+    portrait_white_painting_trigger_chars: int = 1200
+    portrait_white_painting_trigger_count: int = 0
+    portrait_white_painting_trigger_hours: int = 0
     # 记忆疲态：分成两个值，**不能共用一个**——
     #   portrait_fatigue：人物肖像摘要，由整体负担 + 对象负担合成（综合）。
     #   event_fatigue：事件，仅由整体记忆负担决定（不看对象负担）。
@@ -186,8 +188,11 @@ class REMSConfig(BaseSettings):
     # Experience 人物路径：白描先累积，再由模型形成简短的相处经验肖像。
     experience_person_trigger_count: int = 10
     experience_person_trigger_chars: int = 1200
+    # 两个字数是给模型的目标长度，不作为拒收条件。
     experience_person_max_chars: int = 400
     experience_person_brief_chars: int = 120
+    # 每次模型调用最多读入的新增白描字数；积压较多时按时间顺序分批增量吸收。
+    experience_person_batch_chars: int = 4000
     event_fatigue: float = 1.0
 
     # ---- Recall budget management（回忆预算管理，docs/recall.md（预算））----

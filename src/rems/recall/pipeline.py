@@ -1,4 +1,4 @@
-"""回忆检索管线：近期保底、长期概率抽样、原始相关度与预算选级。
+"""回忆检索管线：小库全量语义检索、大库近期与长期分池、预算选级。
 
 可及性概率仅决定长期事件是否进入语义检索；不修改向量相关度分数。
 """
@@ -9,7 +9,6 @@ import hashlib
 import logging
 import math
 import random
-import re
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -26,8 +25,6 @@ logger = logging.getLogger(__name__)
 _IMPORTANCE_ORDER = {"S": 0, "A": 1, "B": 2, "C": 3, "D": 4}
 _INTERLOCUTOR_OBJECT_WEIGHT = 0.7
 _INVOLVED_OBJECT_WEIGHT = 0.3
-_NUMBER_RE = re.compile(r"\d+(?:\.\d+)?(?:℃|°c|°|%)?", re.IGNORECASE)
-_LATIN_RE = re.compile(r"[a-z][a-z0-9+\-]{1,}")
 
 
 def _shown_object_id(ev: Event, wanted: tuple[str, ...]) -> str | None:
@@ -71,7 +68,7 @@ def _level_text(levels: dict | None, key: str) -> str:
 
 @dataclass
 class _Candidate:
-    """一条候选材料。原始相关度取语义和词面的较大值，再乘对象角色权重排序。"""
+    """一条候选材料；语义与词面一致时加分，再乘对象角色权重。"""
 
     material_type: str
     event_id: str
@@ -93,7 +90,11 @@ class _Candidate:
 
     @property
     def relevance(self) -> float:
-        return max(float(self.semantic), float(self.lexical))
+        semantic = max(0.0, float(self.semantic))
+        lexical = max(0.0, float(self.lexical))
+        # Agreement between independent signals is evidence in its own right.
+        # Keep single-route results at their original score.
+        return min(1.0, max(semantic, lexical) + 0.25 * min(semantic, lexical))
 
     @property
     def rank_score(self) -> float:
@@ -104,7 +105,15 @@ def order_by_relevance(items: list[_Candidate], close: float) -> list[_Candidate
     """加权分明显不同时保持顺序；只有落在接近幅度内，可及性才改序。"""
     if not items:
         return []
-    ordered = sorted(items, key=lambda c: (c.rank_score, c.accessibility), reverse=True)
+    ordered = sorted(
+        items,
+        key=lambda c: (
+            c.rank_score,
+            c.material_type == "object_event_fact",
+            c.accessibility,
+        ),
+        reverse=True,
+    )
     if close <= 0 or len(ordered) < 2:
         return ordered
     out: list[_Candidate] = []
@@ -127,21 +136,16 @@ def order_by_relevance(items: list[_Candidate], close: float) -> list[_Candidate
 
 
 def lexical_score(query: str, text: str) -> float:
-    """词面分。专名、数字、完整短语命中为 1；其余按最长公共子串占查询的比例。"""
-    q = _norm(query)
-    t = _norm(text)
+    """词面分：完整命中、最长片段和查询双字片段覆盖率。"""
+    q = "".join(ch for ch in _norm(query) if ch.isalnum() or ch in "℃°%+-")
+    t = "".join(ch for ch in _norm(text) if ch.isalnum() or ch in "℃°%+-")
     if not q or not t:
         return 0.0
     if len(q) >= 2 and q in t:
         return 1.0
-    for match in _NUMBER_RE.finditer(q):
-        tok = match.group(0)
-        if len(tok) >= 1 and tok in t:
-            return 1.0
-    for match in _LATIN_RE.finditer(q):
-        tok = match.group(0)
-        if tok in t:
-            return 1.0
+    # A name or date shared by many memories cannot by itself prove that the
+    # rest of a longer question matches. In particular "lux" previously gave
+    # every lux fact the maximum lexical score, burying the requested topic.
     q2 = q[:80]
     found = 0
     for length in range(len(q2), 1, -1):
@@ -153,9 +157,17 @@ def lexical_score(query: str, text: str) -> float:
                 break
         if hit:
             break
-    if found >= 2:
-        return found / len(q2)
-    return _bigram_jaccard(_bigrams(q), _bigrams(t))
+    query_bigrams = _bigrams(q)
+    text_bigrams = _bigrams(t)
+    coverage = (
+        len(query_bigrams & text_bigrams) / len(query_bigrams)
+        if query_bigrams else 0.0
+    )
+    return max(
+        found / len(q2) if found >= 2 else 0.0,
+        coverage,
+        _bigram_jaccard(query_bigrams, text_bigrams),
+    )
 
 
 def _bigrams(text: str) -> set[str]:
@@ -223,6 +235,7 @@ class RecallPipeline:
         recency_enabled: bool = True,
         recency_window_events: int = 80,
         recency_top_k: int = 40,
+        full_scan_event_limit: int = 1000,
         long_term_probability_floor: float = 0.05,
         factor_alpha: float = 0.5,
         mood_beta: float = 0.2,
@@ -254,6 +267,7 @@ class RecallPipeline:
         self._recency_enabled = recency_enabled
         self._recency_window_events = recency_window_events
         self._recency_top_k = recency_top_k
+        self._full_scan_event_limit = max(0, int(full_scan_event_limit))
         self._long_term_probability_floor = min(
             max(float(long_term_probability_floor), 0.0), 0.99,
         )
@@ -307,11 +321,24 @@ class RecallPipeline:
             ev for ev in self._candidate_events(subject_id)
             if self._in_time_range(ev, time_range) and self._matches_objects(subject_id, ev, wanted)
         ]
+        small_library = bool(events) and len(events) <= self._full_scan_event_limit
         recent_event_ids: set[str] = set()
         semantic: dict[tuple[str, str, str], float] = {}
         if use_semantic:
             query_vector = self._embedding.embed_query(q)
-            if self._recency_enabled:
+            if small_library:
+                # In a small library every event can participate. Sampling here
+                # made old but relevant memories disappear between identical calls.
+                semantic = self._semantic_signals(
+                    subject_id, q, wanted, time_range,
+                    query_vector=query_vector,
+                    top_k=max(self._top_k, len(events) * 4),
+                )
+                if self._recency_enabled:
+                    recent_event_ids = {
+                        ev.event_id for ev in events[-self._recency_window_events:]
+                    } if self._recency_window_events > 0 else set()
+            elif self._recency_enabled:
                 recent_events, long_term_events = self._split_semantic_pools(events, now)
                 recent_event_ids = {ev.event_id for ev in recent_events}
                 if recent_events:
@@ -352,8 +379,8 @@ class RecallPipeline:
             use_lexical=use_lexical,
         ))
         admitted = [c for c in candidates if self._admitted(c, use_semantic, use_lexical)]
-        ordered = self._arrange(admitted, wanted)
-        if recent_event_ids:
+        ordered = self._arrange(admitted, wanted, close=0.0 if small_library else None)
+        if recent_event_ids and not small_library:
             ordered = self._reserve_recent_candidate(ordered, wanted)
         fragments = self._fill_budget(ordered, budget, expand_raw=expand_raw, limit=limit)
         if reinforce:
@@ -367,16 +394,33 @@ class RecallPipeline:
                     self._reinforce(ev)
         return tuple(fragments)
 
-    def index_event(self, event: Event) -> None:
-        """为事件 L1 和每条对象事实 L1 写向量。正文与版本都没变则跳过。"""
+    def backfill_index(self, subject_id: str | None = None) -> tuple[int, int]:
+        """Reconcile active events with the current embedding collection.
+
+        Returns (events scanned, points written). Safe to rerun: index_event
+        compares the L1 hash, embedding version and object payload first.
+        """
+        scanned = 0
+        written = 0
+        for event in self._event_repo.list_all():
+            if subject_id is not None and event.subject_id != subject_id:
+                continue
+            scanned += 1
+            written += self.index_event(event)
+        return scanned, written
+
+    def index_event(self, event: Event) -> int:
+        """为事件 L1 和每条对象事实 L1 写向量；返回写入的点数。"""
         object_ids = [role.role_id for role in event.role_list if not role.is_subject]
         event_object_ids = list(dict.fromkeys((
             *object_ids,
             *(item.object_id for item in event.interlocutor_attributions if item.object_id),
         )))
         pending: list[tuple[str, str, dict]] = []
+        desired: set[str] = set()
         l1 = retrieval_text(event)
         if l1:
+            desired.add(event.event_id)
             payload = self._index_payload(
                 event, material_type="event", object_id=None,
                 object_ids=event_object_ids, text=l1,
@@ -394,17 +438,23 @@ class RecallPipeline:
                 if not fact:
                     self._vector_store.delete(logical_id)
                     continue
+                desired.add(logical_id)
                 payload = self._index_payload(
                     event, material_type="object_event_fact", object_id=role.role_id,
                     object_ids=[role.role_id], text=fact,
                 )
                 if not self._index_unchanged(logical_id, payload):
                     pending.append((logical_id, fact, payload))
+            lister = getattr(self._vector_store, "list_event_logical_ids", None)
+            if lister is not None:
+                for stale_id in set(lister(event.event_id)) - desired:
+                    self._vector_store.delete(stale_id)
         if not pending:
-            return
+            return 0
         vectors = self._embedding.embed_documents([text for _pid, text, _payload in pending])
         for (logical_id, _text, payload), vector in zip(pending, vectors):
             self._vector_store.upsert(logical_id, vector, payload)
+        return len(pending)
 
     def _index_payload(
         self,
@@ -697,41 +747,34 @@ class RecallPipeline:
         lexical_ok = use_lexical and cand.lexical >= self._lexical_min
         return semantic_ok or lexical_ok
 
-    def _arrange(self, admitted: list[_Candidate], wanted: tuple[str, ...]) -> list[_Candidate]:
-        if not wanted:
-            return order_by_relevance(admitted, self._relevance_close)
-        facts = [c for c in admitted if c.material_type == "object_event_fact"]
-        rest = [c for c in admitted if c.material_type != "object_event_fact"]
-        return [
-            *order_by_relevance(facts, self._relevance_close),
-            *order_by_relevance(rest, self._relevance_close),
-        ]
+    def _arrange(
+        self, admitted: list[_Candidate], wanted: tuple[str, ...], *, close: float | None = None,
+    ) -> list[_Candidate]:
+        del wanted
+        close = self._relevance_close if close is None else close
+        return order_by_relevance(admitted, close)
 
     @staticmethod
     def _reserve_recent_candidate(
         ordered: list[_Candidate], wanted: tuple[str, ...],
     ) -> list[_Candidate]:
         """Reserve the first eligible recent result without changing vector scores."""
+        del wanted
         if not ordered:
             return ordered
-        if not wanted:
-            preferred_start, preferred_end = 0, len(ordered)
-        else:
-            fact_count = sum(c.material_type == "object_event_fact" for c in ordered)
-            preferred_start, preferred_end = (0, fact_count) if fact_count else (0, len(ordered))
-            if fact_count and not any(c.is_recent_lane for c in ordered[:fact_count]):
-                preferred_start = fact_count
-                preferred_end = len(ordered)
         recent_index = next(
-            (idx for idx in range(preferred_start, preferred_end) if ordered[idx].is_recent_lane),
+            (idx for idx, item in enumerate(ordered) if item.is_recent_lane),
             None,
         )
-        if recent_index is None or recent_index == preferred_start:
+        if recent_index is None or recent_index == 0:
+            return ordered
+        # Recency is a tie-breaker, not a licence to put an unrelated memory
+        # ahead of a clearly better match.
+        if ordered[recent_index].rank_score < 0.9 * ordered[0].rank_score:
             return ordered
         return [
-            *ordered[:preferred_start],
             ordered[recent_index],
-            *ordered[preferred_start:recent_index],
+            *ordered[:recent_index],
             *ordered[recent_index + 1 :],
         ]
 

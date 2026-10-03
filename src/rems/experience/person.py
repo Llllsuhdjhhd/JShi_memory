@@ -100,6 +100,8 @@ class WhitePaintingExperiencePortraitBuilder:
         if self._composer is None or not (count_ready or chars_ready):
             return status
 
+        # 签名覆盖全部待吸收白描：同一批证据判过一次（不足或无效）就不再调用模型，
+        # 有新白描进来再重试。
         signature_source = "|".join(
             [str(portrait.version if portrait else 0), *(item.summary_id for item in pending)]
         )
@@ -107,6 +109,50 @@ class WhitePaintingExperiencePortraitBuilder:
         if self._portraits.last_insufficient_signature(subject_id, object_id) == signature:
             return replace(status, review_outcome="already_reviewed")
 
+        changed_any = False
+        outcome = ""
+        remaining = pending
+        while remaining:
+            batch = self._next_batch(remaining)
+            outcome, changed = self._absorb(subject_id, object_id, portrait, batch)
+            if outcome in {"insufficient", "invalid"}:
+                self._portraits.record_insufficient(subject_id, object_id, signature)
+                left = remaining
+                return replace(
+                    status,
+                    updated=changed_any,
+                    pending_white_paintings=len(left),
+                    pending_chars=sum(len(item.text) for item in left),
+                    review_outcome=outcome,
+                )
+            changed_any = changed_any or changed
+            portrait = self._portraits.get_portrait(object_id)
+            remaining = remaining[len(batch):]
+        return ExperiencePortraitSyncResult(object_id, added, changed_any, 0, 0, outcome)
+
+    def _next_batch(
+        self, pending: tuple[PendingPortraitSummary, ...]
+    ) -> tuple[PendingPortraitSummary, ...]:
+        limit = self._config.experience_person_batch_chars
+        if limit <= 0:
+            return pending
+        batch: list[PendingPortraitSummary] = []
+        used = 0
+        for item in pending:
+            if batch and used + len(item.text) > limit:
+                break
+            batch.append(item)
+            used += len(item.text)
+        return tuple(batch)
+
+    def _absorb(
+        self,
+        subject_id: str,
+        object_id: str,
+        portrait: PersonExperiencePortrait | None,
+        pending: tuple[PendingPortraitSummary, ...],
+    ) -> tuple[str, bool]:
+        """Merge one batch of white paintings into the current portrait."""
         draft = self._composer.compose(
             object_id=object_id,
             previous=portrait,
@@ -115,59 +161,22 @@ class WhitePaintingExperiencePortraitBuilder:
             brief_chars=self._config.experience_person_brief_chars,
         )
         if isinstance(draft, InsufficientEvidence):
-            self._portraits.record_insufficient(subject_id, object_id, signature)
-            return replace(status, review_outcome="insufficient")
+            return "insufficient", False
         if draft is None:
-            return replace(status, review_outcome="invalid")
+            return "invalid", False
         full = draft.full.strip()
         brief = draft.brief.strip()
-        if (
-            not full or not brief
-            or len(full) > self._config.experience_person_max_chars
-            or len(brief) > self._config.experience_person_brief_chars
-        ):
-            return replace(status, review_outcome="invalid")
-        if portrait is None and draft.revision_kind != "initial":
-            return replace(status, review_outcome="invalid")
-        if portrait is not None:
-            if draft.revision_kind == "initial":
-                return replace(status, review_outcome="invalid")
-            same_shape = (
-                draft.baseline == portrait.baseline
-                and draft.adjustments == portrait.adjustments
-                and draft.uncertainties == portrait.uncertainties
-                and brief == portrait.brief
-            )
-            if (draft.revision_kind == "confirm") != same_shape:
-                return replace(status, review_outcome="invalid")
-            if draft.revision_kind != "confirm" and not draft.revision_reason:
-                return replace(status, review_outcome="invalid")
-            if draft.revision_kind == "extend":
-                old_adjustments = set(portrait.adjustments)
-                new_adjustments = set(draft.adjustments)
-                old_uncertainties = set(portrait.uncertainties)
-                new_uncertainties = set(draft.uncertainties)
-                if (
-                    draft.baseline != portrait.baseline
-                    or not old_adjustments.issubset(new_adjustments)
-                    or not old_uncertainties.issubset(new_uncertainties)
-                    or (
-                        old_adjustments == new_adjustments
-                        and old_uncertainties == new_uncertainties
-                    )
-                ):
-                    return replace(status, review_outcome="invalid")
-        if draft.revision_kind in {"revise", "uncertain"} and not draft.revised_claims:
-            return replace(status, review_outcome="invalid")
-        if draft.revision_kind == "uncertain" and not draft.uncertainties:
-            return replace(status, review_outcome="invalid")
+        if not full or not brief:
+            return "invalid", False
+        # 修订类别按新旧内容的实际差异定，模型给的标签只作参考：
+        # 标签与内容不符时改标签，不丢弃整份可用的草稿。
+        draft = replace(draft, revision_kind=_actual_revision_kind(draft, portrait, brief))
         if draft.revision_kind == "confirm" and portrait is not None:
             full = portrait.content
             brief = portrait.brief
 
-        source_chars = sum(
-            len(item.text) for item in all_summaries
-            if item.subject_id == subject_id and item.summary_id.startswith("xp:")
+        source_chars = (portrait.source_chars if portrait else 0) + sum(
+            len(item.text) for item in pending
         )
         now = datetime.now()
         changed = draft.revision_kind != "confirm"
@@ -188,9 +197,29 @@ class WhitePaintingExperiencePortraitBuilder:
             reason=draft.revision_reason,
             revised_claims=draft.revised_claims,
         )
-        return ExperiencePortraitSyncResult(
-            object_id, added, changed, 0, 0, draft.revision_kind
-        )
+        return draft.revision_kind, changed
+
+
+def _actual_revision_kind(draft, portrait: PersonExperiencePortrait | None, brief: str) -> str:
+    """按新旧内容定修订类别：无旧版为 initial，全同为 confirm，只增为 extend，其余为 revise。"""
+    if portrait is None:
+        return "initial"
+    if (
+        draft.baseline == portrait.baseline
+        and draft.adjustments == portrait.adjustments
+        and draft.uncertainties == portrait.uncertainties
+        and brief == portrait.brief
+    ):
+        return "confirm"
+    if draft.revision_kind == "uncertain" and draft.uncertainties:
+        return "uncertain"
+    if (
+        draft.baseline == portrait.baseline
+        and set(portrait.adjustments) <= set(draft.adjustments)
+        and set(portrait.uncertainties) <= set(draft.uncertainties)
+    ):
+        return "extend"
+    return "revise"
 
 
 class ExperiencePortraitReader:

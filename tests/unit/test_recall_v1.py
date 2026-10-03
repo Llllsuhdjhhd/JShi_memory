@@ -293,6 +293,62 @@ def test_index_is_idempotent_until_l1_changes(db):
     assert store.get(ev.event_id)["source_hash"] == material_source_hash("改成另一句 L1")
 
 
+def test_backfill_indexes_missing_active_events_once(db):
+    embedding = _CountingEmbedding()
+    store = QdrantRecallVectorStore("events", url=":memory:")
+    event_repo = EventRepository(db)
+    pipe = RecallPipeline(embedding, store, event_repo, include_unclosed=False)
+    active = Event(content_raw="原文", subject_id="jshi-1", summaries={"L1": "修理自行车"})
+    other = Event(content_raw="原文", subject_id="jshi-2", summaries={"L1": "种花"})
+    event_repo.save(active)
+    event_repo.save(other)
+
+    assert pipe.backfill_index("jshi-1") == (1, 1)
+    assert store.get(active.event_id) is not None
+    assert store.get(other.event_id) is None
+    assert pipe.backfill_index("jshi-1") == (1, 0)
+    assert embedding.docs == 1
+
+
+def test_reindex_removes_fact_point_for_role_removed_from_event(recall_pipeline):
+    pipe, event_repo, role_repo = recall_pipeline
+    ev = Event(
+        content_raw="甲与乙聊天", subject_id="jshi-1",
+        summaries={"L1": "甲与乙聊天"}, role_list=_roles("OBJ-A", "OBJ-B"),
+    )
+    event_repo.save(ev)
+    _save_fact(role_repo, "OBJ-A", "甲", ev.event_id, {"L1": "甲在聊天"})
+    _save_fact(role_repo, "OBJ-B", "乙", ev.event_id, {"L1": "乙在聊天"})
+    pipe.index_event(ev)
+    removed_fact_id = f"{ev.event_id}#fact#OBJ-B"
+    assert pipe._vector_store.get(removed_fact_id) is not None
+
+    ev.role_list = _roles("OBJ-A")
+    event_repo.save(ev)
+    pipe.index_event(ev)
+    assert pipe._vector_store.get(removed_fact_id) is None
+    assert pipe._vector_store.get(ev.event_id)["object_ids"] == ["OBJ-A"]
+
+
+def test_name_alone_does_not_make_unrelated_fact_a_perfect_lexical_match():
+    from rems.recall.pipeline import lexical_score
+
+    query = "lux 讨论崀山天气和路线"
+    assert lexical_score(query, "lux讨论崀山的天气和路线") > lexical_score(
+        query, "lux追问今天的新闻"
+    )
+    assert lexical_score(query, "lux追问今天的新闻") < 1.0
+
+
+def test_multiple_topic_details_outweigh_a_shared_name():
+    from rems.recall.pipeline import lexical_score
+
+    query = "lux 查杭州城西路况，工具只返回网页源码"
+    relevant = "lux问杭州城西路况，我查失败，只拿到网页源码"
+    unrelated = "lux问能否查机票，我只有工具回显，接不上查询"
+    assert lexical_score(query, relevant) > lexical_score(query, unrelated)
+
+
 def test_missing_l1_does_not_embed_raw(db):
     embedding = _CountingEmbedding()
     store = QdrantRecallVectorStore("events", url=":memory:")

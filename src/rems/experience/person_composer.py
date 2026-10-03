@@ -23,12 +23,20 @@ def render_person_experience(
 ) -> str:
     """Make the structured stance usable as a short piece of context."""
     parts = [baseline.strip().rstrip("。；")]
-    parts.extend(
-        f"在{item.context.strip()}时，{item.approach.strip()}".rstrip("。；")
-        for item in adjustments
-    )
+    for item in adjustments:
+        context = item.context.strip().rstrip("。；，")
+        approach = item.approach.strip().rstrip("。；")
+        if not context or not approach:
+            continue
+        if context.startswith("在"):
+            context = context[1:]
+        condition = f"在{context}" if context.endswith(("时", "时候")) else f"在{context}时"
+        parts.append(f"{condition}，{approach}")
     if uncertainties:
-        parts.append("尚不确定：" + "；".join(item.strip() for item in uncertainties))
+        parts.append(
+            "尚不确定："
+            + "；".join(item.strip().rstrip("。；") for item in uncertainties)
+        )
     return "；".join(item for item in parts if item) + "。"
 
 
@@ -87,6 +95,9 @@ _SYSTEM = """你在维护「匠石与某个人长期相处形成的经验肖像�
 6. 新旧证据冲突时，结合证据数量、情境差异和反例判断；
    不要用最新一次经历直接覆盖长期认识。
 7. 描述的是匠石形成的相处经验，不是对人物的绝对评价。
+8. baseline、adjustments、uncertainties 和 brief 统一用第三人称：称互动对象为「对方」或其名字，称主体为「匠石」。不要输出没有引号的「我」「你」，以免把对象的话误写成匠石的要求。
+9. 如果对象明确限定某偏好的适用场景，严格保留这个条件；不同场景的做法分开写。明确给出的边界不要再写成「尚不确定」，但可以保留真正缺乏跨事件证据的部分。
+10. 互斥场景必须拆成不同 adjustments，禁止把两种做法合进一项。例如「操作时要三条短步骤，倾诉时不要清单」应分别写成「值班操作→只给三条短步骤，不额外扩写」和「倾诉心情→先听，不列步骤或清单」。操作项不得包含「先讲心情」「不塞清单」；倾诉项不得包含操作步骤。
 
 revision_kind 只能是：
 - initial：此前没有肖像，本轮首次形成。
@@ -144,23 +155,27 @@ class LLMPersonExperienceComposer:
                 f"object_id: {object_id}\n"
                 f"已有肖像：{json.dumps(old_shape, ensure_ascii=False)}\n"
                 f"新增白描：{json.dumps(evidence, ensure_ascii=False)}\n"
-                f"完整渲染最多 {max_chars} 字；brief 最多 {brief_chars} 字。"
+                f"完整渲染目标约 {max_chars} 字，brief 目标约 {brief_chars} 字；"
+                "有依据的情境需要时可以超出，不要为压字数删去仍然有效的认识。"
             )},
         ])
         if data.get("insufficient_evidence") is True:
-            if previous is not None:
-                return None
-            return InsufficientEvidence(str(data.get("reason") or "").strip())
+            if previous is None:
+                return InsufficientEvidence(str(data.get("reason") or "").strip())
+            # 已有肖像时「证据不足」就是本批不改：原样确认，白描算已吸收。
+            return InteractionPortraitDraft(
+                baseline=previous.baseline,
+                adjustments=previous.adjustments,
+                uncertainties=previous.uncertainties,
+                brief=previous.brief,
+                revision_kind="confirm",
+                revision_reason=str(data.get("reason") or "").strip(),
+            )
+        # 类别由调用方按新旧内容的实际差异重定，这里只做格式校验。
         kind = data.get("revision_kind")
         if kind not in {"initial", "confirm", "extend", "revise", "uncertain"}:
-            return None
+            kind = "initial" if previous is None else "revise"
         reason = str(data.get("revision_reason") or "").strip()
-        if previous is None and kind != "initial":
-            return None
-        if previous is not None and kind == "initial":
-            return None
-        if kind != "initial" and not reason:
-            return None
         baseline = data.get("baseline")
         brief = data.get("brief")
         adjustments_raw = data.get("adjustments")
@@ -171,9 +186,10 @@ class LLMPersonExperienceComposer:
             or not isinstance(brief, str) or not brief.strip()
             or not isinstance(adjustments_raw, list)
             or not isinstance(uncertainties_raw, list)
-            or not isinstance(revised_raw, list)
         ):
             return None
+        if not isinstance(revised_raw, list):
+            revised_raw = []
         adjustments: list[ContextualAdjustment] = []
         for item in adjustments_raw:
             if (
@@ -199,7 +215,7 @@ class LLMPersonExperienceComposer:
                     for key in ("previous", "updated", "reason")
                 )
             ):
-                return None
+                continue
             revised_claims.append(RevisedClaim(
                 previous=item["previous"].strip(),
                 updated=item["updated"].strip(),
@@ -215,22 +231,8 @@ class LLMPersonExperienceComposer:
             revised_claims=tuple(revised_claims),
         )
         if (
-            len(draft.full) > max_chars or len(draft.brief) > brief_chars
-            or draft.full in {item.text.strip() for item in pending}
+            draft.full in {item.text.strip() for item in pending}
             or draft.brief in {item.text.strip() for item in pending}
         ):
-            return None
-        if kind in {"revise", "uncertain"} and not draft.revised_claims:
-            return None
-        if kind in {"initial", "confirm", "extend"} and draft.revised_claims:
-            return None
-        if kind == "confirm" and previous is not None and (
-            draft.baseline != previous.baseline
-            or draft.adjustments != previous.adjustments
-            or draft.uncertainties != previous.uncertainties
-            or draft.brief != previous.brief
-        ):
-            return None
-        if kind == "uncertain" and not draft.uncertainties:
             return None
         return draft

@@ -20,6 +20,7 @@ class BufferSentence(BaseModel):
 
     text: str
     residual_id: str | None = None
+    objects: dict[str, str] = Field(default_factory=dict)
     interlocutor_attributions: list[InterlocutorAttribution] = Field(default_factory=list)
 
 

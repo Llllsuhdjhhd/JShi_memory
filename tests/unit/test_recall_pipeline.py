@@ -38,6 +38,20 @@ def _mk(event_repo, text, summaries, subject_id="jshi-1", **kw):
     return ev
 
 
+def test_small_library_does_not_sample_away_older_semantic_match(recall_pipeline, monkeypatch):
+    pipe, event_repo, _obj, _meta = recall_pipeline
+    pipe._recency_window_events = 1
+    old = _mk(event_repo, "修理红色自行车", {"L1": "修理红色自行车"})
+    _mk(event_repo, "询问天气", {"L1": "询问天气"})
+    pipe.index_event(old)
+    monkeypatch.setattr(pipe, "_split_semantic_pools", lambda *_args: ([], []))
+
+    found = pipe.recall(
+        "jshi-1", "修理红色自行车", channels=("semantic",), reinforce=False,
+    )
+    assert any(item.event_id == old.event_id for item in found)
+
+
 class TestRecall:
     def test_historical_interlocutor_is_returned_and_drives_70_30_weight(
         self, recall_pipeline

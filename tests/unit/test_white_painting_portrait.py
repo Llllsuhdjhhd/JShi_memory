@@ -1,4 +1,4 @@
-"""Descriptive portraits refresh in batches and stop compressing when short."""
+"""Descriptive portraits refresh once pending white paintings are long enough."""
 
 from datetime import datetime, timedelta
 
@@ -7,11 +7,10 @@ from rems.services.white_painting_portrait import WhitePaintingPortraitBuilder
 from rems.storage.repository import PortraitRepository, RoleRepository
 
 
-def test_count_trigger_builds_l1_then_stops_at_sufficiently_short_level(
-    config, db, fake_llm
-):
-    config.portrait_white_painting_trigger_count = 2
-    config.portrait_white_painting_trigger_hours = 24
+def test_char_trigger_builds_all_levels_in_one_call(config, db, fake_llm):
+    config.portrait_white_painting_trigger_chars = 20
+    config.portrait_white_painting_trigger_count = 0
+    config.portrait_white_painting_trigger_hours = 0
     now = datetime(2026, 9, 27, 12)
     paintings = RoleRepository(db)
     portraits = PortraitRepository(db)
@@ -33,23 +32,41 @@ def test_count_trigger_builds_l1_then_stops_at_sufficiently_short_level(
         subject_id="jshi-1", event_id="E2", role_summary="多年以后仍能聊起共同的老师。",
         create_time=now,
     ))
-    for length in (800, 350, 150, 50, 20):
-        fake_llm.push_response({"text": "人" * length})
+    fake_llm.push_response({"levels": {
+        f"L{index}": "人" * length
+        for index, length in enumerate((800, 350, 150, 50, 20, 10), start=1)
+    }})
     result = builder.refresh("jshi-1", "OBJ-X")
     portrait = portraits.get_portrait("OBJ-X")
 
-    assert result.updated and result.trigger == "count"
+    assert result.updated and result.trigger == "chars"
     assert result.levels == ("L1", "L2", "L3", "L4", "L5")
     assert portrait.max_level == "L1"
     assert portrait.longest_level.text == "人" * 800
-    assert len(fake_llm.calls) == 5
+    assert len(fake_llm.calls) == 1
     assert builder.refresh("jshi-1", "OBJ-X").updated is False
     assert len(portraits.list_summaries("OBJ-X")) == 2
+
+
+def test_levels_stop_at_first_level_that_does_not_shrink(config, db, fake_llm):
+    config.portrait_white_painting_trigger_chars = 1
+    paintings = RoleRepository(db)
+    portraits = PortraitRepository(db)
+    builder = WhitePaintingPortraitBuilder(config, paintings, portraits, fake_llm)
+    paintings.add_white_painting_entry("OBJ-Z", WhitePaintingEntry(
+        subject_id="jshi-1", event_id="E1", role_summary="阿竹在图书室修复录音带。",
+    ))
+    fake_llm.push_response({"levels": {"L1": "阿" * 200, "L2": "阿" * 300, "L3": "阿" * 50}})
+
+    result = builder.refresh("jshi-1", "OBJ-Z")
+
+    assert result.updated and result.levels == ("L1",)
 
 
 def test_time_trigger_refreshes_only_when_new_white_painting_exists(
     config, db, fake_llm
 ):
+    config.portrait_white_painting_trigger_chars = 0
     config.portrait_white_painting_trigger_count = 10
     config.portrait_white_painting_trigger_hours = 24
     now = datetime(2026, 9, 27, 12)
@@ -59,7 +76,7 @@ def test_time_trigger_refreshes_only_when_new_white_painting_exists(
         subject_id="jshi-1", event_id="E1", role_summary="阿青与我一起上过学。",
         create_time=now - timedelta(hours=25),
     ))
-    fake_llm.push_response({"text": "阿青是我过去的同学。"})
+    fake_llm.push_response({"levels": {"L1": "阿青是我过去的同学。"}})
     builder = WhitePaintingPortraitBuilder(
         config, paintings, portraits, fake_llm, clock=lambda: now
     )
@@ -76,7 +93,7 @@ def test_time_trigger_refreshes_only_when_new_white_painting_exists(
         subject_id="jshi-1", event_id="E2", role_summary="多年后仍记得阿青。",
         create_time=next_day,
     ))
-    fake_llm.push_response({"text": "阿青是我过去的同学，多年后仍有联系。"})
+    fake_llm.push_response({"levels": {"L1": "阿青是我过去的同学，多年后仍有联系。"}})
     later = WhitePaintingPortraitBuilder(
         config, paintings, portraits, fake_llm, clock=lambda: next_day
     )
