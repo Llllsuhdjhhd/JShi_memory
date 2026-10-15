@@ -145,6 +145,7 @@ class LLMProvider:
             messages=messages,
             temperature=temp,
             timeout=300.0,
+            **({"extra_body": dict(self.config.llm.extra_body)} if self.config.llm.extra_body else {}),
         )
         latency_ms = (time.perf_counter() - t0) * 1000.0
         msg = response.choices[0].message
@@ -159,6 +160,8 @@ class LLMProvider:
                 prompt_tokens=self._usage_int(usage, "prompt_tokens"),
                 completion_tokens=ct,
                 total_tokens=self._usage_int(usage, "total_tokens"),
+                response_model=getattr(response, "model", None),
+                cached_tokens=self._usage_int(usage, "prompt_cache_hit_tokens"),
             ),
         )
         if not content.strip():

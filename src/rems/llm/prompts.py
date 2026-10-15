@@ -511,7 +511,28 @@ def build_enrichment_system_message(
             f"Unknown enrichment mode: {mode!r} "
             "(expected full/names_only/summary_only/memory)"
         )
+    if getattr(config, "enrichment_perspective", "first_person") == "neutral":
+        body = apply_neutral_perspective(body)
     return base + body
+
+
+ENRICHMENT_NEUTRAL_PERSPECTIVE_NOTE = """
+## 视角（中立）
+本条原文是多说话人对话，每行形如「说话人: 内容」。行内的「我 / I / my」指该行的说话人本人，不是记忆主体。
+摘要和对象事实用第三人称中立视角书写，点名说话人（例如「Caroline 说她去了支持小组」），不要使用「我」。
+摘要与 fact 使用事件原文的语言；原文的日期、数字、专名保持原样。
+"""
+
+
+def apply_neutral_perspective(body: str) -> str:
+    """把 enrichment 提示里的第一人称「我」视角改为点名说话人的中立视角。"""
+    out = body.replace(
+        "摘要和对象事实用「我」的第一人称。不要在输出里混用「我」和「匠石」。",
+        "摘要和对象事实用第三人称中立视角，点名说话人，不要使用「我」。",
+    )
+    out = out.replace("用「我」的视角写这个对象", "用中立视角、点名说话人写这个对象")
+    out = out.replace("不必写成和我的互动；", "")
+    return out + ENRICHMENT_NEUTRAL_PERSPECTIVE_NOTE
 
 
 _LEGACY_ENRICHMENT_SUMMARY_ONLY_DEFAULT_FUSE = 12

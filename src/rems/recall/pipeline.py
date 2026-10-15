@@ -28,6 +28,18 @@ _INTERLOCUTOR_OBJECT_WEIGHT = 0.7
 _INVOLVED_OBJECT_WEIGHT = 0.3
 _NUMBER_RE = re.compile(r"\d+(?:\.\d+)?(?:℃|°c|°|%)?", re.IGNORECASE)
 _LATIN_RE = re.compile(r"[a-z][a-z0-9+\-]{1,}")
+_EN_STOPWORDS = frozenset("""
+a an the and or but if of at by for with about against between into through during before
+after above below to from up down in out on off over under again further then once here there
+when where why how all any both each few more most other some such no nor not only own same so
+than too very can will just don should now is am are was were be been being have has had having
+do does did doing i me my myself we our ours ourselves you your yours yourself yourselves he him
+his himself she her hers herself it its itself they them their theirs themselves what which who
+whom this that these those would could also get got go went like really yeah yes oh hey thanks
+thank lot much many one two time day did what's i'm it's that's you're
+""".split())
+LATIN_MODES = ("overlap", "token", "off")
+_CJK_RE = re.compile(r"[\u3400-\u9fff]")
 
 
 def _shown_object_id(ev: Event, wanted: tuple[str, ...]) -> str | None:
@@ -126,8 +138,22 @@ def order_by_relevance(items: list[_Candidate], close: float) -> list[_Candidate
     return out
 
 
-def lexical_score(query: str, text: str) -> float:
-    """词面分。专名、数字、完整短语命中为 1；其余按最长公共子串占查询的比例。"""
+def latin_overlap(query: str, text: str) -> float:
+    """去英文停用词后，查询内容词在文本中出现的比例（0~1）。"""
+    q_words = {w for w in _LATIN_RE.findall(query) if w not in _EN_STOPWORDS}
+    if not q_words:
+        return 0.0
+    t_words = set(_LATIN_RE.findall(text))
+    return len(q_words & t_words) / len(q_words)
+
+
+def lexical_score(query: str, text: str, *, latin_mode: str = "overlap") -> float:
+    """词面分。专名、数字、完整短语命中为 1；其余按最长公共子串占查询的比例。
+
+    拉丁词（``latin_mode``）：``overlap``（默认）=去停用词后的词重叠率，纯拉丁查询直接返回该比例；
+    ``token``=旧行为（任一 ≥2 字母词命中即 1，英文几乎恒为 1）；``off``=不计拉丁词。
+    含中文的查询仍走原中文逻辑（与重叠率取大）。
+    """
     q = _norm(query)
     t = _norm(text)
     if not q or not t:
@@ -138,10 +164,19 @@ def lexical_score(query: str, text: str) -> float:
         tok = match.group(0)
         if len(tok) >= 1 and tok in t:
             return 1.0
-    for match in _LATIN_RE.finditer(q):
-        tok = match.group(0)
-        if tok in t:
-            return 1.0
+    overlap = 0.0
+    if latin_mode == "token":
+        for match in _LATIN_RE.finditer(q):
+            if match.group(0) in t:
+                return 1.0
+    elif latin_mode == "overlap" and _LATIN_RE.search(q):
+        overlap = latin_overlap(q, t)
+        if not _CJK_RE.search(q):
+            return overlap
+    return max(overlap, _cjk_lexical(q, t))
+
+
+def _cjk_lexical(q: str, t: str) -> float:
     q2 = q[:80]
     found = 0
     for length in range(len(q2), 1, -1):
@@ -237,6 +272,7 @@ class RecallPipeline:
         default_budget_chars: int = 8000,
         embedding_model: str = "hash",
         embedding_version: int = 1,
+        lexical_latin_mode: str = "overlap",
     ):
         self._embedding = embedding
         self._vector_store = vector_store
@@ -272,6 +308,9 @@ class RecallPipeline:
         self._default_budget_chars = default_budget_chars
         self._embedding_model = embedding_model
         self._embedding_version = int(embedding_version)
+        if lexical_latin_mode not in LATIN_MODES:
+            raise ValueError(f"lexical_latin_mode must be one of {LATIN_MODES}")
+        self._lexical_latin_mode = lexical_latin_mode
 
     # ------------------------------------------------------------------
     def recall(
@@ -577,7 +616,7 @@ class RecallPipeline:
             event_id=ev.event_id,
             object_id=_shown_object_id(ev, wanted),
             semantic=semantic.get(("event", ev.event_id, ""), 0.0) if use_semantic else 0.0,
-            lexical=lexical_score(query, event_text) if use_lexical else 0.0,
+            lexical=lexical_score(query, event_text, latin_mode=self._lexical_latin_mode) if use_lexical else 0.0,
             object_hit=object_hit,
             temporal=temporal,
             accessibility=access,
@@ -604,7 +643,7 @@ class RecallPipeline:
                 event_id=ev.event_id,
                 object_id=role.role_id,
                 semantic=semantic.get(("object_event_fact", ev.event_id, role.role_id), 0.0) if use_semantic else 0.0,
-                lexical=lexical_score(query, fact_text) if use_lexical else 0.0,
+                lexical=lexical_score(query, fact_text, latin_mode=self._lexical_latin_mode) if use_lexical else 0.0,
                 object_hit=object_hit,
                 temporal=temporal,
                 accessibility=access,
@@ -671,7 +710,7 @@ class RecallPipeline:
                 event_id=item.id,
                 object_id=next((oid for oid in wanted if oid in roles), None),
                 semantic=0.0,
-                lexical=lexical_score(query, text),
+                lexical=lexical_score(query, text, latin_mode=self._lexical_latin_mode),
                 object_hit=1.0 if wanted else 0.0,
                 temporal=1.0 if time_range is not None else None,
                 accessibility=1.0,
