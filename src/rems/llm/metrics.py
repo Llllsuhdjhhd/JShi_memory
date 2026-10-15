@@ -19,3 +19,6 @@ class LLMInvocationMetrics:
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
     total_tokens: int | None = None
+    # 服务端响应里返回的 model 字段（别名解析后的真实模型名）
+    response_model: str | None = None
+    cached_tokens: int | None = None

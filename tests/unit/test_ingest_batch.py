@@ -293,3 +293,39 @@ class TestIngestBatch:
         assert len(result.errors) == 1
         assert len(result.sealed_event_ids) == 1
         assert result.stored_marks == {"seg-003": result.sealed_event_ids}
+
+
+class TestIngestBatchOccurredAt:
+    def test_merged_batch_passes_through_first_occurred_at(
+        self, memory_pipeline, fake_llm: FakeLLM
+    ):
+        from datetime import datetime
+
+        pipeline, event_repo, _role_repo, _marks_repo = memory_pipeline
+        fake_llm.push_response({
+            "completed_events": [{"content_raw_indices": [1, 2], "continuation_of": None}],
+            "new_unclosed_indices": [],
+        })
+        fake_llm.push_response({"summaries": {"L1": "两人聊天。"}, "objects": []})
+        t0 = datetime(2023, 5, 8, 13, 56)
+        batch = MemoryBatch(
+            subject_id="conv-1",
+            experiences=(
+                MemoryExperience(
+                    subject_id="conv-1", text="Caroline: Hi Mel!",
+                    source_ids=("D1:1",), segment_id="s1", occurred_at=t0,
+                ),
+                MemoryExperience(
+                    subject_id="conv-1", text="Melanie: Hey Caroline!",
+                    source_ids=("D1:2",), segment_id="s2",
+                    occurred_at=datetime(2023, 5, 9, 0, 0),
+                ),
+            ),
+        )
+        result = pipeline.ingest_batch(batch)
+        assert result.errors == []
+        assert result.sealed_event_ids
+        for eid in result.sealed_event_ids:
+            ev = event_repo.get(eid)
+            assert ev.occurred_at == t0
+            assert ev.source_ids == ["D1:1", "D1:2"]

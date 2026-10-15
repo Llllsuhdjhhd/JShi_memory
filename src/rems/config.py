@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from enum import Enum
+from typing import Literal
 
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -64,6 +65,9 @@ class LLMConfig(BaseModel):
     task_models: TaskModelMapping = Field(default_factory=TaskModelMapping)
     temperature: float = 0.3
     max_retries: int = 3
+    # 透传给 chat.completions.create 的 extra_body，例如关闭 DeepSeek 思考：
+    # REMS_LLM__EXTRA_BODY='{"thinking": {"type": "disabled"}}'
+    extra_body: dict = Field(default_factory=dict)
 
 
 class EmbeddingConfig(BaseModel):
@@ -211,6 +215,13 @@ class REMSConfig(BaseSettings):
     recall_relevance_close: float = 0.08
     # 嵌入模型或维度变更时递增。物理集合名会带上这个版本，旧集合不覆盖。
     recall_embedding_version: int = 1
+    # 词面分拉丁词规则：overlap=去停用词后的词重叠率（默认）；
+    # token=任一 ≥2 字母词命中即 1（旧行为；英文语料几乎恒为 1）；off=不计拉丁词。中文逻辑不变。
+    recall_lexical_latin_mode: str = "overlap"
+    # 召回强化副作用（命中事件 forgetting_factor 乘 reinforce_multiplier）；评测可关。
+    recall_reinforce_enabled: bool = True
+    # enrichment 摘要视角：first_person=「我」（原行为）；neutral=第三人称点名说话人（多人对话评测）。
+    enrichment_perspective: Literal["first_person", "neutral"] = "first_person"
 
     # ---- Recall: 并发人物提取与多路检索（本轮新增）----
     # 回忆是否等待回忆前的人物提取结果。默认 False：人物提取并发跑，回忆用即时启发式 focus，不阻塞。

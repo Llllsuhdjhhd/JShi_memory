@@ -181,6 +181,7 @@ class REMSPipeline:
                 else config.embedding.model_name
             ),
             embedding_version=config.recall_embedding_version,
+            lexical_latin_mode=config.recall_lexical_latin_mode,
         )
 
         # ---- 技能与领域服务 ----
@@ -277,6 +278,8 @@ class REMSPipeline:
                     else None
                 ),
                 source_ids=tuple(merged_sources),
+                # 透传发生时间：合并批次以首段为准（空 = 摄入时刻）
+                occurred_at=valid[0].occurred_at,
                 segment_id="+".join(e.segment_id for e in valid),
                 origin=valid[0].origin,
                 sub_segments=sub_segments,
@@ -363,10 +366,17 @@ class REMSPipeline:
         level: int = 1,
         limit: int | None = None,
         anchor_event_ids: tuple[str, ...] = (),
+        reinforce: bool | None = None,
     ) -> tuple[RecalledFragment, ...]:
-        """实现 MemoryBackendPort.recall。预算选级在回忆管线内完成，不再截断原文。"""
+        """实现 MemoryBackendPort.recall。``reinforce=None`` 时取 ``recall_reinforce_enabled``。预算选级在回忆管线内完成，不再截断原文。"""
         if self.recall_pipeline is None:
             return ()
+        do_reinforce = (
+            getattr(self.config, "recall_reinforce_enabled", True)
+            if reinforce is None else reinforce
+        )
+        # 只在关闭强化时显式透传，保持既有调用契约（默认强化）。
+        extra = {} if do_reinforce else {"reinforce": False}
         fragments = self.recall_pipeline.recall(
             subject_id,
             query,
@@ -383,6 +393,7 @@ class REMSPipeline:
             level=level,
             limit=limit,
             anchor_event_ids=anchor_event_ids,
+            **extra,
         )
         self._record_recall_trace(
             subject_id,
