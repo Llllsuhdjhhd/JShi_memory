@@ -29,7 +29,8 @@ def test_session_batch_shape():
     s1 = L.iter_sessions(SAMPLE)[0]
     b = L.session_batch(SAMPLE, s1)
     (e,) = b.experiences
-    assert b.subject_id == e.subject_id == "conv-x"
+    # 与 runner 默认一致：全局主体 protagonist（非 sample_id）
+    assert b.subject_id == e.subject_id == L.PROTAGONIST
     assert e.text == "Caroline: Hey Mel!\nMelanie: Hi! [shares an image: a dog]"
     assert e.objects == {"Melanie": "conv-x:Melanie"}  # speaker_a = 主体，不进对象表
     assert e.source_ids == ("D1:1", "D1:2")

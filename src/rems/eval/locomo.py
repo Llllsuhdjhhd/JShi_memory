@@ -131,10 +131,15 @@ def session_batches(
 
 
 def session_batch(
-    sample: dict[str, Any], session: Session, *, include_image_caption: bool = True,
+    sample: dict[str, Any], session: Session, *,
+    subject_id: str = PROTAGONIST, include_image_caption: bool = True,
 ) -> MemoryBatch:
-    """整 session 一批（不切块）；subject_id = sample_id。"""
-    return session_batches(sample, session, subject_id=sample["sample_id"],
+    """整 session 一批（不切块）。
+
+    ``subject_id`` 默认 ``PROTAGONIST``，与 ``scripts/locomo_eval.py`` 共用实例约定一致；
+    评测运行器通过 ``session_batches(..., subject_id=...)`` 显式传入同一全局主体。
+    """
+    return session_batches(sample, session, subject_id=subject_id,
                            soft_chars=10**9, include_image_caption=include_image_caption)[0]
 
 

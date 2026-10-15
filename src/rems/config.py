@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from enum import Enum
+from typing import Literal
 
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -220,7 +221,7 @@ class REMSConfig(BaseSettings):
     # 召回强化副作用（命中事件 forgetting_factor 乘 reinforce_multiplier）；评测可关。
     recall_reinforce_enabled: bool = True
     # enrichment 摘要视角：first_person=「我」（原行为）；neutral=第三人称点名说话人（多人对话评测）。
-    enrichment_perspective: str = "first_person"
+    enrichment_perspective: Literal["first_person", "neutral"] = "first_person"
 
     # ---- Recall: 并发人物提取与多路检索（本轮新增）----
     # 回忆是否等待回忆前的人物提取结果。默认 False：人物提取并发跑，回忆用即时启发式 focus，不阻塞。

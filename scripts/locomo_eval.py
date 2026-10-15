@@ -1,4 +1,4 @@
-"""LoCoMo 评测运行器（每段对话独立实例：独立 SQLite + 独立 Qdrant 路径）。
+"""LoCoMo 评测运行器（所有对话共用一个实例：专用 SQLite + 专用 Qdrant 路径）。
 
 用法（密钥只从环境变量读，脚本与产物都不记录密钥）::
 
@@ -6,7 +6,7 @@
         --data /workspace/LoCoMo/locomo10.json --out runs/locomo_smoke \
         --model deepseek-flash --thinking off
 
-所有对话共用一个实例（专用 SQLite + Qdrant 路径）；全局主体 = 第 1 段对话 speaker_a。
+所有对话共用一个实例（专用 SQLite + Qdrant 路径）；全局主体 = ``--subject``（默认 protagonist）。
 默认只跑第 1 段对话；``--all`` 才跑全部（需评审同意）。
 """
 
