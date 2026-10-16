@@ -9,6 +9,7 @@ import hashlib
 import logging
 import math
 import random
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -51,9 +52,9 @@ def _event_object_id(ev: Event) -> str | None:
     return others[0].role_id
 
 
-def retrieval_text(event: Event) -> str:
-    """事件向量文本：只有 L1。没有 L1 时返回空串，不改用原文。"""
-    return _level_text(event.summaries, "L1")
+def retrieval_text(event: Event, level: str = "L1") -> str:
+    """索引来源与取回表示独立；不混用两个版本的向量。"""
+    return (event.content_raw or "").strip() if level == "L0" else _level_text(event.summaries, "L1")
 
 
 def material_source_hash(text: str) -> str:
@@ -135,8 +136,41 @@ def order_by_relevance(items: list[_Candidate], close: float) -> list[_Candidate
     return out
 
 
-def lexical_score(query: str, text: str) -> float:
+_ENGLISH_WORDS = re.compile(r"[^\W_]+(?:['’][^\W_]+)?", re.UNICODE)
+_ENGLISH_FUNCTION_WORDS = frozenset("""a an the and or but of to in on at by for from with
+as is are was were be been being do does did have has had can could would should
+will shall may might what which who whom whose where when why how i me my mine
+you your yours he him his she her hers it its we us our ours they them their theirs
+this that these those than then so not no yes s t m re ve ll d""".split())
+
+
+def _english_terms(text: str) -> set[str]:
+    result = set()
+    for word in _ENGLISH_WORDS.findall(text.casefold()):
+        word = word.replace("’", "'")
+        if word.endswith("'s"):
+            word = word[:-2]
+        if word in _ENGLISH_FUNCTION_WORDS:
+            continue
+        # Small, dependency-free plural normalization; do not match substrings
+        # such as 'art' inside 'party'. Semantic matching handles paraphrases.
+        if len(word) > 4 and word.endswith("ies"):
+            word = word[:-3] + "y"
+        elif len(word) > 3 and word.endswith("s") and not word.endswith(("ss", "us", "is")):
+            word = word[:-1]
+        result.add(word)
+    return result
+
+
+def english_word_coverage(query: str, text: str) -> float:
+    terms = _english_terms(query)
+    return len(terms & _english_terms(text)) / len(terms) if terms else 0.0
+
+
+def lexical_score(query: str, text: str, *, english_words: bool = False) -> float:
     """词面分：完整命中、最长片段和查询双字片段覆盖率。"""
+    if english_words and re.search(r"[A-Za-z]", query) and not re.search(r"[\u3400-\u9fff]", query):
+        return english_word_coverage(query, text)
     q = "".join(ch for ch in _norm(query) if ch.isalnum() or ch in "℃°%+-")
     t = "".join(ch for ch in _norm(text) if ch.isalnum() or ch in "℃°%+-")
     if not q or not t:
@@ -250,6 +284,8 @@ class RecallPipeline:
         default_budget_chars: int = 8000,
         embedding_model: str = "hash",
         embedding_version: int = 1,
+        english_word_lexical: bool = False,
+        event_index_level: str = "L1",
     ):
         self._embedding = embedding
         self._vector_store = vector_store
@@ -286,6 +322,10 @@ class RecallPipeline:
         self._default_budget_chars = default_budget_chars
         self._embedding_model = embedding_model
         self._embedding_version = int(embedding_version)
+        self._english_word_lexical = english_word_lexical
+        if event_index_level not in {"L0", "L1"}:
+            raise ValueError("event_index_level must be L0 or L1")
+        self._event_index_level = event_index_level
 
     # ------------------------------------------------------------------
     def recall(
@@ -398,7 +438,7 @@ class RecallPipeline:
         """Reconcile active events with the current embedding collection.
 
         Returns (events scanned, points written). Safe to rerun: index_event
-        compares the L1 hash, embedding version and object payload first.
+        compares source hashes, embedding version and object payload first.
         """
         scanned = 0
         written = 0
@@ -410,7 +450,7 @@ class RecallPipeline:
         return scanned, written
 
     def index_event(self, event: Event) -> int:
-        """为事件 L1 和每条对象事实 L1 写向量；返回写入的点数。"""
+        """L0 分块索引事件，或兼容旧 L1 事件与对象事实索引。"""
         object_ids = [role.role_id for role in event.role_list if not role.is_subject]
         event_object_ids = list(dict.fromkeys((
             *object_ids,
@@ -418,18 +458,23 @@ class RecallPipeline:
         )))
         pending: list[tuple[str, str, dict]] = []
         desired: set[str] = set()
-        l1 = retrieval_text(event)
+        l1 = retrieval_text(event, self._event_index_level)
         if l1:
-            desired.add(event.event_id)
-            payload = self._index_payload(
-                event, material_type="event", object_id=None,
-                object_ids=event_object_ids, text=l1,
-            )
-            if not self._index_unchanged(event.event_id, payload):
-                pending.append((event.event_id, l1, payload))
+            splitter = getattr(self._embedding, "split_document", None)
+            chunks = splitter(l1) if splitter and self._event_index_level == "L0" else [l1]
+            for index, chunk in enumerate(chunks):
+                logical_id = event.event_id if index == 0 else f"{event.event_id}#raw#{index}"
+                desired.add(logical_id)
+                payload = self._index_payload(
+                    event, material_type="event", object_id=None,
+                    object_ids=event_object_ids, text=chunk,
+                )
+                payload["chunk_index"] = index
+                if not self._index_unchanged(logical_id, payload):
+                    pending.append((logical_id, chunk, payload))
         else:
             self._vector_store.delete(event.event_id)
-        if self._role_repo is not None:
+        if self._role_repo is not None and self._event_index_level == "L1":
             for role in event.role_list:
                 if role.is_subject:
                     continue
@@ -445,10 +490,10 @@ class RecallPipeline:
                 )
                 if not self._index_unchanged(logical_id, payload):
                     pending.append((logical_id, fact, payload))
-            lister = getattr(self._vector_store, "list_event_logical_ids", None)
-            if lister is not None:
-                for stale_id in set(lister(event.event_id)) - desired:
-                    self._vector_store.delete(stale_id)
+        lister = getattr(self._vector_store, "list_event_logical_ids", None)
+        if lister is not None:
+            for stale_id in set(lister(event.event_id)) - desired:
+                self._vector_store.delete(stale_id)
         if not pending:
             return 0
         vectors = self._embedding.embed_documents([text for _pid, text, _payload in pending])
@@ -472,7 +517,7 @@ class RecallPipeline:
             "event_id": event.event_id,
             "object_id": object_id,
             "object_ids": list(object_ids),
-            "representation_level": "L1",
+            "representation_level": self._event_index_level if material_type == "event" else "L1",
             "source_hash": material_source_hash(text),
             "embedding_model": self._embedding_model,
             "embedding_version": self._embedding_version,
@@ -490,6 +535,7 @@ class RecallPipeline:
             existing.get("source_hash") == payload["source_hash"]
             and existing.get("embedding_model") == payload["embedding_model"]
             and existing.get("embedding_version") == payload["embedding_version"]
+            and existing.get("representation_level") == payload["representation_level"]
             and existing.get("object_id") == payload.get("object_id")
             and existing.get("object_ids") == payload.get("object_ids")
         )
@@ -627,7 +673,7 @@ class RecallPipeline:
             event_id=ev.event_id,
             object_id=_shown_object_id(ev, wanted),
             semantic=semantic.get(("event", ev.event_id, ""), 0.0) if use_semantic else 0.0,
-            lexical=lexical_score(query, event_text) if use_lexical else 0.0,
+            lexical=lexical_score(query, event_text, english_words=self._english_word_lexical) if use_lexical else 0.0,
             object_hit=object_hit,
             temporal=temporal,
             accessibility=access,
@@ -654,7 +700,7 @@ class RecallPipeline:
                 event_id=ev.event_id,
                 object_id=role.role_id,
                 semantic=semantic.get(("object_event_fact", ev.event_id, role.role_id), 0.0) if use_semantic else 0.0,
-                lexical=lexical_score(query, fact_text) if use_lexical else 0.0,
+                lexical=lexical_score(query, fact_text, english_words=self._english_word_lexical) if use_lexical else 0.0,
                 object_hit=object_hit,
                 temporal=temporal,
                 accessibility=access,
@@ -721,7 +767,7 @@ class RecallPipeline:
                 event_id=item.id,
                 object_id=next((oid for oid in wanted if oid in roles), None),
                 semantic=0.0,
-                lexical=lexical_score(query, text),
+                lexical=lexical_score(query, text, english_words=self._english_word_lexical),
                 object_hit=1.0 if wanted else 0.0,
                 temporal=1.0 if time_range is not None else None,
                 accessibility=1.0,
@@ -796,15 +842,22 @@ class RecallPipeline:
             if key in seen:
                 continue
             seen.add(key)
+            dates = sorted({value[:10] for value in (cand.event.source_dates if cand.event else [])})
+            date_note = ""
+            if len(dates) == 1:
+                date_note = f"[Source statement date: {dates[0]}; relative dates refer to this date.] "
+            elif dates:
+                date_note = f"[Source statements span {dates[0]} to {dates[-1]}; relative-date anchor is ambiguous.] "
             if cand.material_type == "unclosed":
                 picked = (cand.raw, "raw") if len(cand.raw) <= remaining else None
             else:
                 picked = select_representation(
-                    cand.levels, cand.raw, remaining, expand_raw=expand_raw,
+                    cand.levels, cand.raw, remaining - len(date_note), expand_raw=expand_raw,
                 )
             if picked is None:
                 continue
             content, level_name = picked
+            content = date_note + content
             remaining -= len(content)
             signals = {
                 "semantic": round(cand.semantic, 6),

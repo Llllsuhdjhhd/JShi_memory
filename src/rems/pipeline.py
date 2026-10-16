@@ -102,12 +102,14 @@ class REMSPipeline:
 
     # ------------------------------------------------------------------
     @classmethod
-    def from_config(cls, config: REMSConfig | None = None) -> "REMSPipeline":
+    def from_config(
+        cls, config: REMSConfig | None = None, *, llm: LLMProvider | None = None
+    ) -> "REMSPipeline":
         """工厂：装配存储、技能、领域服务与回忆 provider（插拔式，docs/project-overview.md）。"""
         if config is None:
             config = REMSConfig()
 
-        llm = LLMProvider(config)
+        llm = llm if llm is not None else LLMProvider(config)
         db = Database(config.storage.database_url)
         db.create_tables()
 
@@ -129,10 +131,14 @@ class REMSPipeline:
         if config.embedding.provider == "hash":
             embedding = HashEmbedding()
         else:
-            embedding = SentenceTransformerEmbedding(config.embedding.model_name)
+            embedding = SentenceTransformerEmbedding(
+                config.embedding.model_name, config.embedding.query_instruction
+            )
         vector_store = QdrantRecallVectorStore(
             versioned_collection_name(
-                config.storage.qdrant_collection,
+                (config.storage.qdrant_collection + "_l0"
+                 if config.recall_event_index_level == "L0"
+                 else config.storage.qdrant_collection),
                 config.recall_embedding_version,
             ),
             url=config.storage.qdrant_url,
@@ -170,6 +176,7 @@ class REMSPipeline:
             role_repo=role_repo,
             semantic_min=config.recall_semantic_min,
             lexical_min=config.recall_lexical_min,
+            english_word_lexical=config.recall_english_word_lexical,
             relevance_close=config.recall_relevance_close,
             default_budget_chars=(
                 config.recall_budget_chars
@@ -182,6 +189,7 @@ class REMSPipeline:
                 else config.embedding.model_name
             ),
             embedding_version=config.recall_embedding_version,
+            event_index_level=config.recall_event_index_level,
         )
 
         # ---- 技能与领域服务 ----
@@ -266,6 +274,8 @@ class REMSPipeline:
                         text=e.text,
                         objects=dict(e.objects),
                         interlocutor_object_id=e.interlocutor,
+                        occurred_at=e.occurred_at,
+                        source_ids=e.source_ids,
                     )
                 )
             memory = MemoryExperience(
@@ -280,6 +290,7 @@ class REMSPipeline:
                 source_ids=tuple(merged_sources),
                 segment_id="+".join(e.segment_id for e in valid),
                 origin=valid[0].origin,
+                occurred_at=valid[0].occurred_at if all(e.occurred_at == valid[0].occurred_at for e in valid) else None,
                 sub_segments=sub_segments,
             )
             try:

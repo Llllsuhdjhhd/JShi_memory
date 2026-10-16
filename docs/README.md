@@ -11,6 +11,10 @@
 | [回忆](recall.md) | 输入过滤、检索候选、可及性、排序、预算与输出 |
 | [匠石交互](jshi-integration.md) | Python 端口、JShi 字段映射、REST API |
 | [开发与验证](development.md) | 安装、配置、离线测试和验证边界 |
+| [LoCoMo 匠石评测](locomo-evaluation.md) | 真实核心、英文嵌入、答案覆盖、评分与费用控制 |
+| [两轮实测与实例复核](locomo-round-comparison.md) | 30 题重写复测、改进得失、评分复核与费用 |
+| [第三轮规则修复与评估](locomo-round3.md) | 长度、剥离、摘要及时间修复；两次完整实测与退步分析 |
+| [第四轮 L0 原文向量对比](locomo-round4-l0.md) | 固定记忆库的 30 题配对、实际取回例子及压缩交付瓶颈 |
 | [草稿箱](drafts/README.md) | 方案讨论、实施计划和调试记录 |
 
 ## 文档与代码的优先级

@@ -21,6 +21,9 @@ class BufferSentence(BaseModel):
     text: str
     residual_id: str | None = None
     objects: dict[str, str] = Field(default_factory=dict)
+    occurred_at: datetime | None = None
+    source_ids: tuple[str, ...] = ()
+    segment_id: str | None = None
     interlocutor_attributions: list[InterlocutorAttribution] = Field(default_factory=list)
 
 

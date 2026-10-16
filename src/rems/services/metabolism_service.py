@@ -69,6 +69,9 @@ def _new_buffer_items(raw_input: str, memory: MemoryExperience | None) -> list[B
             BufferSentence(
                 text=sentence,
                 objects=dict(sub.objects),
+                occurred_at=sub.occurred_at,
+                source_ids=sub.source_ids,
+                segment_id=sub.segment_id,
                 interlocutor_attributions=(
                     [InterlocutorAttribution(
                         segment_id=sub.segment_id,
@@ -84,6 +87,9 @@ def _new_buffer_items(raw_input: str, memory: MemoryExperience | None) -> list[B
         BufferSentence(
             text=sentence,
             objects=_objects_for_event(sentence, memory),
+            occurred_at=memory.occurred_at if memory else None,
+            source_ids=memory.source_ids if memory else (),
+            segment_id=memory.segment_id if memory else None,
             interlocutor_attributions=_interlocutors_for_event(sentence, memory),
         )
         for sentence in segment_sentences(raw_input)
@@ -328,6 +334,7 @@ class MetabolismService:
 
         buffer = self._load_buffer(unclosed)
         buffer.extend(_new_buffer_items(raw_input, memory))
+        buffer = self._bounded_sentences(buffer)
 
         def _run_boundary():
             if ingest_session is not None and getattr(ingest_session, "turn", 0) >= 1:
@@ -353,6 +360,7 @@ class MetabolismService:
             )
 
         if result.disentangle:
+            result = self._bound_groups(result, buffer)
             sealed = self._apply_disentangle(
                 result, buffer, unclosed,
                 input_id=input_id,
@@ -428,6 +436,58 @@ class MetabolismService:
         factor = float(self._config.event_len_factor or 2)
         return ev_len <= length < factor * ev_len
 
+    def _bounded_sentences(self, buffer: list[BufferSentence]) -> list[BufferSentence]:
+        """Lossless last resort for an individual sentence longer than the event cap."""
+        if self._config.event_min_chars <= 0:
+            return buffer
+        cap = max(1, int(self._config.event_min_chars * self._config.event_len_factor) - 1)
+        return [item.model_copy(update={"text": item.text[start:start + cap]})
+                for item in buffer for start in range(0, len(item.text), cap)]
+
+    def _bound_groups(self, result, buffer):
+        """Apply event limits after semantic grouping; sentence ownership stays disjoint."""
+        from ..skills.boundary_detection import BoundaryResult, CompletedFragment, NewUnclosed
+        cap = (max(1, int(self._config.event_min_chars * self._config.event_len_factor) - 1)
+               if self._config.event_min_chars > 0 else sum(len(item.text) + 1 for item in buffer) + 1)
+        claimed = set()
+        completed, residual = [], []
+
+        def groups(indices):
+            chunks, chunk, size = [], [], 0
+            for index in indices:
+                if index in claimed or not 1 <= index <= len(buffer):
+                    continue
+                claimed.add(index)
+                length = len(buffer[index - 1].text)
+                if chunk and size + 1 + length > cap:
+                    chunks.append(chunk)
+                    chunk, size = [], 0
+                chunk.append(index)
+                size += length + (1 if len(chunk) > 1 else 0)
+            if chunk:
+                chunks.append(chunk)
+            return chunks
+
+        def text(indices):
+            return "\n".join(buffer[i - 1].text for i in indices)
+
+        for fragment in result.completed_events:
+            for chunk in groups(fragment.source_indices):
+                completed.append(CompletedFragment(content_raw=text(chunk), source_indices=chunk,
+                    content_includes_source=True, is_split_prefix=fragment.is_split_prefix))
+        for item in result.new_unclosed:
+            chunks = groups(item.source_indices)
+            for chunk in chunks[:-1]:
+                completed.append(CompletedFragment(content_raw=text(chunk), source_indices=chunk,
+                    content_includes_source=True, is_split_prefix=True))
+            if chunks:
+                residual.append(NewUnclosed(content=text(chunks[-1]), source_indices=chunks[-1]))
+        unclaimed = [i for i in range(1, len(buffer) + 1) if i not in claimed]
+        # Unclaimed source sentences remain buffered; never silently disappear.
+        for chunk in groups(unclaimed):
+            residual.append(NewUnclosed(content=text(chunk), source_indices=chunk))
+        return BoundaryResult(completed_events=completed, new_unclosed=residual, disentangle=True)
+
     def _dominant_residual_id(
         self,
         indices: list[int],
@@ -467,6 +527,7 @@ class MetabolismService:
         known_roles_hint: list[Role] | None = None,
         pre_role_entries: list[EventRoleEntry] | None = None,
         memory: MemoryExperience | None = None,
+        force_save: bool = False,
     ) -> list[Event]:
         """按模型的句子分组封存。稳定编号由句子来源决定，不用模型的临时 id。"""
         sealed: list[Event] = []
@@ -479,14 +540,14 @@ class MetabolismService:
             indices = [i for i in frag.source_indices if 1 <= i <= len(buffer)]
             if not indices:
                 continue
-            if not self._length_accepted(len(frag.content_raw)):
+            if not force_save and not frag.is_split_prefix and not self._length_accepted(len(frag.content_raw)):
                 residual_id = self._allocate_residual_id(indices, buffer, taken)
                 for index in indices:
                     residual_of[index] = residual_id
                 continue
             event = self._event_svc.seal_event(
                 frag.content_raw,
-                seal_reason="closed",
+                seal_reason="split" if frag.is_split_prefix else "closed",
                 **self._seal_memory_kwargs(
                     memory,
                     content=frag.content_raw,
@@ -534,11 +595,7 @@ class MetabolismService:
                 if loose_id is None:
                     loose_id = f"UC-{secrets.token_hex(4)}"
                 residual_id = loose_id
-            rebuilt.append(BufferSentence(
-                text=sentence.text,
-                residual_id=residual_id,
-                interlocutor_attributions=list(sentence.interlocutor_attributions),
-            ))
+            rebuilt.append(sentence.model_copy(update={"residual_id": residual_id}))
 
         grouped: dict[str, list[str]] = {}
         grouped_interlocutors: dict[str, list[InterlocutorAttribution]] = {}
@@ -765,63 +822,51 @@ class MetabolismService:
         手动触发或长度被迫兜底：将残影与当前输入合并后尽可能封存；遍历未完成库中已有内容的条目逐一封存并删除；
         最后清空残影。用于用户显式「保存记忆」或文本溢出边界强制回收。
         """
-        sealed: list[Event] = []
+        return self._close_lines(unclosed, raw_input, memory=memory, input_id=input_id,
+            known_roles_hint=known_roles_hint, pre_role_entries=pre_role_entries)
 
-        combined = (shadow_content + "\n" + raw_input).strip()
-        if combined:
+    def _line_buffer(self, lines):
+        result = []
+        for line in lines:
+            if line.buffer_items:
+                result.extend(line.buffer_items)
+            else:
+                result.extend(BufferSentence(text=text, residual_id=line.id,
+                    interlocutor_attributions=list(line.interlocutor_attributions))
+                    for text in segment_sentences(line.merged_content))
+        return self._bounded_sentences(result)
+
+    def _close_lines(self, lines, raw_input="", *, memory, input_id,
+                     known_roles_hint, pre_role_entries, semantic=None):
+        from ..skills.boundary_detection import BoundaryResult, CompletedFragment
+        buffer = self._line_buffer(lines)
+        buffer.extend(self._bounded_sentences(_new_buffer_items(raw_input, memory)))
+        groups = semantic.completed_events if semantic is not None else []
+        claimed = {i for fragment in groups for i in fragment.source_indices}
+        groups = list(groups) + [CompletedFragment(content_raw="", source_indices=list(item.source_indices))
+            for item in (semantic.new_unclosed if semantic is not None else [])]
+        claimed.update(i for group in groups for i in group.source_indices)
+        groups.append(CompletedFragment(content_raw="", source_indices=[i
+            for i in range(1, len(buffer) + 1) if i not in claimed]))
+        # Without semantic grouping, retain each old line's boundary and pack the
+        # ordered source sentences into bounded events rather than one per sentence.
+        if semantic is None or not claimed:
+            groups = [CompletedFragment(content_raw="", source_indices=list(range(1,len(buffer)+1)))]
+        result = self._bound_groups(BoundaryResult(completed_events=groups, disentangle=True), buffer)
+        sealed = []
+        for fragment in result.completed_events:
+            selected = _buffer_items_for_content(fragment.content_raw, buffer, fragment.source_indices)
             event = self._event_svc.seal_event(
-                combined,
-                is_suspicious=is_suspicious,
-                seal_reason="truncated",
-                **self._seal_memory_kwargs(
-                    memory,
-                    content=combined,
-                    input_id=input_id,
-                    known_roles_hint=known_roles_hint,
-                    pre_role_entries=pre_role_entries,
-                    interlocutor_attributions=_unique_interlocutors(
-                        *(ue.interlocutor_attributions for ue in unclosed),
-                        _interlocutors_for_event(combined, memory),
-                    ),
-                    buffer_items=[
-                        *(item for ue in unclosed for item in ue.buffer_items),
-                        *_new_buffer_items(raw_input, memory),
-                    ],
-                ),
-            )
+                fragment.content_raw, seal_reason="truncated",
+                **self._seal_memory_kwargs(memory, content=fragment.content_raw,
+                    input_id=input_id, known_roles_hint=known_roles_hint,
+                    pre_role_entries=pre_role_entries, buffer_items=selected,
+                    interlocutor_attributions=_interlocutors_from_buffer(selected)))
             sealed.append(event)
-
-        for ue in unclosed:
-            if ue.total_length > 0:
-                event = self._event_svc.seal_event(
-                    ue.merged_content,
-                    is_suspicious=is_suspicious,
-                    split_prefix_event_ids=list(ue.split_prefix_event_ids or []) or None,
-                    seal_reason="truncated",
-                    **self._seal_memory_kwargs(
-                        memory,
-                        content=ue.merged_content,
-                        input_id=input_id,
-                        known_roles_hint=known_roles_hint,
-                        pre_role_entries=pre_role_entries,
-                        interlocutor_attributions=ue.interlocutor_attributions,
-                        buffer_items=ue.buffer_items,
-                    ),
-                )
-                # 反向链：force_save 也要登记 successor。
-                if ue.split_prefix_event_ids and self._event_repo is not None:
-                    for prefix_id in ue.split_prefix_event_ids:
-                        try:
-                            self._event_repo.append_split_successor(prefix_id, event.event_id)
-                        except Exception:  # noqa: BLE001
-                            logger.debug(
-                                "append_split_successor(%s, %s) failed; skipping",
-                                prefix_id, event.event_id, exc_info=True,
-                            )
-                sealed.append(event)
-            self._repo.delete_unclosed_event(ue.id)
-
-        self._repo.update_shadow(Shadow(content="", updated_at=datetime.now()))
+        # Only consume source lines after all their sealed representations succeed.
+        for line in lines:
+            self._repo.delete_unclosed_event(line.id)
+        self._rebuild_shadow()
         return sealed
 
     @staticmethod
@@ -854,8 +899,9 @@ class MetabolismService:
                 "input_id": memory.segment_id,
                 "subject_id": memory.subject_id,
                 "objects": objects,
-                "source_ids": memory.source_ids,
-                "occurred_at": memory.occurred_at,
+                "source_ids": tuple(dict.fromkeys(s for item in buffer_items for s in item.source_ids)) if buffer_items else memory.source_ids,
+                "occurred_at": min((item.occurred_at for item in buffer_items if item.occurred_at), key=lambda value: value.timestamp(), default=memory.occurred_at) if buffer_items else memory.occurred_at,
+                "source_dates": sorted({item.occurred_at.isoformat() for item in buffer_items if item.occurred_at}) if buffer_items else ([memory.occurred_at.isoformat()] if memory.occurred_at else []),
                 "origin": memory.origin,
                 "interlocutor_attributions": attributions,
             }
@@ -886,16 +932,10 @@ class MetabolismService:
         for ue in unclosed:
             if ue.total_length < force_threshold:
                 continue
-            event = self._seal_unclosed_as_event(
-                ue,
-                memory=memory,
-                input_id=None,
-                known_roles_hint=None,
-                pre_role_entries=None,
-                seal_reason="truncated",
-            )
+            events = self._close_lines([ue], memory=memory, input_id=None,
+                known_roles_hint=None, pre_role_entries=None)
             sealed_ids.add(ue.id)
-            logger.info("Force-sealed unclosed %s as event %s (physical-redline tier)", ue.id, event.event_id)
+            logger.info("Physical redline sealed %s into %d bounded events", ue.id, len(events))
 
         self._forget_stale_unclosed([ue for ue in unclosed if ue.id not in sealed_ids])
         self._rebuild_shadow()
@@ -931,17 +971,8 @@ class MetabolismService:
                 remaining.append(ue)
                 continue
             if (ue.formation_role or "residual") == "formed":
-                logger.info("Sealing held event %s after wait (closed)", ue.id)
-                sealed.append(
-                    self._seal_unclosed_as_event(
-                        ue,
-                        memory=memory,
-                        input_id=input_id,
-                        known_roles_hint=known_roles_hint,
-                        pre_role_entries=pre_role_entries,
-                        seal_reason="closed",
-                    )
-                )
+                sealed.extend(self._close_lines([ue], memory=memory, input_id=input_id,
+                    known_roles_hint=known_roles_hint, pre_role_entries=pre_role_entries))
                 continue
             logger.info("Rejudging abandoned residual %s before seal", ue.id)
             sealed.extend(self._rejudge_abandoned(
@@ -1195,72 +1226,15 @@ class MetabolismService:
         pre_role_entries: list[EventRoleEntry] | None,
     ) -> list[Event]:
         """搁置的残影再划分一次。已有边界的封为 closed，仍未形成的封为 truncated。"""
+        buffer = self._line_buffer(lines)
         try:
-            result = self._boundary.detect("", "", lines)
+            result = self._boundary.detect("", "", lines, buffer_items=buffer)
         except Exception:
-            logger.exception("Formation rejudge failed; sealing residual as truncated")
-            return [
-                self._seal_unclosed_as_event(
-                    ue,
-                    memory=memory,
-                    input_id=input_id,
-                    known_roles_hint=known_roles_hint,
-                    pre_role_entries=pre_role_entries,
-                    seal_reason="truncated",
-                )
-                for ue in lines
-            ]
-
-        sealed: list[Event] = []
-        handled: set[str] = set()
-        no_form = set(result.no_form_texts)
-        if result.completed_events:
-            for frag in result.completed_events:
-                ue, content, prefix = self._resolve_fragment(frag, lines)
-                if ue:
-                    handled.add(ue.id)
-                event = self._event_svc.seal_event(
-                    content,
-                    split_prefix_event_ids=prefix or None,
-                    seal_reason="closed",
-                    **self._seal_memory_kwargs(
-                        memory,
-                        content=content,
-                        input_id=input_id,
-                        known_roles_hint=known_roles_hint,
-                        pre_role_entries=pre_role_entries,
-                        interlocutor_attributions=(
-                            _interlocutors_in_buffer_content(content, ue.buffer_items)
-                            if ue is not None and ue.buffer_items
-                            else ue.interlocutor_attributions if ue and content == ue.merged_content
-                            else []
-                        ),
-                        buffer_items=(
-                            _buffer_items_for_content(content, ue.buffer_items)
-                            if ue is not None else None
-                        ),
-                    ),
-                )
-                sealed.append(event)
-                if ue is not None:
-                    self._repo.delete_unclosed_event(ue.id)
-                    self._raise_dormant_same_object([event])
-        for ue in lines:
-            if ue.id in handled:
-                continue
-            if ue.merged_content and ue.merged_content in no_form:
-                logger.info("Dust exit on rejudge, not stored: %s", ue.merged_content[:200])
-                self._repo.delete_unclosed_event(ue.id)
-                continue
-            sealed.append(self._seal_unclosed_as_event(
-                ue,
-                memory=memory,
-                input_id=input_id,
-                known_roles_hint=known_roles_hint,
-                pre_role_entries=pre_role_entries,
-                seal_reason="truncated",
-            ))
-        return sealed
+            logger.exception("Formation rejudge failed; preserving bounded original source")
+            result = None
+        return self._close_lines(lines, memory=memory, input_id=input_id,
+            known_roles_hint=known_roles_hint, pre_role_entries=pre_role_entries,
+            semantic=result)
 
     # ------------------------------------------------------------------
     @staticmethod

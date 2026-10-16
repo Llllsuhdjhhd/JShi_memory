@@ -10,6 +10,7 @@ JShi_memory 是匠石（JShi）使用的记忆后端项目。Python 包名为 `r
 - [回忆检索](docs/recall.md)：过滤、语义/词面检索、近因与长期通道、排序和预算。
 - [匠石交互](docs/jshi-integration.md)：MemoryBackendPort、字段映射和 HTTP 接口。
 - [开发与验证](docs/development.md)：环境、配置和测试入口。
+- [LoCoMo 匠石评测](docs/locomo-evaluation.md)：真实核心、英文记忆、答案条目覆盖及费用控制。
 - [草稿箱](docs/drafts/README.md)：模块方案、实施步骤和调试记录的工作区。
 - [历史文档](docs/history/README.md)：本次迁移前的文档原件，供追溯，不作为当前行为依据。
 

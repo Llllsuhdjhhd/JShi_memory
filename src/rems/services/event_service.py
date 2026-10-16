@@ -88,6 +88,7 @@ class EventService:
         objects: dict[str, str] | None = None,
         source_ids: tuple[str, ...] = (),
         occurred_at: datetime | None = None,
+        source_dates: list[str] | None = None,
         origin: str | None = None,
         interlocutor_attributions: list[InterlocutorAttribution] | None = None,
     ) -> Event:
@@ -113,6 +114,18 @@ class EventService:
         """
         if seal_reason not in ("closed", "split", "truncated"):
             seal_reason = "closed"
+
+        if objects is not None and self._config.event_min_chars > 0:
+            maximum = int(self._config.event_min_chars * self._config.event_len_factor)
+            if len(content_raw) >= maximum:
+                raise ValueError(f"Event must be split before sealing: {len(content_raw)} >= {maximum}")
+        if objects is not None and source_ids:
+            # Stable source identity separates retries from genuinely repeated
+            # statements on different occasions. Do not deduplicate text alone.
+            for previous in self._event_repo.list_all():
+                if (previous.subject_id == subject_id and previous.content_raw == content_raw
+                        and set(previous.source_ids) == set(source_ids)):
+                    return previous
 
         # 白皮书 1.2：前置预算计算 —— 在调用任何 LLM 之前确定性地算出各衍生数据项的字符预算
         budget = self._compute_budget(len(content_raw))
@@ -253,6 +266,7 @@ class EventService:
             source_ids=list(source_ids or ()),
             occurred_at=occurred_at,
             summaries=enrichment.summaries,
+            source_dates=source_dates or ([occurred_at.isoformat()] if occurred_at else []),
             summary_lengths=enrichment.summary_lengths,
             actual_max_level=enrichment.actual_max_level,
             role_list=resolved_role_entries,
@@ -371,9 +385,8 @@ class EventService:
     def _compute_budget(self, raw_len: int, role_count_estimate: int = 2) -> CompressionBudget:
         """Pre-compute character budgets for all derived data components.
 
-        根据已知的 ``raw_len`` 和配置的目标压缩率，计算出各衍生数据项的字符预算。
-        针对短文本引入宽恕机制（平滑补偿）：文字越短，允许保留的比例越高。
-        支持多层级指数衰减预算。
+        L1 直接按原文保留比例计算，辅助材料沿用旧预算基准。
+        极短原文允许熔断保底，但 L1 预算不超过原文长度。
         """
         cfg = self._config
         
@@ -388,7 +401,10 @@ class EventService:
         
         # 1. 摘要层级预算 (L1 -> L10 指数衰减)
         summary_total_b = int(total * cfg.budget_ratio_summary)
-        summary_l1 = max(summary_total_b, cfg.summary_fuse_min_chars)
+        summary_l1 = min(raw_len, max(
+            int(raw_len * cfg.summary_l1_retention_ratio),
+            cfg.summary_fuse_min_chars,
+        ))
         summary_budgets = {"L1": summary_l1}
         for i in range(2, 11):
             prev_b = summary_budgets[f"L{i-1}"]
@@ -412,7 +428,7 @@ class EventService:
 
         return CompressionBudget(
             raw_len=raw_len,
-            total_budget=total,
+            total_budget=total - summary_total_b + summary_l1,
             summary_level_budgets=summary_budgets,
             snapshot_level_budgets=snapshot_budgets,
             wp_budget_per_role=max(wp_b, 10),

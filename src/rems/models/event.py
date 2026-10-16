@@ -120,7 +120,7 @@ class CompressionBudget(BaseModel):
     支持多层级指数级递减预算。
     """
     raw_len: int                   # L0 原文字符长度
-    total_budget: int              # raw_len * target_ratio * multiplier
+    total_budget: int              # 独立 L1 预算 + 旧基准扣除摘要份额后的辅助预算
     
     # [L1..L10] 摘要字数上限字典 (key: "L1"..."L10")
     summary_level_budgets: dict[str, int] = Field(default_factory=dict)
@@ -222,6 +222,7 @@ class Event(BaseModel):
 
     # Optional recall metadata (BM25 / literary profile); persisted as recall_metadata JSON.
     keywords: list[str] = Field(default_factory=list)
+    source_dates: list[str] = Field(default_factory=list)
     location: str | None = None
 
     def model_post_init(self, __context: object) -> None:

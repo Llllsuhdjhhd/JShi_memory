@@ -307,7 +307,7 @@ class BoundaryDetectionSkill:
             if not isinstance(item, dict):
                 continue
             indices = normalize_indices(item.get("indices") or item.get("content_raw_indices") or [])
-            indices = [i for i in indices if 1 <= i <= n_sent]
+            indices = [i for i in indices if 1 <= i <= n_sent and i not in claimed]
             if not indices:
                 continue
             claimed.update(indices)

@@ -69,6 +69,7 @@ class EventRepository:
                 forgetting_factor=float(getattr(event, "forgetting_factor", 1.0) or 1.0),
                 seal_reason=getattr(event, "seal_reason", None) or "closed",
                 recall_metadata={
+                    "source_dates": event.source_dates,
                     "keywords": list(getattr(event, "keywords", None) or []),
                     "location": getattr(event, "location", None),
                     "interlocutor_attributions": [
@@ -289,6 +290,7 @@ class EventRepository:
             ptsd_immune=bool(getattr(r, "ptsd_immune", False)),
             origin="external" if (getattr(r, "origin", None) or "") in ("", "normal") else r.origin,
             keywords=list((getattr(r, "recall_metadata", None) or {}).get("keywords") or []),
+            source_dates=list((getattr(r, "recall_metadata", None) or {}).get("source_dates") or []),
             location=getattr(r, "location", None) or (getattr(r, "recall_metadata", None) or {}).get("location"),
             emotion=EmotionalModel(**r.emotion) if (getattr(r, "emotion", None) or None) else None,
             forgetting_factor=float(getattr(r, "forgetting_factor", 1.0) or 1.0),
@@ -529,7 +531,7 @@ class MetabolismRepository:
     def update_shadow(self, shadow: Shadow) -> None:
         with self._db.session() as s:
             record = s.query(ShadowRecord).first()
-            payload = [item.model_dump() for item in shadow.buffer_items]
+            payload = [item.model_dump(mode="json") for item in shadow.buffer_items]
             if record:
                 record.content = shadow.content
                 record.updated_at = shadow.updated_at

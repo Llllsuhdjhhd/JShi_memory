@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from enum import Enum
+from typing import Literal
 
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -73,6 +74,7 @@ class EmbeddingConfig(BaseModel):
     # 向量嵌入：默认本地 SentenceTransformer；可扩展为远程 API。
     provider: str = "local"
     model_name: str = "BAAI/bge-small-zh-v1.5"
+    query_instruction: str = ""
     api_base_url: str | None = None
     api_key: str | None = None
 
@@ -165,6 +167,8 @@ class REMSConfig(BaseSettings):
     # 每次 recall 调用把输入与命中的回忆条目写入 ``recall_traces`` 表；
     # 关闭则回忆起只读路径（不新增记录）。只作观测，不影响召回结果。
     recall_trace_enabled: bool = True
+    # 英文可选整词通道；兼容默认仍保留原双字片段行为。
+    recall_english_word_lexical: bool = False
     # 单条轨迹最多记录多少个命中条目（防御超大 top_k 撑爆 JSON 列）。
     recall_trace_max_items: int = 60
 
@@ -216,6 +220,8 @@ class REMSConfig(BaseSettings):
     recall_relevance_close: float = 0.08
     # 嵌入模型或维度变更时递增。物理集合名会带上这个版本，旧集合不覆盖。
     recall_embedding_version: int = 1
+    # 原文用于寻找事件；压缩层仍用于取回后的预算选级。L1 保留作对照。
+    recall_event_index_level: Literal["L0", "L1"] = "L0"
 
     # ---- Recall: 并发人物提取与多路检索（本轮新增）----
     # 回忆是否等待回忆前的人物提取结果。默认 False：人物提取并发跑，回忆用即时启发式 focus，不阻塞。
@@ -362,17 +368,19 @@ class REMSConfig(BaseSettings):
     wp_role_capacity_divisor: float = 6.6
 
     # ---- Dynamic compression ratio control (白皮书 1.2 前置预算计算) ----
-    # 事件封存时 sum_len / raw_len 的目标比值，默认 1/6.6。
+    # L0→L1 独立保留比例；不再乘入角色/白描/装饰的预算份额。
+    # 作为可调工程起点，不代表人类记忆的实测规律。极短文本仍使用熔断保底。
+    summary_l1_retention_ratio: float = Field(default=1.0 / 3.0, gt=0, le=1)
+    # 旧预算基准，现用于辅助材料，不再决定 L1 或全部衍生内容的总保留比例。
     compression_target_ratio: float = 0.1515
     # 递归摘要指数衰减因子 (L1 -> L10)；每一级相对于上一级的字数限制比例。
     summary_decay_factor: float = 0.5
     # 角色快照指数衰减因子 (L3 -> L2 -> L1)；L2 = L3 * factor, L1 = L2 * factor。
     snapshot_decay_factor: float = 0.6
-    # 缩放因子：在目标压缩率基础上的全局缩放（> 1.0 放松字数，< 1.0 收紧字数）。
-    # 既有递归摘要熔断等逻辑保持不变，预算约束通过该因子叠加于其上。
+    # 辅助材料预算缩放；L1 由 summary_l1_retention_ratio 独立控制。
     compression_budget_multiplier: float = 1.0
-    # 分项预算占总预算的比例（合计应为 1.0）。
-    budget_ratio_summary: float = 0.40     # 默认级摘要
+    # 旧预算基准的分项份额；summary 份额仅用于总预算账面替换，L1 不受它限制。
+    budget_ratio_summary: float = 0.40
     budget_ratio_snapshot: float = 0.25    # 角色快照（各角色均分）
     budget_ratio_wp: float = 0.25          # 角色白描条目（各角色均分）
     budget_ratio_decoration: float = 0.10  # 装饰

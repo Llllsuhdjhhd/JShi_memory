@@ -78,8 +78,9 @@ class HashEmbedding:
 class SentenceTransformerEmbedding:
     """本地 sentence-transformers 嵌入（bge-base-zh / BGE-M3 等）。"""
 
-    def __init__(self, model_name: str):
+    def __init__(self, model_name: str, query_instruction: str = ""):
         self._model_name = model_name
+        self._query_instruction = query_instruction
         self._model = None
         self._lock = threading.Lock()
 
@@ -94,10 +95,44 @@ class SentenceTransformerEmbedding:
             self._ensure()
             return self._model.encode(list(texts), normalize_embeddings=True).tolist()
 
+    def split_document(self, text: str) -> list[str]:
+        """按实际编码器 token 上限分块；保留原文切片和相邻 32 token 重叠。"""
+        with self._lock:
+            self._ensure()
+            tokenizer = self._model.tokenizer
+            capacity = int(self._model.max_seq_length) - tokenizer.num_special_tokens_to_add(pair=False)
+            if capacity < 2:
+                raise ValueError("Encoder document capacity is too small")
+            offsets = tokenizer(text, add_special_tokens=False, truncation=False,
+                                return_offsets_mapping=True)["offset_mapping"]
+            if not offsets:
+                return [text]
+            chunks = []
+            start = 0
+            while start < len(offsets):
+                end = min(start + capacity, len(offsets))
+                left = 0 if start == 0 else offsets[start][0]
+                right = len(text) if end == len(offsets) else offsets[end][0]
+                chunk = text[left:right]
+                # Re-tokenizing a substring can change a boundary wordpiece.
+                while len(tokenizer(chunk, add_special_tokens=True)["input_ids"]) > self._model.max_seq_length:
+                    end -= 1
+                    if end <= start:
+                        raise ValueError("Unable to form an encoder-sized raw chunk")
+                    right = offsets[end][0]
+                    chunk = text[left:right]
+                chunks.append(chunk)
+                if end == len(offsets):
+                    break
+                start = max(start + 1, end - min(32, capacity // 4))
+            return chunks
+
     def embed_query(self, text: str) -> list[float]:
         with self._lock:
             self._ensure()
-            return self._model.encode([text], normalize_embeddings=True)[0].tolist()
+            return self._model.encode(
+                [self._query_instruction + text], normalize_embeddings=True
+            )[0].tolist()
 
 
 class NullReranker:
@@ -238,7 +273,8 @@ class QdrantRecallVectorStore:
                 for point in points:
                     payload = point.payload or {}
                     if payload.get("type") == "event":
-                        found.append(event_id)
+                        index = int(payload.get("chunk_index") or 0)
+                        found.append(event_id if index == 0 else f"{event_id}#raw#{index}")
                     elif payload.get("type") == "object_event_fact" and payload.get("object_id"):
                         found.append(f"{event_id}#fact#{payload['object_id']}")
                 if offset is None:

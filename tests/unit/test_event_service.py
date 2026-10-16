@@ -24,6 +24,24 @@ def event_service(config: REMSConfig, db: Database, fake_llm: FakeLLM, tmp_dir):
     return EventService(config, fake_llm, event_repo, None, enrichment_skill)
     
 
+def test_l1_budget_is_independent_of_auxiliary_allocations(event_service):
+    # L1 must keep its one-third allowance even when auxiliary budgets change.
+    baseline = event_service._compute_budget(2000, role_count_estimate=1)
+    assert baseline.summary_level_budgets["L1"] == 666
+    cfg = event_service._config
+    cfg.budget_ratio_summary = 0.05
+    cfg.compression_target_ratio = 0.05
+    cfg.compression_budget_multiplier = 0.2
+    changed = event_service._compute_budget(2000, role_count_estimate=20)
+    assert changed.summary_level_budgets == baseline.summary_level_budgets
+    assert changed.snapshot_level_budgets != baseline.snapshot_level_budgets
+
+
+def test_l1_ratio_can_be_tuned_without_expanding_short_original(event_service):
+    event_service._config.summary_l1_retention_ratio = 0.5
+    assert event_service._compute_budget(2000).summary_level_budgets["L1"] == 1000
+    assert event_service._compute_budget(10).summary_level_budgets["L1"] == 10
+
 
 class TestSealEvent:
     def test_seal_creates_event(self, event_service: EventService, fake_llm: FakeLLM):

@@ -64,6 +64,8 @@ class SubSegment(BaseModel):
     text: str
     objects: dict[str, str] = Field(default_factory=dict)
     interlocutor_object_id: str | None = None
+    occurred_at: datetime | None = None
+    source_ids: tuple[str, ...] = ()
 
 
 class MemoryBatch(BaseModel):
