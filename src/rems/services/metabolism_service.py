@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import hashlib
+import json
 import secrets
 from datetime import datetime, timedelta
 from typing import Any, Optional
@@ -63,11 +65,23 @@ def _objects_from_buffer(items: list[BufferSentence]) -> dict[str, str]:
 
 def _new_buffer_items(raw_input: str, memory: MemoryExperience | None) -> list[BufferSentence]:
     """Keep the original segment's object map on each buffered sentence."""
+    def sentences(text, source_ids, segment_id):
+        cursor = 0
+        for sentence in segment_sentences(text):
+            offset = text.index(sentence, cursor)
+            cursor = offset + len(sentence)
+            identity = None
+            if memory is not None and (source_ids or segment_id):
+                payload = [memory.subject_id, list(source_ids) or [segment_id], offset, sentence]
+                identity = hashlib.sha256(json.dumps(payload, ensure_ascii=False).encode()).hexdigest()
+            yield sentence, identity
+
     subs = getattr(memory, "sub_segments", None) if memory is not None else None
     if subs:
         return [
             BufferSentence(
                 text=sentence,
+                fragment_id=identity,
                 objects=dict(sub.objects),
                 occurred_at=sub.occurred_at,
                 source_ids=sub.source_ids,
@@ -81,18 +95,20 @@ def _new_buffer_items(raw_input: str, memory: MemoryExperience | None) -> list[B
                 ),
             )
             for sub in subs
-            for sentence in segment_sentences(sub.text)
+            for sentence, identity in sentences(sub.text, sub.source_ids, sub.segment_id)
         ]
     return [
         BufferSentence(
             text=sentence,
+            fragment_id=identity,
             objects=_objects_for_event(sentence, memory),
             occurred_at=memory.occurred_at if memory else None,
             source_ids=memory.source_ids if memory else (),
             segment_id=memory.segment_id if memory else None,
             interlocutor_attributions=_interlocutors_for_event(sentence, memory),
         )
-        for sentence in segment_sentences(raw_input)
+        for sentence, identity in sentences(raw_input, memory.source_ids if memory else (),
+                                             memory.segment_id if memory else None)
     ]
 
 
@@ -333,8 +349,8 @@ class MetabolismService:
         )
 
         buffer = self._load_buffer(unclosed)
-        buffer.extend(_new_buffer_items(raw_input, memory))
         buffer = self._bounded_sentences(buffer)
+        buffer.extend(self._admit_items(raw_input, memory, buffer))
 
         def _run_boundary():
             if ingest_session is not None and getattr(ingest_session, "turn", 0) >= 1:
@@ -431,6 +447,8 @@ class MetabolismService:
     def _length_accepted(self, length: int) -> bool:
         """ev_len ≤ L < k·ev_len。ev_len 为 0 时不设尺度。"""
         ev_len = int(self._config.event_min_chars or 0)
+        if self._config.memory_refinement.enabled:
+            return length <= self._config.memory_refinement.small_event_max_chars
         if ev_len <= 0:
             return True
         factor = float(self._config.event_len_factor or 2)
@@ -438,17 +456,42 @@ class MetabolismService:
 
     def _bounded_sentences(self, buffer: list[BufferSentence]) -> list[BufferSentence]:
         """Lossless last resort for an individual sentence longer than the event cap."""
-        if self._config.event_min_chars <= 0:
+        if self._config.event_min_chars <= 0 and not self._config.memory_refinement.enabled:
             return buffer
-        cap = max(1, int(self._config.event_min_chars * self._config.event_len_factor) - 1)
-        return [item.model_copy(update={"text": item.text[start:start + cap]})
+        cap = (self._config.memory_refinement.small_event_max_chars
+               if self._config.memory_refinement.enabled
+               else max(1, int(self._config.event_min_chars * self._config.event_len_factor) - 1))
+        return [item.model_copy(update={"text": item.text[start:start + cap],
+                    "fragment_id": (f"{item.fragment_id}:{start}:{cap}"
+                                    if item.fragment_id and len(item.text) > cap else item.fragment_id)})
                 for item in buffer for start in range(0, len(item.text), cap)]
+
+    def _admit_items(self, raw_input, memory, pending):
+        """A partially acknowledged batch may replay both pending and sealed sources."""
+        incoming = self._bounded_sentences(_new_buffer_items(raw_input, memory))
+        if not self._config.memory_refinement.enabled or memory is None:
+            return incoming
+        seen = {item.fragment_id for item in pending if item.fragment_id}
+        if self._event_repo is not None:
+            seen.update(identity for event in self._event_repo.list_all()
+                        if event.subject_id == memory.subject_id
+                        for identity in event.source_fragment_ids)
+        admitted = []
+        for item in incoming:
+            if item.fragment_id and item.fragment_id in seen:
+                continue
+            admitted.append(item)
+            if item.fragment_id:
+                seen.add(item.fragment_id)
+        return admitted
 
     def _bound_groups(self, result, buffer):
         """Apply event limits after semantic grouping; sentence ownership stays disjoint."""
         from ..skills.boundary_detection import BoundaryResult, CompletedFragment, NewUnclosed
         cap = (max(1, int(self._config.event_min_chars * self._config.event_len_factor) - 1)
                if self._config.event_min_chars > 0 else sum(len(item.text) + 1 for item in buffer) + 1)
+        if self._config.memory_refinement.enabled:
+            cap = self._config.memory_refinement.small_event_max_chars
         claimed = set()
         completed, residual = [], []
 
@@ -681,6 +724,8 @@ class MetabolismService:
         # split_id → prefix event_id，便于 tail UC 落库时回写 split_prefix_event_ids。
         split_id_to_prefix_event_id: dict[str, str] = {}
         minimum = int(self._config.event_min_chars or 0)
+        if self._config.memory_refinement.enabled:
+            minimum = 0
 
         for frag in result.completed_events:
             ue, content, inherited_prefix_chain = self._resolve_fragment(frag, unclosed)
@@ -840,7 +885,7 @@ class MetabolismService:
                      known_roles_hint, pre_role_entries, semantic=None):
         from ..skills.boundary_detection import BoundaryResult, CompletedFragment
         buffer = self._line_buffer(lines)
-        buffer.extend(self._bounded_sentences(_new_buffer_items(raw_input, memory)))
+        buffer.extend(self._admit_items(raw_input, memory, buffer))
         groups = semantic.completed_events if semantic is not None else []
         claimed = {i for fragment in groups for i in fragment.source_indices}
         groups = list(groups) + [CompletedFragment(content_raw="", source_indices=list(item.source_indices))
@@ -900,6 +945,7 @@ class MetabolismService:
                 "subject_id": memory.subject_id,
                 "objects": objects,
                 "source_ids": tuple(dict.fromkeys(s for item in buffer_items for s in item.source_ids)) if buffer_items else memory.source_ids,
+                "source_fragment_ids": list(dict.fromkeys(item.fragment_id for item in (buffer_items or []) if item.fragment_id)),
                 "occurred_at": min((item.occurred_at for item in buffer_items if item.occurred_at), key=lambda value: value.timestamp(), default=memory.occurred_at) if buffer_items else memory.occurred_at,
                 "source_dates": sorted({item.occurred_at.isoformat() for item in buffer_items if item.occurred_at}) if buffer_items else ([memory.occurred_at.isoformat()] if memory.occurred_at else []),
                 "origin": memory.origin,

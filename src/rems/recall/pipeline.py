@@ -37,6 +37,7 @@ def _shown_object_id(ev: Event, wanted: tuple[str, ...]) -> str | None:
         for oid in wanted:
             if (
                 oid in historical_interlocutor_ids
+                or oid in ev.refinement_objects.values()
                 or any((not role.is_subject) and role.role_id == oid for role in ev.role_list)
             ):
                 return oid
@@ -47,7 +48,7 @@ def _event_object_id(ev: Event) -> str | None:
     """取这条记忆事件自己的对象（外部角色），不做成查询对象。"""
     others = [r for r in ev.role_list if not r.is_subject]
     if not others:
-        return None
+        return next(iter(ev.refinement_objects.values()), None)
     others.sort(key=lambda r: _IMPORTANCE_ORDER.get(r.importance.value, 99))
     return others[0].role_id
 
@@ -372,6 +373,7 @@ class RecallPipeline:
                 semantic = self._semantic_signals(
                     subject_id, q, wanted, time_range,
                     query_vector=query_vector,
+                    event_ids=tuple(event.event_id for event in events),
                     top_k=max(self._top_k, len(events) * 4),
                 )
                 if self._recency_enabled:
@@ -451,7 +453,12 @@ class RecallPipeline:
 
     def index_event(self, event: Event) -> int:
         """L0 分块索引事件，或兼容旧 L1 事件与对象事实索引。"""
+        if event.refinement_hidden_by:
+            for key in self._vector_store.list_event_logical_ids(event.event_id):
+                self._vector_store.delete(key)
+            return 0
         object_ids = [role.role_id for role in event.role_list if not role.is_subject]
+        object_ids.extend(event.refinement_objects.values())
         event_object_ids = list(dict.fromkeys((
             *object_ids,
             *(item.object_id for item in event.interlocutor_attributions if item.object_id),
@@ -511,6 +518,7 @@ class RecallPipeline:
         text: str,
     ) -> dict:
         moment = event.occurred_at or event.create_time
+        from ..services.refinement_service import utc
         return {
             "type": material_type,
             "subject_id": event.subject_id,
@@ -522,6 +530,8 @@ class RecallPipeline:
             "embedding_model": self._embedding_model,
             "embedding_version": self._embedding_version,
             "occurred_at": moment.timestamp() if moment else None,
+            "event_time_start": utc(event.event_time_start or moment).timestamp(),
+            "event_time_end": utc(event.event_time_end or moment).timestamp(),
         }
 
     def _index_unchanged(self, logical_id: str, payload: dict) -> bool:
@@ -538,6 +548,8 @@ class RecallPipeline:
             and existing.get("representation_level") == payload["representation_level"]
             and existing.get("object_id") == payload.get("object_id")
             and existing.get("object_ids") == payload.get("object_ids")
+            and existing.get("event_time_start") == payload.get("event_time_start")
+            and existing.get("event_time_end") == payload.get("event_time_end")
         )
 
     def _wanted_objects(
@@ -560,6 +572,9 @@ class RecallPipeline:
         if time_range is None:
             return True
         start, end = time_range
+        if ev.event_time_start is not None and ev.event_time_end is not None:
+            from ..services.refinement_service import utc
+            return utc(ev.event_time_start) <= utc(end) and utc(ev.event_time_end) >= utc(start)
         moment = ev.occurred_at or ev.create_time
         if moment is None:
             return False
@@ -567,6 +582,8 @@ class RecallPipeline:
 
     def _matches_objects(self, subject_id: str, ev: Event, wanted: tuple[str, ...]) -> bool:
         if not wanted:
+            return True
+        if any(oid in wanted for oid in ev.refinement_objects.values()):
             return True
         if any(
             item.object_id in wanted
@@ -604,7 +621,9 @@ class RecallPipeline:
         ranges = None
         if time_range is not None:
             start, end = time_range
-            ranges = {"occurred_at": (start.timestamp(), end.timestamp())}
+            from ..services.refinement_service import utc
+            ranges = {"event_time_start": (None, utc(end).timestamp()),
+                      "event_time_end": (utc(start).timestamp(), None)}
         hits = self._vector_store.search(
             vector,
             top_k=self._top_k if top_k is None else top_k,
@@ -667,7 +686,7 @@ class RecallPipeline:
             for key, text in (ev.summaries or {}).items()
             if text and str(text).strip()
         }
-        event_text = "\n".join(levels.values())
+        event_text = ev.content_raw if ev.memory_stage == 0 else "\n".join(levels.values())
         out = [_Candidate(
             material_type="event",
             event_id=ev.event_id,
@@ -852,7 +871,8 @@ class RecallPipeline:
                 picked = (cand.raw, "raw") if len(cand.raw) <= remaining else None
             else:
                 picked = select_representation(
-                    cand.levels, cand.raw, remaining - len(date_note), expand_raw=expand_raw,
+                    cand.levels, cand.raw, remaining - len(date_note),
+                    expand_raw=expand_raw or bool(cand.event and cand.event.memory_stage == 0),
                 )
             if picked is None:
                 continue
@@ -900,6 +920,9 @@ class RecallPipeline:
         return levels.get("L1") or ""
 
     def _fact_levels(self, role_id: str, event_id: str) -> dict[str, str]:
+        event = self._event_repo.get(event_id)
+        if event and role_id in event.refinement_object_levels:
+            return dict(event.refinement_object_levels[role_id])
         if self._role_repo is None:
             return {}
         entry = self._role_repo.get_white_painting_by_event(role_id, event_id)
@@ -919,7 +942,7 @@ class RecallPipeline:
     def _candidate_events(self, subject_id: str) -> list[Event]:
         return [
             e for e in self._event_repo.list_all(exclude_tombstoned=True)
-            if (e.subject_id or "") == subject_id and not e.is_tombstoned
+            if (e.subject_id or "") == subject_id and not e.is_tombstoned and not e.refinement_hidden_by
         ]
 
     def _retrieval_text(self, ev: Event) -> str:

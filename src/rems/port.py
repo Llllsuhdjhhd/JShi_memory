@@ -4,7 +4,7 @@
 MetabolismService / EventService 等（详见 docs/memory.md 输入协议）。
 
 硬约束：
-- 无抽象事件（不做频繁子集挖掘、ASF、抽象合成）；
+- 不做频繁子集挖掘或 ASF；后台可按时间阶段提炼连续的已存事件；
 - 不建角色系统（对象一律用 01 的 object_id）；
 - 只做记忆，不决定主体面；原文保全。
 """

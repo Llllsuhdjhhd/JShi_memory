@@ -87,6 +87,7 @@ class EventEnrichmentSkill:
         names_only: bool = False,
         memory_objects: dict[str, str] | None = None,
         seal_reason: str = "closed",
+        source_context: str | None = None,
     ) -> EnrichmentResult:
         memory_mode = memory_objects is not None
         if memory_mode:
@@ -164,6 +165,10 @@ class EventEnrichmentSkill:
                 "entity, number and time. L1 must fit its character budget; later levels compress "
                 "the preceding level. Stop before a level whose budget is <= " + str(fuse_min) + ".")
 
+        if source_context:
+            user_msg += ("\n\nSource-unit provenance (not additional narrative):\n" + source_context +
+                         "\nAnchor each relative date to its own source unit, never the refinement date. "
+                         "Do not merge different people's statements or different dates into one fact.")
         data = self._llm.complete_json(
             "event_enrichment",
             [

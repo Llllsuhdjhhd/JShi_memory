@@ -3,7 +3,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # REMS 全局配置（对照《REMS 记忆系统规范解析》白皮书）。
@@ -14,6 +14,34 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # - tombstone_prefix：4.3 墓碑化时在 insight 中的审计标记前缀；
 # - user_mode / core_user_role_id / active_participants：2.2 单人/多人模式与提示词注入引擎。
 # 加载：环境变量前缀 REMS_，嵌套键用 __ 分隔；可选 .env。
+
+
+class RefinementStage(BaseModel):
+    age_days: int = Field(gt=0)
+    l1_retention_ratio: float = Field(default=1 / 3, gt=0, le=1)
+
+
+class MemoryRefinementConfig(BaseModel):
+    enabled: bool = True
+    stages: list[RefinementStage] = Field(default_factory=lambda: [
+        RefinementStage(age_days=90), RefinementStage(age_days=365),
+        RefinementStage(age_days=1095),
+    ])
+    candidate_chars: int = Field(default=5000, gt=0)
+    batch_chars: int = Field(default=2000, gt=0)
+    direction: Literal["backward", "forward"] = "backward"
+    small_event_max_chars: int = Field(default=2000, gt=0)
+    max_batches_per_stage: int = Field(default=1, gt=0)
+    interval_seconds: int = Field(default=3600, gt=0)
+
+    @model_validator(mode="after")
+    def validate_stages(self):
+        ages = [stage.age_days for stage in self.stages]
+        if not ages or ages != sorted(set(ages)):
+            raise ValueError("Refinement ages must be nonempty and strictly increasing")
+        if self.batch_chars > self.candidate_chars:
+            raise ValueError("batch_chars cannot exceed candidate_chars")
+        return self
 
 
 class UserMode(str, Enum):
@@ -371,6 +399,7 @@ class REMSConfig(BaseSettings):
     # L0→L1 独立保留比例；不再乘入角色/白描/装饰的预算份额。
     # 作为可调工程起点，不代表人类记忆的实测规律。极短文本仍使用熔断保底。
     summary_l1_retention_ratio: float = Field(default=1.0 / 3.0, gt=0, le=1)
+    memory_refinement: MemoryRefinementConfig = Field(default_factory=MemoryRefinementConfig)
     # 旧预算基准，现用于辅助材料，不再决定 L1 或全部衍生内容的总保留比例。
     compression_target_ratio: float = 0.1515
     # 递归摘要指数衰减因子 (L1 -> L10)；每一级相对于上一级的字数限制比例。

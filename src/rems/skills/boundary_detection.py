@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field
 
 from ..config import REMSConfig
 from ..llm.provider import LLMProvider
-from ..llm.prompts import BOUNDARY_SYSTEM, BOUNDARY_USER, build_user_mode_block
+from ..llm.prompts import BOUNDARY_SYSTEM, BOUNDARY_USER, SMALL_EVENT_BOUNDARY_SYSTEM, build_user_mode_block
 from ..models.metabolism import BufferSentence, UnclosedEvent
 from ..utils.text import (
     segment_sentences,
@@ -186,13 +186,18 @@ class BoundaryDetectionSkill:
             ctx = self.build_index_context(shadow_content, current_input, unclosed_events)
             sentences = ctx["sentences"]
         ev_len = int(self._config.event_min_chars or 0)
+        lightweight = self._config.memory_refinement.enabled
+        if lightweight:
+            ev_len = 0
         factor = float(self._config.event_len_factor or 2)
         user_msg = BOUNDARY_USER.format(
             memory_buffer=format_indexed_text(sentences) or "（无）",
             ev_len=ev_len,
             k=f"{factor:g}",
         )
-        system_msg = build_user_mode_block(self._config) + BOUNDARY_SYSTEM
+        system_msg = build_user_mode_block(self._config) + (SMALL_EVENT_BOUNDARY_SYSTEM if lightweight else BOUNDARY_SYSTEM)
+        if lightweight:
+            user_msg = "## Memory Buffer\n" + format_indexed_text(sentences)
 
         data = self._llm.complete_json(
             "boundary_detection",

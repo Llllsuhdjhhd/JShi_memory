@@ -245,6 +245,15 @@ class REMSPipeline:
     # 记忆写入端口（docs/memory.md）
     # ------------------------------------------------------------------
 
+    def refine_memory(self, subject_id: str | None = None, *, now: datetime | None = None) -> dict:
+        """Run one bounded background refinement pass; no automatic source expansion."""
+        from .services.refinement_service import RefinementService
+        if self.recall_pipeline is None:
+            raise RuntimeError("Refinement requires the recall index")
+        return RefinementService(self.config, self.event_repo, self.event_service,
+                                 self.recall_pipeline, self.llm).run(
+                                     subject_id or self.config.subject_id, now)
+
     def ingest_batch(self, batch: MemoryBatch) -> BackendIngestResult:
         """记忆写入：整批合并为一段输入走一次代谢（与 rems3 整批语义对齐），
         再按事件内容归属回各 segment 写 stored_marks / 对象时间线 / 向量索引。

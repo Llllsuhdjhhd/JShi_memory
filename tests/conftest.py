@@ -15,6 +15,9 @@ def tmp_dir(tmp_path):
 @pytest.fixture
 def config(tmp_dir):
     cfg = REMSConfig()
+    # Existing fixtures exercise the pre-refinement full-event path.
+    # New refinement tests explicitly enable the production-default lifecycle.
+    cfg.memory_refinement.enabled = False
     cfg.storage.database_url = f"sqlite:///{tmp_dir}/test.db"
     cfg.storage.qdrant_url = ":memory:"
     cfg.embedding.provider = "hash"  # Use deterministic hash to avoid downloading models

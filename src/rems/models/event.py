@@ -161,6 +161,7 @@ class Event(BaseModel):
     create_time: datetime = Field(default_factory=datetime.now)
     input_id: Optional[str] = None  # 记录产生此事件的经历段 segment_id（30 侧；docs/memory.md）
     source_ids: list[str] = Field(default_factory=list)  # 来源链（docs/memory.md）
+    source_fragment_ids: list[str] = Field(default_factory=list)
     occurred_at: Optional[datetime] = None  # 经历发生时间；空 = 摄入时刻（docs/memory.md）
     content_raw: str  # L0：基本事件为已闭环事实原文；抽象事件为自子事件归纳的合成描述（白皮书 1.1.2、3.1）。
 
@@ -223,6 +224,16 @@ class Event(BaseModel):
     # Optional recall metadata (BM25 / literary profile); persisted as recall_metadata JSON.
     keywords: list[str] = Field(default_factory=list)
     source_dates: list[str] = Field(default_factory=list)
+    # None: pre-refinement legacy event; 0: lightweight; 1+: age-based stage.
+    memory_stage: int | None = None
+    event_time_start: Optional[datetime] = None
+    event_time_end: Optional[datetime] = None
+    refined_at: Optional[datetime] = None
+    refinement_hidden_by: list[str] = Field(default_factory=list)
+    refinement_objects: dict[str, str] = Field(default_factory=dict)
+    refinement_policy: dict = Field(default_factory=dict)
+    refinement_object_levels: dict[str, dict[str, str]] = Field(default_factory=dict)
+    refinement_source_units: list[dict] = Field(default_factory=list)
     location: str | None = None
 
     def model_post_init(self, __context: object) -> None:

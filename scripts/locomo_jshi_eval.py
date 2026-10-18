@@ -77,6 +77,81 @@ def make_pipe(directory, cfg, llm, encoder):
     return pipe
 
 
+def refine_history(pipe, out, n, result):
+    """Same bounded age replay for fresh ingestion and copied sealed baselines."""
+    if not pipe.config.memory_refinement.enabled:
+        return result
+    from datetime import datetime
+    from rems.eval.runtime import evaluation_clock
+    as_of = datetime.fromisoformat(result["last_date"]) + timedelta(days=1)
+    before = pipe.event_repo.list_all()
+    result = {**result, "pre_refinement_events_this_pass": len(before),
+        "small_events": sum(e.memory_stage == 0 for e in before),
+        "small_event_max_chars": max((len(e.content_raw) for e in before if e.memory_stage == 0), default=0)}
+    log_path = out / "history" / f"c{n}" / "refinement.jsonl"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    for pass_number in range(128):
+        with evaluation_clock(as_of):
+            refined = pipe.refine_memory(SUBJECT, now=as_of)
+        with log_path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(refined, ensure_ascii=False) + "\n")
+        if refined["errors"]:
+            raise RuntimeError(f"Refinement failed: {refined['errors']}")
+        count = sum(b["status"] == "refined" for b in refined["batches"])
+        print(f"refinement pass {pass_number}: {count} batches", flush=True)
+        if not count:
+            break
+    else:
+        raise RuntimeError("Refinement exceeded bounded replay passes")
+    after = pipe.event_repo.list_all()
+    return {**result, "memory_lifecycle": "staged", "refinement_as_of": as_of.isoformat(),
+        "visible_events": sum(not e.refinement_hidden_by for e in after),
+        "hidden_events": sum(bool(e.refinement_hidden_by) for e in after), "events": len(after)}
+
+
+def restore_small_baseline(source_database, pipe):
+    """Copy immutable stage-0 records into a clean ablation DB; never re-extract."""
+    from sqlalchemy import create_engine, select
+    from sqlalchemy.orm import Session
+    from rems.storage.database import EventRecord
+    from rems.storage.repository import EventRepository
+    source_database = Path(source_database).resolve()
+    before = hashlib.sha256(source_database.read_bytes()).hexdigest()
+    if pipe.event_repo.list_all():
+        raise ValueError("Small-event ablation requires an empty destination")
+    engine = create_engine("sqlite:///file:" + source_database.as_posix() + "?mode=ro&uri=true")
+    try:
+        with Session(engine) as session:
+            events = [EventRepository._to_model(row) for row in session.scalars(select(EventRecord))]
+    finally:
+        engine.dispose()
+    roots = [event for event in events if event.memory_stage == 0]
+    if not roots or any(event.is_tombstoned for event in roots):
+        raise ValueError("Expected intact small-event sources")
+    restored_hidden = sum(bool(event.refinement_hidden_by) for event in roots)
+    for event in roots:
+        if event.summaries or event.emotion is not None or event.role_list:
+            raise ValueError("Small-event source unexpectedly enriched")
+        event.refinement_hidden_by = []
+        event.is_abstracted = False
+        pipe.event_repo.save(event)
+        pipe.recall_pipeline.index_event(event)
+    def digest(items):
+        payload = [event.model_dump(mode="json") for event in sorted(items, key=lambda e: e.event_id)]
+        return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+    actual = pipe.event_repo.list_all()
+    if digest(actual) != digest(roots):
+        raise RuntimeError("Restored small events differ beyond visibility flags")
+    if hashlib.sha256(source_database.read_bytes()).hexdigest() != before:
+        raise RuntimeError("Source database changed during read-only extraction")
+    return {"source_database_sha256": before, "small_event_count": len(roots),
+            "small_events_sha256": digest(roots), "excluded_parent_count": len(events)-len(roots),
+            "root_source_ids": len({identity for event in roots for identity in event.source_ids}),
+            "restored_hidden_sources": restored_hidden,
+            "changed_fields": ["refinement_hidden_by", "is_abstracted"],
+            "reingested": False, "reextracted": False, "additional_age_refinement": False}
+
+
 def report(out, manifest, ledger):
     records = []
     for item in manifest["questions"]:
@@ -157,11 +232,15 @@ def main(argv=None):
     ap.add_argument("--default-memory-triggers", action="store_true", help="Use real JShi default trigger conditions with synchronous deterministic dispatch")
     ap.add_argument("--event-index-level", choices=["L0", "L1"], default="L0")
     ap.add_argument("--reuse-baseline", type=Path, help="Reuse sealed events and frozen rubrics; rebuild only the index")
+    ap.add_argument("--small-events-only", action="store_true", help="Restore every stage-0 event from reused baseline; exclude parents and skip age refinement")
+    ap.add_argument("--memory-lifecycle", choices=["staged", "legacy"], default="staged")
     ap.add_argument("--budget", type=float, default=10, help="Cumulative submission limit, maximum 90 yuan")
     ap.add_argument("--no-recall-controls", type=int, default=3)
     args = ap.parse_args(argv)
     if args.conversations < 1 or args.questions < 1 or args.no_recall_controls < 0:
         ap.error("Invalid sample counts")
+    if args.small_events_only and (not args.reuse_baseline or args.memory_lifecycle != "staged"):
+        ap.error("--small-events-only requires --reuse-baseline and staged lifecycle")
     # Keep all artifacts and credentials separate. A report never constructs an API client.
     out = args.out.resolve()
     out.mkdir(parents=True, exist_ok=True)
@@ -176,6 +255,7 @@ def main(argv=None):
     load_jshi(args.jshi)
     cfg = make_config(out / "unused", "not-loaded", english_word_lexical=args.english_word_lexical)
     cfg.recall_event_index_level = args.event_index_level
+    cfg.memory_refinement.enabled = args.memory_lifecycle == "staged"
     source_hash = fingerprint_code(ROOT / "src/rems")
     jshi_hash = fingerprint_code(args.jshi / "src/jshi")
     selected = data[:args.conversations]
@@ -192,6 +272,8 @@ def main(argv=None):
         "seed": args.seed, "conversations": args.conversations, "questions_per_conversation": args.questions,
         "default_memory_triggers": args.default_memory_triggers,
         "event_index_level": args.event_index_level,
+        "memory_lifecycle": args.memory_lifecycle,
+        "small_events_only": args.small_events_only,
         "reuse_baseline": str(args.reuse_baseline.resolve()) if args.reuse_baseline else None,
         "no_recall_controls": args.no_recall_controls, "embedding": "BAAI/bge-small-en-v1.5",
         "category5_protocol": "official_distractor_vs_not_mentioned_choices",
@@ -202,7 +284,7 @@ def main(argv=None):
     if manifest_path.exists():
         manifest = read_json(manifest_path)
         for key, value in settings.items():
-            if manifest.get(key) != value:
+            if manifest.get(key, False) != value if key == "small_events_only" else manifest.get(key) != value:
                 raise RuntimeError(f"Frozen run differs in {key}; use a new output directory")
     else:
         manifest = {**settings, "questions": selection}
@@ -253,6 +335,24 @@ def main(argv=None):
                 baseline = out / "baselines" / f"c{n}"
                 if (baseline / "complete.json").exists():
                     continue
+                if source and not baseline.exists() and args.small_events_only:
+                    original = source / "baselines" / f"c{n}"
+                    info = read_json(original / "complete.json")
+                    baseline.mkdir(parents=True)
+                    pipe = make_pipe(baseline, cfg, llm, encoder)
+                    try:
+                        provenance = restore_small_baseline(original / "rems.db", pipe)
+                    finally:
+                        close_pipeline(pipe)
+                    write_json(out / "baseline_provenance.json", {**provenance,
+                        "source": str(original), "view": "small_events_only",
+                        "final_database_sha256": hashlib.sha256((baseline / "rems.db").read_bytes()).hexdigest()})
+                    write_json(baseline / "complete.json", {**info,
+                        "events": provenance["small_event_count"], "small_events": provenance["small_event_count"],
+                        "visible_events": provenance["small_event_count"], "hidden_events": 0,
+                        "refinement_as_of": None, "memory_lifecycle": "small_events_only"})
+                    print(f"restored {provenance['small_event_count']} original small events, no refinement", flush=True)
+                    continue
                 if source and not baseline.exists():
                     original = source / "baselines" / f"c{n}"
                     info = read_json(original / "complete.json")
@@ -262,17 +362,20 @@ def main(argv=None):
                     pipe = make_pipe(baseline, cfg, llm, encoder)
                     try:
                         scanned, written = pipe.recall_pipeline.backfill_index()
+                        source_sha = hashlib.sha256((original / "rems.db").read_bytes()).hexdigest()
+                        target_sha = hashlib.sha256((baseline / "rems.db").read_bytes()).hexdigest()
+                        if source_sha != target_sha:
+                            raise RuntimeError("Reindex changed the sealed event database")
+                        info = refine_history(pipe, out, n, info)
                     finally:
                         close_pipeline(pipe)
-                    source_sha = hashlib.sha256((original / "rems.db").read_bytes()).hexdigest()
-                    target_sha = hashlib.sha256((baseline / "rems.db").read_bytes()).hexdigest()
-                    if source_sha != target_sha:
-                        raise RuntimeError("Reindex changed the sealed event database")
                     write_json(out / "baseline_provenance.json", {
                         "source": str(original), "source_database_sha256": source_sha,
                         "reindexed_database_sha256": target_sha, "events_scanned": scanned,
                         "points_written": written, "event_index_level": args.event_index_level,
-                        "reingested": False})
+                        "reingested": False,
+                        "additional_age_refinement": cfg.memory_refinement.enabled,
+                        "final_database_sha256": hashlib.sha256((baseline / "rems.db").read_bytes()).hexdigest()})
                     write_json(baseline / "complete.json", info)
                     print(f"reindexed {scanned} events, {written} points", flush=True)
                     continue
@@ -289,6 +392,7 @@ def main(argv=None):
                     else:
                         result = replay_history(pipe, llm, out / "history" / f"c{n}", sample,
                             default_triggers=args.default_memory_triggers)
+                    result = refine_history(pipe, out, n, result)
                     pipe.db.engine.dispose()
                 finally:
                     close_pipeline(pipe)

@@ -3,6 +3,11 @@
 入口为 `scripts/locomo_jshi_eval.py`。使用相邻 `../JShi` 的真实 `SubjectProcess`、
 `CognitionSkill`、`MemoryShell`、REMS3 适配器与本仓记忆后端，不用另写的问答 Agent 代替核心。
 
+当前默认 `--memory-lifecycle staged`：轻量写入后，以最后会话次日为评测时钟执行到龄提炼，
+再回答固定题目。`--memory-lifecycle legacy` 保留旧完整事件路径。
+`--reuse-baseline` 可复用封存库；staged 模式会继续其尚未完成的到龄提炼，来源与新旧校验值单独记录。
+最新实际结果见[取消全部聚合对照](locomo-round6-small-only.md)；聚合版见[来源重投修复复测](locomo-round5-replay-fix.md)，前序机制实现见[第五轮报告](locomo-round5-staged.md)；以下第一轮范围为历史基线说明。
+
 ## 第一轮范围
 
 - 匠石是观察者，LoCoMo 两位说话人是其他人物；保持历史原话，不生成替代回复。

@@ -25,5 +25,10 @@ memory_samples/
 # --- local live tests and dumps ---
 _tmp_*/
 _tmp_*.py
+.tmp/
+tests/boundary_detect_tests/outputs/
 logs/
 runs/
+
+# --- git worktrees kept inside the repo ---
+.worktrees/

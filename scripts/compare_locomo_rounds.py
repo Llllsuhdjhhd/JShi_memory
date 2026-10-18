@@ -31,12 +31,17 @@ def main():
             {"answer": read_json(p / "answers" / (q["safe_id"] + ".json")),
              "grade": read_json(p / "grades" / (q["safe_id"] + ".json"))}
             for p in (first, second)]})
-    reused = (second / "baseline_provenance.json").exists() and read_json(second / "baseline_provenance.json").get("reingested") is False
+    provenance = read_json(second / "baseline_provenance.json") if (second / "baseline_provenance.json").exists() else {}
+    source_run = Path(provenance["source"]).parents[1].resolve() if provenance.get("source") else None
+    reused = (source_run == first.resolve() and provenance.get("reingested") is False
+              and not provenance.get("additional_age_refinement")
+              and provenance.get("view") != "small_events_only")
     result = {"summaries": summaries, "paired_questions": pairs, "samples": samples,
         "limitations": "Same development questions; stochastic model answers and grades, not independent human adjudication.",
         "same_sealed_memory_reindexed": reused}
     write_json(second / "comparison.json", result)
-    lineage = "复用同一封存事件数据库，仅重建索引；未重新提取或压缩事件。" if reused else "第二轮从空库重新写入。"
+    lineage = ("复用同一封存事件数据库，仅重建索引；未重新提取或压缩事件。" if reused else
+               "事件形成或后续提炼有变化，并非固定封存库的单变量对照；具体来源见各轮 manifest 与 baseline_provenance。")
     lines = ["# 两轮逐题自动结果与实际回忆", "", "同一完整历史、同一 30 题及固定评分条目；" + lineage, "",
         "| 指标 | 第一轮 | 第二轮 |", "|---|---:|---:|"]
     for key, title in (("official_f1", "官方 F1"), ("semantic_accuracy", "最终回答语义正确率"),

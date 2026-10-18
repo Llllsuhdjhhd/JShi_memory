@@ -11,6 +11,7 @@
 | 匠石端口模型 | `src/rems/port.py` | 定义经历批次、写入结果、回忆片段和后端协议 |
 | 主编排 | `src/rems/pipeline.py` | 装配服务并实现写入、回忆、肖像和墓碑化入口 |
 | 领域服务与技能 | `src/rems/services/`、`src/rems/skills/` | 代谢、事件封装、对象/情绪信息处理和肖像压缩 |
+| 分阶段提炼 | `src/rems/services/refinement_service.py`、`src/rems/jobs/refine_memory.py` | 轻量事件到龄提炼、前轮 L1 再提炼、来源保留与旧节点隐藏 |
 | 回忆检索 | `src/rems/recall/` | 语义/词面候选、对象事实、访问概率、排序和预算 |
 | 持久化 | `src/rems/storage/` | SQLAlchemy 数据表、仓储和事件/对象数据 |
 | HTTP API | `src/rems/api/` | FastAPI 应用和 `/api` 路由 |

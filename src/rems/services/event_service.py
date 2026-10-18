@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+from datetime import datetime
 from typing import Optional
 
 # 基本事件封存：L0 → 递归摘要 → 角色抽取 → decoration → 持久化与向量索引。
@@ -87,10 +88,14 @@ class EventService:
         subject_id: str = "",
         objects: dict[str, str] | None = None,
         source_ids: tuple[str, ...] = (),
+        source_fragment_ids: list[str] | None = None,
         occurred_at: datetime | None = None,
         source_dates: list[str] | None = None,
         origin: str | None = None,
         interlocutor_attributions: list[InterlocutorAttribution] | None = None,
+        refinement_stage: int | None = None,
+        persist: bool = True,
+        source_context: str | None = None,
     ) -> Event:
         """Create, enrich, persist and index a new basic event.
 
@@ -115,17 +120,40 @@ class EventService:
         if seal_reason not in ("closed", "split", "truncated"):
             seal_reason = "closed"
 
-        if objects is not None and self._config.event_min_chars > 0:
-            maximum = int(self._config.event_min_chars * self._config.event_len_factor)
+        lightweight = (objects is not None and self._config.memory_refinement.enabled
+                       and refinement_stage is None)
+        if objects is not None and refinement_stage is None and (lightweight or self._config.event_min_chars > 0):
+            maximum = (self._config.memory_refinement.small_event_max_chars + 1 if lightweight
+                       else int(self._config.event_min_chars * self._config.event_len_factor))
             if len(content_raw) >= maximum:
                 raise ValueError(f"Event must be split before sealing: {len(content_raw)} >= {maximum}")
-        if objects is not None and source_ids:
+        if objects is not None and source_ids and refinement_stage is None:
             # Stable source identity separates retries from genuinely repeated
             # statements on different occasions. Do not deduplicate text alone.
             for previous in self._event_repo.list_all():
                 if (previous.subject_id == subject_id and previous.content_raw == content_raw
-                        and set(previous.source_ids) == set(source_ids)):
+                        and set(previous.source_ids) == set(source_ids)
+                        and (not source_fragment_ids or previous.source_fragment_ids == source_fragment_ids)):
                     return previous
+
+        if lightweight:
+            dates = source_dates or ([occurred_at.isoformat()] if occurred_at else [])
+            moments = [datetime.fromisoformat(value) for value in dates]
+            from datetime import timezone
+            key = lambda value: value.replace(tzinfo=timezone.utc).timestamp() if value.tzinfo is None else value.timestamp()
+            moment = occurred_at or datetime.now(timezone.utc)
+            event = Event(content_raw=content_raw, subject_id=subject_id,
+                source_ids=list(source_ids), source_fragment_ids=list(source_fragment_ids or []),
+                source_dates=dates, occurred_at=moment,
+                input_id=input_id, memory_stage=0, refinement_objects=dict(objects),
+                event_time_start=min(moments, key=key) if moments else moment,
+                event_time_end=max(moments, key=key) if moments else moment,
+                interlocutor_attributions=list(interlocutor_attributions or []),
+                split_prefix_event_ids=list(split_prefix_event_ids or []),
+                origin=origin or "external", seal_reason=seal_reason)
+            if persist:
+                self._event_repo.save(event)
+            return event
 
         # 白皮书 1.2：前置预算计算 —— 在调用任何 LLM 之前确定性地算出各衍生数据项的字符预算
         budget = self._compute_budget(len(content_raw))
@@ -156,6 +184,7 @@ class EventService:
             known_roles=known_roles,
             memory_objects=objects,
             seal_reason=seal_reason if memory_mode else "closed",
+            source_context=source_context,
         )
 
         from ..skills.role_extraction import RoleExtractionSkill
@@ -264,6 +293,7 @@ class EventService:
             content_raw=content_raw,
             subject_id=subject_id,
             source_ids=list(source_ids or ()),
+            source_fragment_ids=list(source_fragment_ids or []),
             occurred_at=occurred_at,
             summaries=enrichment.summaries,
             source_dates=source_dates or ([occurred_at.isoformat()] if occurred_at else []),
@@ -281,6 +311,14 @@ class EventService:
             emotion=enrichment.emotion,
             origin=origin or "external",
             seal_reason=seal_reason,
+            memory_stage=refinement_stage,
+            refinement_objects=dict(objects or {}),
+            refinement_object_levels={
+                oid: ((getattr(enrichment, "object_levels", None) or {}).get(name)
+                      or {"L1": enrichment.object_snapshots[name]})
+                for name, oid in (objects or {}).items()
+                if oid and enrichment.object_snapshots.get(name)
+            } if refinement_stage is not None else {},
         )
 
         if memory_mode and event.emotion is not None:
@@ -288,7 +326,7 @@ class EventService:
 
         # EMA 动态演化 + activation_energy 计算（白皮书 2.5）。
         # 必须在 save 之前，让 ORM 落盘时带上"历史心境调和后的情感"和激活能量。
-        if self._emotion_evolver is not None:
+        if self._emotion_evolver is not None and persist:
             try:
                 self._emotion_evolver.evolve_event(event)
             except Exception:
@@ -307,8 +345,9 @@ class EventService:
         if any(entry.emotional_model.arousal > threshold for entry in event.role_list):
             event.ptsd_immune = True
 
-        self._event_repo.save(event)
-        if memory_mode and self._role_service is not None:
+        if persist:
+            self._event_repo.save(event)
+        if persist and memory_mode and self._role_service is not None:
             # 每个对象追加一句与本事件绑定的事实白描。
             for name, oid in (objects or {}).items():
                 if not oid:
@@ -323,7 +362,7 @@ class EventService:
                     fact=fact,
                     levels=(getattr(enrichment, "object_levels", None) or {}).get(name),
                 )
-        if not memory_mode and self._vector is not None:
+        if persist and not memory_mode and self._vector is not None:
             # 旧路径兼容：仅当显式注入了旧向量库才索引（新架构索引走 recall_pipeline，docs/recall.md）。
             self._index_event(event)
 
@@ -410,6 +449,8 @@ class EventService:
             prev_b = summary_budgets[f"L{i-1}"]
             # 按 summary_decay_factor 递减，保底为 summary_fuse_min_chars
             new_b = max(int(prev_b * cfg.summary_decay_factor), cfg.summary_fuse_min_chars)
+            if new_b >= prev_b:
+                break
             summary_budgets[f"L{i}"] = new_b
 
         # 2. 角色快照层级预算 (L3 -> L2 -> L1 指数衰减)

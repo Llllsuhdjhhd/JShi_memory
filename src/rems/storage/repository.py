@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Optional
+from contextlib import nullcontext
 
 # 仓储层：Event/Role/Metabolism 的 CRUD 与 ORM ↔ Pydantic 模型转换。
 
@@ -35,8 +36,8 @@ class EventRepository:
     def __init__(self, db: Database):
         self._db = db
 
-    def save(self, event: Event) -> None:
-        with self._db.session() as s:
+    def save(self, event: Event, *, session=None) -> None:
+        with (self._db.session() if session is None else nullcontext(session)) as s:
             record = EventRecord(
                 event_id=event.event_id,
                 subject_id=getattr(event, "subject_id", "") or "",
@@ -69,6 +70,10 @@ class EventRepository:
                 forgetting_factor=float(getattr(event, "forgetting_factor", 1.0) or 1.0),
                 seal_reason=getattr(event, "seal_reason", None) or "closed",
                 recall_metadata={
+                    "refinement": event.model_dump(mode="json", include={
+                        "source_fragment_ids", "memory_stage", "event_time_start", "event_time_end", "refined_at",
+                        "refinement_hidden_by", "refinement_objects", "refinement_policy",
+                        "refinement_object_levels", "refinement_source_units"}),
                     "source_dates": event.source_dates,
                     "keywords": list(getattr(event, "keywords", None) or []),
                     "location": getattr(event, "location", None),
@@ -79,7 +84,61 @@ class EventRepository:
                 },
             )
             s.merge(record)
-            s.commit()
+            if session is None:
+                s.commit()
+
+    def commit_refinement(self, children: list[Event], parents: list[Event]) -> None:
+        """Publish parents and hide exactly their children in one transaction.
+
+        Compare-and-swap child visibility prevents two workers consuming the
+        same event. A conflict or persistence failure rolls back every update.
+        """
+        from sqlalchemy import update
+        ids = [event.event_id for event in children]
+        covered = [eid for parent in parents for eid in (parent.source_events or [])]
+        if not parents or len(ids) != len(set(ids)) or sorted(ids) != sorted(covered):
+            raise ValueError("Refinement must cover each consumed source exactly once")
+        with self._db.session() as session:
+            for child in children:
+                record = session.get(EventRecord, child.event_id)
+                if record is None or record.is_tombstoned:
+                    raise ValueError("Refinement source is unavailable")
+                current = self._to_model(record)
+                if (current.refinement_hidden_by or current.content_raw != child.content_raw
+                        or current.summaries != child.summaries or current.memory_stage != child.memory_stage):
+                    raise ValueError("Refinement source changed or was already consumed")
+                owners = [p for p in parents if child.event_id in (p.source_events or [])]
+                if any(p.subject_id != child.subject_id or p.memory_stage != (child.memory_stage or 0) + 1
+                       for p in owners):
+                    raise ValueError("Refinement stage or subject mismatch")
+                meta = dict(record.recall_metadata or {})
+                refinement = dict(meta.get("refinement") or {})
+                refinement["refinement_hidden_by"] = [p.event_id for p in owners]
+                meta["refinement"] = refinement
+                changed = session.execute(update(EventRecord).where(
+                    EventRecord.event_id == child.event_id,
+                    EventRecord.is_abstracted == False,  # noqa: E712
+                    EventRecord.is_tombstoned == False,  # noqa: E712
+                ).values(is_abstracted=True, recall_metadata=meta).execution_options(synchronize_session=False))
+                if changed.rowcount != 1:
+                    raise ValueError("Refinement source was concurrently consumed")
+            for parent in parents:
+                if session.get(EventRecord, parent.event_id) is not None:
+                    raise ValueError("Refinement result already exists")
+                self.save(parent, session=session)
+                for oid, levels in parent.refinement_object_levels.items():
+                    if not levels.get("L1"):
+                        continue
+                    session.add(WhitePaintingRecord(subject_id=parent.subject_id,
+                        role_id=oid, event_id=parent.event_id, role_summary=levels["L1"],
+                        l1_mention=levels["L1"], l2_interaction=levels.get("L2"),
+                        l3_decision=levels.get("L3"), emotional_model=EmotionalModel().model_dump(mode="json"),
+                        importance="C", create_time=parent.create_time,
+                        last_accessed_time=parent.create_time))
+                    session.add(ObjectMemoryEntryRecord(subject_id=parent.subject_id,
+                        object_id=oid, event_id=parent.event_id, summary=levels["L1"],
+                        create_time=parent.create_time))
+            session.commit()
 
     def append_split_successor(self, event_id: str, successor_event_id: str) -> None:
         """Append *successor_event_id* to ``events.split_successor_event_ids`` (dedup).
@@ -295,6 +354,7 @@ class EventRepository:
             emotion=EmotionalModel(**r.emotion) if (getattr(r, "emotion", None) or None) else None,
             forgetting_factor=float(getattr(r, "forgetting_factor", 1.0) or 1.0),
             seal_reason=getattr(r, "seal_reason", None) or "closed",
+            **((getattr(r, "recall_metadata", None) or {}).get("refinement") or {}),
         )
 
 
