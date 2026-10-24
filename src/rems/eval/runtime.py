@@ -226,6 +226,7 @@ def answer_question(pipe, llm, root, names, question, date, seed, *, recall=True
     # Construct first so first-use lazy application imports exist before clock
     # references are patched. No question or historical scene is processed here.
     process, transport = make_process(root, pipe, llm, names, recall=recall)
+    previous_traces = {row["recall_id"] for row in pipe.recall_trace_repo.list_all(subject_id=SUBJECT)}
     with evaluation_clock(date):
         from jshi.memorycontrol import InProcessMemoryControl
         process.memory_control = InProcessMemoryControl(
@@ -233,7 +234,12 @@ def answer_question(pipe, llm, root, names, question, date, seed, *, recall=True
             flush_max_segments=10**12, flush_max_idle_seconds=float("inf"),
             flush_on_idle_seconds=float("inf"), flush_night_window="",
         )
-        result = process.experience(SUBJECT, question, object_ref=ASKER)
+        candidates: list = []
+        pipe.recall_candidate_sink = candidates
+        try:
+            result = process.experience(SUBJECT, question, object_ref=ASKER)
+        finally:
+            pipe.recall_candidate_sink = None
         if not transport.captures:
             raise RuntimeError("Real JShi cognition was not called")
         if len(transport.captures) != 1:
@@ -250,7 +256,25 @@ def answer_question(pipe, llm, root, names, question, date, seed, *, recall=True
                   "as_of": capture["as_of"],
                   "core_user": capture["user"], "core_context": capture["context"],
                   "sources": [{"source": r.source, "loaded": list(r.loaded_ids),
-                               "skipped": list(r.skipped_ids)} for r in result.current_state.source_report]}
+                               "skipped": list(r.skipped_ids)} for r in result.current_state.source_report],
+                  # 后端候选的去向（排名/长度/淘汰原因），与 delivered_memory 对照可分离
+                  # “没召回”“召回了没交付”“交付了没答对”。仅诊断，不参与评分。
+                  "recall_candidates": [c.as_dict() for c in candidates]}
+        # Evaluation-only provenance. Never pass raw events or gold evidence to
+        # cognition. Ignore historical traces copied with the sealed baseline.
+        retrieved = {}
+        for trace in pipe.recall_trace_repo.list_all(subject_id=SUBJECT):
+            if trace["recall_id"] in previous_traces:
+                continue
+            for item in trace["items"]:
+                event = pipe.event_repo.get(item["event_id"])
+                if event is not None:
+                    retrieved[event.event_id] = {
+                        "event_id": event.event_id, "source_ids": list(event.source_ids),
+                        "occurred_at": event.occurred_at.isoformat() if event.occurred_at else None,
+                        "content_raw": event.content_raw,
+                    }
+        record["retrieved_events"] = list(retrieved.values())
         process.repository.close() if hasattr(process.repository, "close") else None
         return record
 

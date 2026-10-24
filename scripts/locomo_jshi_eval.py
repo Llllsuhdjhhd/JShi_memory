@@ -22,6 +22,7 @@ from rems.eval.budget import BudgetLedger
 from rems.eval.client import EvaluationLLM
 from rems.eval.dataset import (CATEGORIES, canonical_answer, question_id, questions,
                                read_dataset, render_question, sessions)
+from rems.eval.evidence import retrieval_evidence
 from rems.eval.runtime import (SUBJECT, answer_question, close_pipeline, finalize_history,
                               load_jshi, replay_history)
 from rems.eval.scoring import aggregate, build_atoms, coverage, judge, official_f1
@@ -52,6 +53,10 @@ def make_config(directory, api_key, *, embedding="BAAI/bge-small-en-v1.5", engli
     cfg = REMSConfig(_env_file=None, _env_prefix="JSHI_EVAL_UNUSED_")
     cfg.subject_id = SUBJECT
     cfg.recall_english_word_lexical = english_word_lexical
+    cfg.recall_reinforce_enabled = False
+    cfg.recall_detail.date_anchor_locale = "en"
+    cfg.recall_trace_enabled = True
+    cfg.recall_trace_max_items = 0
     cfg.llm.api_key = api_key
     cfg.llm.base_url = "https://api.deepseek.com"
     cfg.llm.max_retries = 0
@@ -195,6 +200,15 @@ def report(out, manifest, ledger):
         f"| 冲突题目比例 | {percent(summary['conflict'])} |", "",
         "以上为自动评分，尚未完成人工抽查，语义评分不是绝对真值。", "",
         "## 分题型", "", "| 题型 | 已评分 | 官方 F1 | 语义正确率 | 充分信息覆盖 |", "|---|---:|---:|---:|---:|"]
+    if summary["retrieval_evidence"]["questions"]:
+        diagnostics = summary["retrieval_evidence"]
+        lines[lines.index("## 分题型"):lines.index("## 分题型")] = [
+            "## 召回证据诊断", "",
+            "范围为后端召回事件，不能替代核心实际收到的记忆覆盖评分；原文轮次匹配不回退到来源块。", "",
+            "| 粒度 | 至少命中一项的题目比例 | 平均证据召回率 |", "|---|---:|---:|",
+            *[f"| {level} | {percent(diagnostics[level + '_hit_rate'])} | {percent(diagnostics[level + '_recall'])} |"
+              for level in ("session", "chunk", "turn")], "",
+        ]
     for name, row in summary["by_category"].items():
         lines.append(f"| {name} | {row['scored']} | {percent(row['official_f1'])} | {percent(row['semantic_accuracy'])} | {percent(row['sufficient'])} |")
     budget = summary["budget"]
@@ -456,6 +470,10 @@ def main(argv=None):
                               "grade": grade, "coverage": coverage(grade),
                               "canonical_answer": predicted,
                               "official_f1": official_f1(item["category"], predicted, item["reference"])}
+                    if "retrieved_events" in answer:
+                        sample = next(s for s in selected if s["sample_id"] == item["sample_id"])
+                        record["retrieval_evidence"] = retrieval_evidence(
+                            sample, answer["retrieved_events"], item["evidence"])
                     write_json(dest, record)
                     print(grade_dir + " " + item["question_id"], flush=True)
     finally:

@@ -230,6 +230,7 @@ class MetabolismService:
         )
         # 默认修复链：调用 OverlongUCSplitSkill，仅在 ``boundary_remediation_enabled`` 打开时装配。
         self._boundary_remediator: SkillRemediator | None = boundary_remediator
+        self._split_skill = getattr(boundary_remediator, "_split", None)
 
     # ------------------------------------------------------------------
     # Factory helpers (便于 pipeline / tests 复用默认装配)
@@ -376,7 +377,10 @@ class MetabolismService:
             )
 
         if result.disentangle:
-            result = self._bound_groups(result, buffer)
+            # 新路径不按字数把完整事件切开；超长改由逻辑切分处理，每轮只切一刀。
+            result = self._bound_groups(
+                result, buffer, mechanical=not self._config.memory_refinement.enabled,
+            )
             sealed = self._apply_disentangle(
                 result, buffer, unclosed,
                 input_id=input_id,
@@ -445,10 +449,11 @@ class MetabolismService:
         return items
 
     def _length_accepted(self, length: int) -> bool:
-        """ev_len ≤ L < k·ev_len。ev_len 为 0 时不设尺度。"""
+        """新路径：下限 ≤ 长度 ≤ 检查线。旧路径：ev_len ≤ L < k·ev_len。"""
         ev_len = int(self._config.event_min_chars or 0)
         if self._config.memory_refinement.enabled:
-            return length <= self._config.memory_refinement.small_event_max_chars
+            policy = self._config.memory_refinement
+            return policy.small_event_min_chars <= length <= policy.small_event_max_chars
         if ev_len <= 0:
             return True
         factor = float(self._config.event_len_factor or 2)
@@ -485,8 +490,8 @@ class MetabolismService:
                 seen.add(item.fragment_id)
         return admitted
 
-    def _bound_groups(self, result, buffer):
-        """Apply event limits after semantic grouping; sentence ownership stays disjoint."""
+    def _bound_groups(self, result, buffer, *, mechanical: bool = True):
+        """句权互斥。mechanical 为真时才按字数把超长组切开；新路径的正常封存关闭这项。"""
         from ..skills.boundary_detection import BoundaryResult, CompletedFragment, NewUnclosed
         cap = (max(1, int(self._config.event_min_chars * self._config.event_len_factor) - 1)
                if self._config.event_min_chars > 0 else sum(len(item.text) + 1 for item in buffer) + 1)
@@ -496,6 +501,14 @@ class MetabolismService:
         completed, residual = [], []
 
         def groups(indices):
+            if not mechanical:
+                chunk = []
+                for index in indices:
+                    if index in claimed or not 1 <= index <= len(buffer):
+                        continue
+                    claimed.add(index)
+                    chunk.append(index)
+                return [chunk] if chunk else []
             chunks, chunk, size = [], [], 0
             for index in indices:
                 if index in claimed or not 1 <= index <= len(buffer):
@@ -530,6 +543,27 @@ class MetabolismService:
         for chunk in groups(unclaimed):
             residual.append(NewUnclosed(content=text(chunk), source_indices=chunk))
         return BoundaryResult(completed_events=completed, new_unclosed=residual, disentangle=True)
+
+    def _cut_indices(
+        self,
+        content: str,
+        indices: list[int],
+        buffer: list[BufferSentence],
+    ) -> tuple[list[int], list[int]] | None:
+        """在句子边界切一刀。前段可封存，后段回到残余。对不齐句子边界则放弃。"""
+        from ..skills.boundary_split import OverlongUCSplitSkill
+        if self._split_skill is None:
+            return None
+        outcome = self._split_skill.split(content)
+        if outcome.aborted or not outcome.prefix_text or not outcome.tail_text:
+            return None
+        valid = [index for index in indices if 1 <= index <= len(buffer)]
+        sentences = [buffer[index - 1].text for index in valid]
+        for end in range(1, len(valid)):
+            head = "\n".join(sentences[:end])
+            if OverlongUCSplitSkill._canonical(head) == OverlongUCSplitSkill._canonical(outcome.prefix_text):
+                return valid[:end], valid[end:]
+        return None
 
     def _dominant_residual_id(
         self,
@@ -582,6 +616,49 @@ class MetabolismService:
         for frag in result.completed_events:
             indices = [i for i in frag.source_indices if 1 <= i <= len(buffer)]
             if not indices:
+                continue
+            if (self._config.memory_refinement.enabled and not force_save
+                    and not frag.is_split_prefix
+                    and len(frag.content_raw) > self._config.memory_refinement.small_event_max_chars):
+                cut = self._cut_indices(frag.content_raw, indices, buffer)
+                if cut is not None:
+                    prefix_indices, tail_indices = cut
+                    prefix_text = "\n".join(buffer[i - 1].text for i in prefix_indices)
+                    event = self._event_svc.seal_event(
+                        prefix_text,
+                        seal_reason="split",
+                        **self._seal_memory_kwargs(
+                            memory,
+                            content=prefix_text,
+                            input_id=input_id,
+                            known_roles_hint=known_roles_hint,
+                            pre_role_entries=pre_role_entries,
+                            interlocutor_attributions=_interlocutors_from_buffer(buffer, prefix_indices),
+                            buffer_items=_buffer_items_for_content(prefix_text, buffer, prefix_indices),
+                        ),
+                    )
+                    sealed.append(event)
+                    sealed_idx.update(prefix_indices)
+                    residual_id = self._allocate_residual_id(tail_indices, buffer, taken)
+                    for index in tail_indices:
+                        residual_of[index] = residual_id
+                    continue
+                event = self._event_svc.seal_event(
+                    frag.content_raw,
+                    seal_reason="closed",
+                    allow_over_cap=True,
+                    **self._seal_memory_kwargs(
+                        memory,
+                        content=frag.content_raw,
+                        input_id=input_id,
+                        known_roles_hint=known_roles_hint,
+                        pre_role_entries=pre_role_entries,
+                        interlocutor_attributions=_interlocutors_from_buffer(buffer, indices),
+                        buffer_items=_buffer_items_for_content(frag.content_raw, buffer, indices),
+                    ),
+                )
+                sealed.append(event)
+                sealed_idx.update(indices)
                 continue
             if not force_save and not frag.is_split_prefix and not self._length_accepted(len(frag.content_raw)):
                 residual_id = self._allocate_residual_id(indices, buffer, taken)
@@ -999,8 +1076,8 @@ class MetabolismService:
     ) -> tuple[list[Event], list[UnclosedEvent]]:
         """按闲置规则封存未完成条目，原因记为 truncated。
 
-        单条字数变长不在边界检测前封存，先交给边界和 80/20 切开。
-        闲置启用时：字数 > 0.5×上限且闲置达到部分天数，或闲置达到硬天数。
+        新路径只看检查线：超过检查线且闲置达到部分天数时先切一刀，切不开才整段封存；
+        不足下限的只在硬闲置到期时封存。旧路径仍用字数上限的一半和硬闲置。
         """
         char_limit = int(self._config.unclosed_char_limit or 0)
         idle_on = bool(self._config.unclosed_idle_seal_enabled)
@@ -1015,6 +1092,22 @@ class MetabolismService:
                 continue
             if not self._is_abandoned_unclosed(ue, now=now):
                 remaining.append(ue)
+                continue
+            if self._config.memory_refinement.enabled and ue.total_length > self._config.memory_refinement.small_event_max_chars:
+                kept = self._split_abandoned_residual(
+                    ue, now=now, memory=memory, input_id=input_id,
+                    known_roles_hint=known_roles_hint, pre_role_entries=pre_role_entries,
+                )
+                if kept is not None:
+                    sealed.append(kept)
+                    updated = self._repo.get_unclosed_event(ue.id)
+                    if updated is not None:
+                        remaining.append(updated)
+                    continue
+                sealed.append(self._seal_unclosed_as_event(
+                    ue, memory=memory, input_id=input_id, known_roles_hint=known_roles_hint,
+                    pre_role_entries=pre_role_entries, allow_over_cap=True,
+                ))
                 continue
             if (ue.formation_role or "residual") == "formed":
                 sealed.extend(self._close_lines([ue], memory=memory, input_id=input_id,
@@ -1059,9 +1152,12 @@ class MetabolismService:
         partial_days = float(self._config.unclosed_idle_partial_days or 0.0)
         partial_ratio = float(self._config.unclosed_idle_partial_ratio or 0.5)
 
-        # 1.3 闲置 ≥ 硬上限天数（默认 7 天）
+        # 1.3 闲置 ≥ 硬上限天数（默认 7 天）。新路径下不足下限的事件也在这时封存。
         if hard_days > 0 and idle >= timedelta(days=hard_days):
             return True
+        if self._config.memory_refinement.enabled:
+            maximum = self._config.memory_refinement.small_event_max_chars
+            return bool(partial_days > 0 and length > maximum and idle >= timedelta(days=partial_days))
         # 1.3 字数 > 0.5×限制 且闲置 ≥ 部分天数（默认 3 天）
         if (
             char_limit > 0
@@ -1072,6 +1168,55 @@ class MetabolismService:
             return True
         return False
 
+    def _split_abandoned_residual(
+        self,
+        ue: UnclosedEvent,
+        *,
+        now: datetime,
+        memory: MemoryExperience | None,
+        input_id: str | None,
+        known_roles_hint: list[Role] | None,
+        pre_role_entries: list[EventRoleEntry] | None,
+    ) -> Event | None:
+        """超长残余只切一刀。前段封存，后段仍留在原残余里，等待下一轮。"""
+        items = list(ue.buffer_items) or [
+            BufferSentence(
+                text=text, residual_id=ue.id,
+                interlocutor_attributions=list(ue.interlocutor_attributions),
+            )
+            for text in segment_sentences(ue.merged_content)
+        ]
+        if len(items) < 2:
+            return None
+        content = "\n".join(item.text for item in items)
+        cut = self._cut_indices(content, list(range(1, len(items) + 1)), items)
+        if cut is None:
+            return None
+        prefix_indices, tail_indices = cut
+        prefix_items = [items[index - 1] for index in prefix_indices]
+        tail_items = [items[index - 1] for index in tail_indices]
+        prefix_text = "\n".join(item.text for item in prefix_items)
+        tail_text = "\n".join(item.text for item in tail_items)
+        event = self._event_svc.seal_event(
+            prefix_text,
+            seal_reason="split",
+            **self._seal_memory_kwargs(
+                memory,
+                content=prefix_text,
+                input_id=input_id,
+                known_roles_hint=known_roles_hint,
+                pre_role_entries=pre_role_entries,
+                interlocutor_attributions=_interlocutors_from_buffer(prefix_items),
+                buffer_items=prefix_items,
+            ),
+        )
+        self._repo.save_unclosed_event(ue.model_copy(update={
+            "content_fragments": [tail_text],
+            "buffer_items": tail_items,
+            "updated_at": now,
+        }))
+        return event
+
     def _seal_unclosed_as_event(
         self,
         ue: UnclosedEvent,
@@ -1081,11 +1226,13 @@ class MetabolismService:
         known_roles_hint: list[Role] | None,
         pre_role_entries: list[EventRoleEntry] | None,
         seal_reason: str = "truncated",
+        allow_over_cap: bool = False,
     ) -> Event:
         event = self._event_svc.seal_event(
             ue.merged_content,
             split_prefix_event_ids=list(ue.split_prefix_event_ids or []) or None,
             seal_reason=seal_reason,
+            allow_over_cap=allow_over_cap,
             **self._seal_memory_kwargs(
                 memory,
                 content=ue.merged_content,

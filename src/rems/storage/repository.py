@@ -13,9 +13,12 @@ from datetime import datetime
 
 from ..models.portrait import ObjectPortrait, PendingPortraitSummary, PortraitLevelInfo
 from ..port import RecallTrace
+from sqlalchemy.exc import IntegrityError
+
 from .database import (
     Database,
     EventRecord,
+    SubjectSequenceRecord,
     ObjectMemoryEntryRecord,
     PortraitRecord,
     PortraitSummaryRecord,
@@ -38,6 +41,7 @@ class EventRepository:
 
     def save(self, event: Event, *, session=None) -> None:
         with (self._db.session() if session is None else nullcontext(session)) as s:
+            self._assign_memory_sequence(s, event)
             record = EventRecord(
                 event_id=event.event_id,
                 subject_id=getattr(event, "subject_id", "") or "",
@@ -71,7 +75,9 @@ class EventRepository:
                 seal_reason=getattr(event, "seal_reason", None) or "closed",
                 recall_metadata={
                     "refinement": event.model_dump(mode="json", include={
-                        "source_fragment_ids", "memory_stage", "event_time_start", "event_time_end", "refined_at",
+                        "source_fragment_ids", "memory_stage", "memory_sequence",
+                        "memory_sequence_start", "memory_sequence_end",
+                        "event_time_start", "event_time_end", "refined_at",
                         "refinement_hidden_by", "refinement_objects", "refinement_policy",
                         "refinement_object_levels", "refinement_source_units"}),
                     "source_dates": event.source_dates,
@@ -313,6 +319,51 @@ class EventRepository:
                 return
             r.forgetting_factor = float(factor)
             s.commit()
+
+    def _assign_memory_sequence(self, session, event: Event) -> None:
+        """第一层序号只在插入时分配。再次保存以库里该事件编号上的序号为准。"""
+        if event.memory_stage != 0:
+            return
+        existing = session.get(EventRecord, event.event_id)
+        if existing is not None:
+            stored = ((existing.recall_metadata or {}).get("refinement") or {}).get("memory_sequence")
+            if isinstance(stored, int):
+                event.memory_sequence = stored
+                return
+            if event.memory_sequence is not None:
+                return
+        if event.memory_sequence is None:
+            event.memory_sequence = self._allocate_memory_sequence(session, event.subject_id or "")
+
+    def _allocate_memory_sequence(self, session, subject_id: str) -> int:
+        """同一事务里取号。计数行不存在时，用该主体已有最大序号初始化一次。"""
+        row = session.get(SubjectSequenceRecord, subject_id)
+        if row is None:
+            row = SubjectSequenceRecord(
+                subject_id=subject_id,
+                next_value=self._highest_memory_sequence(session, subject_id) + 1,
+            )
+            try:
+                with session.begin_nested():
+                    session.add(row)
+                    session.flush()
+            except IntegrityError:
+                row = session.get(SubjectSequenceRecord, subject_id)
+        value = int(row.next_value)
+        row.next_value = value + 1
+        return value
+
+    @staticmethod
+    def _highest_memory_sequence(session, subject_id: str) -> int:
+        highest = 0
+        rows = session.query(EventRecord).filter(EventRecord.subject_id == subject_id).all()
+        for record in rows:
+            refinement = (record.recall_metadata or {}).get("refinement") or {}
+            for key in ("memory_sequence", "memory_sequence_end"):
+                value = refinement.get(key)
+                if isinstance(value, int) and value > highest:
+                    highest = value
+        return highest
 
     # ------------------------------------------------------------------
     @staticmethod

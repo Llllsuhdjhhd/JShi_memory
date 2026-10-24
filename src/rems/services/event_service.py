@@ -96,6 +96,7 @@ class EventService:
         refinement_stage: int | None = None,
         persist: bool = True,
         source_context: str | None = None,
+        allow_over_cap: bool = False,
     ) -> Event:
         """Create, enrich, persist and index a new basic event.
 
@@ -125,7 +126,7 @@ class EventService:
         if objects is not None and refinement_stage is None and (lightweight or self._config.event_min_chars > 0):
             maximum = (self._config.memory_refinement.small_event_max_chars + 1 if lightweight
                        else int(self._config.event_min_chars * self._config.event_len_factor))
-            if len(content_raw) >= maximum:
+            if len(content_raw) >= maximum and not allow_over_cap:
                 raise ValueError(f"Event must be split before sealing: {len(content_raw)} >= {maximum}")
         if objects is not None and source_ids and refinement_stage is None:
             # Stable source identity separates retries from genuinely repeated

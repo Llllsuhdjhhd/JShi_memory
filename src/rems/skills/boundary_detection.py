@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field
 
 from ..config import REMSConfig
 from ..llm.provider import LLMProvider
-from ..llm.prompts import BOUNDARY_SYSTEM, BOUNDARY_USER, SMALL_EVENT_BOUNDARY_SYSTEM, build_user_mode_block
+from ..llm.prompts import BOUNDARY_SYSTEM, BOUNDARY_USER, build_user_mode_block, small_event_boundary_system
 from ..models.metabolism import BufferSentence, UnclosedEvent
 from ..utils.text import (
     segment_sentences,
@@ -195,7 +195,8 @@ class BoundaryDetectionSkill:
             ev_len=ev_len,
             k=f"{factor:g}",
         )
-        system_msg = build_user_mode_block(self._config) + (SMALL_EVENT_BOUNDARY_SYSTEM if lightweight else BOUNDARY_SYSTEM)
+        system_msg = build_user_mode_block(self._config) + (
+            self._small_event_system() if lightweight else BOUNDARY_SYSTEM)
         if lightweight:
             user_msg = "## Memory Buffer\n" + format_indexed_text(sentences)
 
@@ -207,6 +208,14 @@ class BoundaryDetectionSkill:
             ],
         )
         return self.parse_response(data, sentences, shadow_count=0, formed_indices=set())
+
+    def _small_event_system(self) -> str:
+        policy = self._config.memory_refinement
+        return small_event_boundary_system(
+            policy.small_event_min_chars,
+            min(policy.small_event_target_chars, policy.small_event_max_chars),
+            policy.small_event_max_chars,
+        )
 
     @staticmethod
     def _line_label(start: int, end: int) -> str:

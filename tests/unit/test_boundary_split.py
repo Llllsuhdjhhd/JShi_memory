@@ -175,6 +175,21 @@ class TestOverlongUCSplitSkill:
         out = skill.split(prefix + tail)
         assert out.aborted
 
+    def test_length_policy_accepts_prefix_near_300(self, config, fake_llm):
+        config.memory_refinement.enabled = True
+        prefix, tail = "前" * 300, "后" * 1200
+        fake_llm.push_response({"prefix_text": prefix, "tail_text": tail})
+        out = OverlongUCSplitSkill(fake_llm, config).split(prefix + tail)
+        assert not out.aborted and out.prefix_text == prefix and out.tail_text == tail
+
+    def test_length_policy_rejects_prefix_outside_100_to_500(self, config, fake_llm):
+        config.memory_refinement.enabled = True
+        skill = OverlongUCSplitSkill(fake_llm, config)
+        fake_llm.push_response({"prefix_text": "前" * 600, "tail_text": "后" * 100})
+        assert skill.split("前" * 600 + "后" * 100).aborted
+        fake_llm.push_response({"prefix_text": "前" * 50, "tail_text": "后" * 200})
+        assert skill.split("前" * 50 + "后" * 200).aborted
+
 
 class TestOverlongUCSplitRemediator:
     def _evaluate(self, config, result, threshold=100):

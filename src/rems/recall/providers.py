@@ -277,6 +277,8 @@ class QdrantRecallVectorStore:
                         found.append(event_id if index == 0 else f"{event_id}#raw#{index}")
                     elif payload.get("type") == "object_event_fact" and payload.get("object_id"):
                         found.append(f"{event_id}#fact#{payload['object_id']}")
+                    elif payload.get("type") == "event_detail" and payload.get("source_event_id"):
+                        found.append(f"{event_id}#detail#{payload['source_event_id']}")
                 if offset is None:
                     break
             return found

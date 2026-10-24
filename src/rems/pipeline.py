@@ -23,6 +23,7 @@ from .port import (
     RecallTrace,
     RecallTraceItem,
     SubSegment,
+    clip_fragment_content,
 )
 from .recall import (
     BgeReranker,
@@ -94,6 +95,11 @@ class REMSPipeline:
         self.metabolism_service = metabolism_service
         self.belief_revision_service = belief_revision_service
         self.recall_pipeline = recall_pipeline
+        # 诊断用：非空时每次 recall 把候选的排名与淘汰原因追加进去（不影响召回结果）。
+        # JShi 核心通过端口回调 recall，拿不到返回值之外的诊断，因此挂在实例上。
+        self.recall_candidate_sink: list | None = None
+        self._candidate_sink_ref: list | None = None
+        self._candidate_call = 0
         self.object_timeline_repo = object_timeline_repo
         self.stored_marks_repo = stored_marks_repo
         self.recall_trace_repo = recall_trace_repo
@@ -190,6 +196,10 @@ class REMSPipeline:
             ),
             embedding_version=config.recall_embedding_version,
             event_index_level=config.recall_event_index_level,
+            detail_enabled=config.recall_detail.enabled,
+            detail_max_count=config.recall_detail.max_count,
+            detail_min_similarity=config.recall_detail.min_similarity,
+            date_anchor_locale=config.recall_detail.date_anchor_locale,
         )
 
         # ---- 技能与领域服务 ----
@@ -384,10 +394,29 @@ class REMSPipeline:
         level: int = 1,
         limit: int | None = None,
         anchor_event_ids: tuple[str, ...] = (),
+        reinforce: bool | None = None,
+        candidate_sink: list | None = None,
     ) -> tuple[RecalledFragment, ...]:
-        """实现 MemoryBackendPort.recall。预算选级在回忆管线内完成，不再截断原文。"""
+        """Recall within the representation budget; reinforce overrides the config for this call.
+
+        ``candidate_sink``（或实例属性 ``recall_candidate_sink``）非空时，把本次按序访问到的
+        候选及其淘汰原因追加进去；只作诊断，不影响返回结果。
+        """
         if self.recall_pipeline is None:
             return ()
+        do_reinforce = (
+            getattr(getattr(self, "config", None), "recall_reinforce_enabled", True)
+            if reinforce is None else reinforce
+        )
+        sink = getattr(self, "recall_candidate_sink", None) if candidate_sink is None else candidate_sink
+        call = 0
+        if sink is not None:
+            # 同一个 sink 里的多次 recall 依次编号；换 sink 视为新的一轮。
+            if sink is not getattr(self, "_candidate_sink_ref", None):
+                self._candidate_sink_ref = sink
+                self._candidate_call = 0
+            self._candidate_call = getattr(self, "_candidate_call", 0) + 1
+            call = self._candidate_call
         fragments = self.recall_pipeline.recall(
             subject_id,
             query,
@@ -404,6 +433,9 @@ class REMSPipeline:
             level=level,
             limit=limit,
             anchor_event_ids=anchor_event_ids,
+            **({"reinforce": do_reinforce} if reinforce is not None or not do_reinforce else {}),
+            # 只有开诊断时才多传参数，保持默认调用契约不变。
+            **({"candidate_sink": sink, "candidate_call": call} if sink is not None else {}),
         )
         self._record_recall_trace(
             subject_id,
@@ -446,8 +478,14 @@ class REMSPipeline:
         for s in selected:
             frag = s["fragment"]
             used = s.get("used") or s["budget"]
-            content = (frag.content or frag.text or "")[:used]
-            out.append(frag.model_copy(update={"content": content, "summary_level": s["level"]}))
+            content, detail_ids, detail_levels = clip_fragment_content(frag, used)
+            out.append(frag.model_copy(update={
+                "content": content,
+                "summary_level": s["level"],
+                "detail_event_ids": detail_ids,
+                "detail_levels": detail_levels,
+                "detail_content_start": frag.detail_content_start if detail_ids else None,
+            }))
         return tuple(out)
 
     def assemble_recall_block(
@@ -466,6 +504,7 @@ class REMSPipeline:
             return {"items": [], "total_length": 0, "budget": budget}
         fragments = self.recall_pipeline.recall(
             subject_id, query, object_id=object_id, level=level, limit=limit, anchor_event_ids=anchor_event_ids,
+            **({} if self.config.recall_reinforce_enabled else {"reinforce": False}),
         )
         items: list[RecalledFragment] = list(fragments)
         if (
@@ -485,12 +524,13 @@ class REMSPipeline:
         for s in selected:
             frag = s["fragment"]
             used = s.get("used") or s["budget"]
-            content = (frag.content or frag.text or "")[: used]
+            content, detail_ids, detail_levels = clip_fragment_content(frag, used)
             total += len(content)
             out_items.append({
                 "event_id": frag.event_id, "object_id": frag.object_id,
-                "kind": frag.kind, "level": s["level"], "budget": s["budget"], "used": used,
+                "kind": frag.kind, "level": s["level"], "budget": s["budget"], "used": len(content),
                 "content": content, "score": frag.score,
+                "detail_event_ids": detail_ids, "detail_levels": detail_levels,
             })
         return {"items": out_items, "total_length": total, "budget": b}
 

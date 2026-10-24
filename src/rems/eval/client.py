@@ -51,6 +51,8 @@ class EvaluationLLM(LLMProvider):
         self._invocations.append(LLMInvocationMetrics(
             task_type, resolved, (time.perf_counter()-began)*1000,
             response.usage.prompt_tokens, response.usage.completion_tokens, response.usage.total_tokens,
+            response_model=getattr(response, "model", None),
+            cached_tokens=self._cached_tokens(response.usage),
         ))
         if choice.finish_reason != "stop" or not content.strip():
             raise RuntimeError(f"Incomplete {task_type} output ({choice.finish_reason}); no score assigned")

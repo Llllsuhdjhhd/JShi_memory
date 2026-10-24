@@ -11,6 +11,8 @@ class LLMInvocationMetrics:
 
     ``prompt_tokens`` / ``completion_tokens`` / ``total_tokens`` mirror the API
     ``usage`` object when the server returns it; otherwise they are ``None``.
+    ``model`` is requested; ``response_model`` is the server-reported model.
+    ``cached_tokens`` stays unknown when neither supported cache field is present.
     """
 
     task_type: str
@@ -19,3 +21,5 @@ class LLMInvocationMetrics:
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
     total_tokens: int | None = None
+    response_model: str | None = None
+    cached_tokens: int | None = None

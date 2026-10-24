@@ -128,6 +128,29 @@ class RecalledFragment(BaseModel):
     representation_level: str | None = None
     signals: dict[str, float] = Field(default_factory=dict)
     occurred_at: datetime | None = None
+    detail_event_ids: list[str] = Field(
+        default_factory=list,
+        description="附在本条摘要后面的下层事件；不另占一条回忆结果",
+    )
+    detail_levels: list[str] = Field(
+        default_factory=list,
+        description="与 detail_event_ids 对应，取 raw 或 L1",
+    )
+    detail_content_start: int | None = Field(
+        default=None,
+        description="content 中附加原文的起始位置。预算截取不得切进这段原文。",
+    )
+
+
+def clip_fragment_content(fragment: RecalledFragment, used: int) -> tuple[str, list[str], list[str]]:
+    """按预算缩短回忆正文。附加原文要么整段保留，要么整段去掉。"""
+    content = fragment.content or fragment.text or ""
+    start = fragment.detail_content_start
+    if used >= len(content):
+        return content, list(fragment.detail_event_ids), list(fragment.detail_levels)
+    if start is None or used <= start:
+        return content[:used], [], []
+    return content[:start].rstrip(), [], []
 
 
 class RecallTraceItem(BaseModel):

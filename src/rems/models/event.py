@@ -226,6 +226,10 @@ class Event(BaseModel):
     source_dates: list[str] = Field(default_factory=list)
     # None: pre-refinement legacy event; 0: lightweight; 1+: age-based stage.
     memory_stage: int | None = None
+    # 第一层按封存先后编号，只作稳定标识。上层记录所覆盖的编号范围。
+    memory_sequence: int | None = None
+    memory_sequence_start: int | None = None
+    memory_sequence_end: int | None = None
     event_time_start: Optional[datetime] = None
     event_time_end: Optional[datetime] = None
     refined_at: Optional[datetime] = None

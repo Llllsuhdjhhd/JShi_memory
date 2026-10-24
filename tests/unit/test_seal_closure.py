@@ -207,7 +207,7 @@ def test_new_event_raises_dormant_same_object(config, db, fake_llm: FakeLLM, vec
     fake_llm.push_response({
         "summaries": {"L1": "又见面"},
         "emotion": {"joy": 0.4},
-        "objects": [{"name": "甲", "fact": "我又见到了甲。"}],
+        "objects": [{"name": "甲", "fact": {"L1": "甲又来了。"}}],
     })
     memory = MemoryExperience(
         subject_id="jshi-1",

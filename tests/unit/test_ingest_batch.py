@@ -68,11 +68,11 @@ class TestIngestBatch:
             "new_unclosed_indices": [],
         })
         fake_llm.push_response({
-            "summaries": {"L1": "匠石看到了美丽的落日。"},
+            "summaries": {"L1": "看到落日。"},
             "emotion": {"joy": 0.8},
             "objects": [{
                 "name": "阿明",
-                "fact": "我和小明一起看了落日。",
+                "fact": {"L1": "阿明看落日。"},
                 "l3_decision": "性格急躁",
             }],
             "location": "海边",
@@ -123,8 +123,8 @@ class TestIngestBatch:
         assert len(wps) == 1
         assert wps[0].event_id == ev.event_id
         assert wps[0].subject_id == "jshi-1"
-        assert wps[0].role_summary == "我和小明一起看了落日。"
-        assert wps[0].l1_mention is None
+        assert wps[0].role_summary == "阿明看落日。"
+        assert wps[0].l1_mention == "阿明看落日。"
         assert wps[0].l2_interaction is None
         assert wps[0].l3_decision is None
         assert "性格" not in wps[0].role_summary
@@ -232,7 +232,7 @@ class TestIngestBatch:
             "new_unclosed_indices": [],
         })
         fake_llm.push_response({
-            "summaries": {"L1": "内心平静。"},
+            "summaries": {"L1": "内心平静"},
             "emotion": {"joy": 0.3},
             "objects": [],
         })

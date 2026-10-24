@@ -166,7 +166,11 @@ class EventEnrichmentSkill:
                 "the preceding level. Stop before a level whose budget is <= " + str(fuse_min) + ".")
 
         if source_context:
+            limit = self._config.memory_refinement.representative_max_chars
             user_msg += ("\n\nSource-unit provenance (not additional narrative):\n" + source_context +
+                         f"\nL1 必须为每个来源事件写一条代表句，格式是〔#序号〕后接不超过 {limit} 字。"
+                         "序号用 provenance 里的 memory_sequence；没有单号时写 memory_sequence_start 到 "
+                         "memory_sequence_end。人名用对象映射里的名字，数字和日期留在代表句中。"
                          "\nAnchor each relative date to its own source unit, never the refinement date. "
                          "Do not merge different people's statements or different dates into one fact.")
         data = self._llm.complete_json(

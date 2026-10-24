@@ -243,9 +243,15 @@ def test_real_jshi_core_receives_only_assembled_memory(tmp_path):
     # Object ownership is set using an actual event role, not an oracle retrieval hint.
     event = Event(subject_id=SUBJECT, content_raw="Lee enjoys swimming. PRIVATE RAW OMITTED",
                   summaries={"L1": "Lee enjoys swimming."}, occurred_at=datetime(2023, 5, 1),
+                  source_ids=["conv-test:D1:1"],
                   role_list=[EventRoleEntry(role_id="person-lee", importance=Importance.S)])
     pipe.event_repo.save(event)
     pipe.recall_pipeline.index_event(event)
+    from rems.port import RecallTrace, RecallTraceItem
+    old_event = Event(subject_id="other", content_raw="Historical trace must be excluded.")
+    pipe.event_repo.save(old_event)
+    pipe.recall_trace_repo.save(RecallTrace(recall_id="historical", subject_id=SUBJECT,
+        query="historical", items=[RecallTraceItem(event_id=old_event.event_id)]))
     try:
         result = answer_question(pipe, llm, tmp_path/"core", {"Lee": "person-lee"},
             "What sport does Lee enjoy?", datetime(2023, 5, 2), 42)
@@ -253,6 +259,9 @@ def test_real_jshi_core_receives_only_assembled_memory(tmp_path):
         assert result["as_of"].startswith("2023-05-02")
         assert "Lee enjoys swimming." in result["delivered_memory"]
         assert "PRIVATE RAW OMITTED" not in result["delivered_memory"]
+        assert result["retrieved_events"] == [{"event_id": event.event_id,
+            "source_ids": ["conv-test:D1:1"], "occurred_at": "2023-05-01T00:00:00",
+            "content_raw": event.content_raw}]
         assert len([m for m in llm.messages if m["role"] == "user"]) == 1
         assert not (tmp_path / ".jshi").exists()
     finally:

@@ -5,8 +5,9 @@ from pydantic import ValidationError
 
 from rems.config import MemoryRefinementConfig, RefinementStage
 from rems.models.event import Event
+from rems.models.metabolism import BufferSentence, UnclosedEvent
 from rems.pipeline import REMSPipeline
-from rems.port import MemoryBatch, MemoryExperience
+from rems.port import MemoryBatch, MemoryExperience, RecalledFragment, clip_fragment_content
 from rems.services.refinement_service import RefinementService
 from rems.storage.database import WhitePaintingRecord
 
@@ -39,13 +40,16 @@ def responses(llm, count=1, summary="Music."):
 def test_partial_ack_replay_keeps_each_source_fragment_once(case):
     pipe, _, llm = case
     date = datetime(2026, 1, 1)
-    first = MemoryExperience(subject_id="stone", text="Lee plays Bach。Lee prepares a concert。",
+    bach = "Lee plays Bach" + (" and practices steadily" * 4) + "。"
+    concert = "Lee prepares a concert。"
+    friday = "The concert is on Friday" + (" with the same audience" * 4) + "。"
+    first = MemoryExperience(subject_id="stone", text=bach + concert,
         source_ids=("D1:1",), segment_id="turn-1", occurred_at=date)
     llm.push_response({"events": [{"indices": [1]}], "residual": [{"indices": [2]}]})
     result = pipe.ingest_batch(MemoryBatch(subject_id="stone", experiences=(first,)))
     assert not result.errors
     llm.push_response({"events": [{"indices": [1, 2]}], "residual": []})
-    second = MemoryExperience(subject_id="stone", text="The concert is on Friday。",
+    second = MemoryExperience(subject_id="stone", text=friday,
         source_ids=("D1:2",), segment_id="turn-2", occurred_at=date)
     result = pipe.ingest_batch(MemoryBatch(subject_id="stone", experiences=(first, second)))
     assert not result.errors
@@ -85,8 +89,10 @@ def test_replayed_oversized_sentence_chunks_are_stable(case):
 def test_ingest_closes_short_event_without_enrichment_or_emotion(case):
     pipe, _, llm = case
     llm.push_response({"events": [{"indices": [1, 2]}], "residual": []})
+    text = ("Lee likes Bach and practices every morning before breakfast。"
+            "Lee plays Mozart in the small room after dinner with friends。")
     result = pipe.ingest_batch(MemoryBatch(subject_id="stone", experiences=(
-        MemoryExperience(subject_id="stone", text="Lee likes Bach。Lee plays Mozart。",
+        MemoryExperience(subject_id="stone", text=text,
             objects={"Lee": "lee"}, source_ids=("D1:1",), segment_id="turn-1",
             occurred_at=datetime(2026, 1, 1)),)))
     assert not result.errors and len(result.sealed_event_ids) == 1
@@ -95,7 +101,8 @@ def test_ingest_closes_short_event_without_enrichment_or_emotion(case):
     assert not event.role_list and event.refinement_objects == {"Lee": "lee"}
     assert [call["task_type"] for call in llm.calls] == ["boundary_detection"]
     prompt = llm.calls[0]["messages"][0]["content"]
-    assert "没有最低字数要求" in prompt and "ev_len ≤" not in prompt
+    assert "100" in prompt and "300" in prompt and "500" in prompt
+    assert "没有最低字数" not in prompt and "ev_len ≤" not in prompt
     found = pipe.recall_pipeline.recall("stone", "Bach", object_id="lee",
                                        channels=("lexical",), reinforce=False)
     assert found and "Bach" in found[0].content and found[0].summary_level == "raw"
@@ -138,28 +145,32 @@ def test_first_refinement_keeps_verbatim_l0_emotion_and_atomic_lineage(case):
     assert service.refine_once("stone", 1, now)["status"] == "idle"
 
 
-def test_all_three_stages_use_previous_l1_and_original_age(case):
+def test_both_stages_use_previous_l1_and_original_age(case):
     pipe, service, llm = case
     now = datetime(2026, 1, 1)
     leaf = small(pipe, "Lee likes Bach and Mozart.", datetime(2022, 1, 1))
-    for _ in range(3):
+    for _ in range(2):
         responses(llm)
     result = service.run("stone", now)
     assert not result["errors"]
     events = pipe.event_repo.list_all()
-    assert sorted(e.memory_stage for e in events) == [0, 1, 2, 3]
+    assert sorted(e.memory_stage for e in events) == [0, 1, 2]
     parents = {e.memory_stage: e for e in events}
     assert parents[1].content_raw == leaf.content_raw
     assert parents[2].content_raw == parents[1].summaries["L1"]
-    assert parents[3].content_raw == parents[2].summaries["L1"]
     assert all(e.event_time_end.date() == leaf.event_time_end.date() for e in events)
     assert all(e.refined_at.replace(tzinfo=None) == now for e in events if e.memory_stage)
-    assert not parents[3].refinement_hidden_by
+    assert not parents[2].refinement_hidden_by
+    assert parents[1].memory_sequence_start == leaf.memory_sequence == 1
+    assert parents[2].memory_sequence_end == 1
     assert service.run("stone", now)["batches"][0]["status"] == "idle"
-    assert len(llm.calls) == 6
+    assert len(llm.calls) == 4
     found = pipe.recall_pipeline.recall("stone", "Music", channels=("lexical",), reinforce=False)
-    assert found and {f.event_id for f in found} == {parents[3].event_id}
-    assert not pipe.recall_pipeline.recall("stone", "Bach", channels=("lexical",), reinforce=False)
+    assert found and {f.event_id for f in found} == {parents[2].event_id}
+    assert not found[0].detail_event_ids
+    bach = pipe.recall_pipeline.recall("stone", "Bach", channels=("lexical",), reinforce=False)
+    assert [item.event_id for item in bach if item.type == "event"] == [parents[2].event_id]
+    assert not bach[0].detail_event_ids
     assert pipe.event_repo.get(leaf.event_id).content_raw == leaf.content_raw
 
 
@@ -243,7 +254,10 @@ def test_later_stage_missing_l1_never_falls_back_to_original(case):
 
 
 def test_policy_validation_and_default_ages():
-    assert [s.age_days for s in MemoryRefinementConfig().stages] == [90, 365, 1095]
+    policy = MemoryRefinementConfig()
+    assert [s.age_days for s in policy.stages] == [90, 365]
+    assert (policy.small_event_min_chars, policy.small_event_target_chars,
+            policy.small_event_max_chars) == (100, 300, 500)
     with pytest.raises(ValidationError):
         MemoryRefinementConfig(stages=[RefinementStage(age_days=365), RefinementStage(age_days=90)])
     with pytest.raises(ValidationError):
@@ -326,7 +340,9 @@ def test_hidden_vector_cleanup_failure_is_filtered_and_backfill_recovers(case, m
     result = service.refine_once("stone", 1, now)
     assert result["cleanup_pending"] == [leaf.event_id]
     assert store.get(leaf.event_id) is not None
-    assert not pipe.recall_pipeline.recall("stone", "Bach", channels=("lexical",), reinforce=False)
+    parent_id = result["parent_ids"][0]
+    found = pipe.recall_pipeline.recall("stone", "Bach", channels=("lexical",), reinforce=False)
+    assert [item.event_id for item in found if item.type == "event"] == [parent_id]
     monkeypatch.setattr(store, "delete", original)
     pipe.recall_pipeline.backfill_index()
     assert store.get(leaf.event_id) is None
@@ -413,3 +429,377 @@ def test_losing_worker_cannot_delete_winning_workers_vectors(case, monkeypatch):
     parent_id = winner[0]["parent_ids"][0]
     assert pipe.event_repo.get(leaf.event_id).refinement_hidden_by == [parent_id]
     assert pipe.recall_pipeline._vector_store.get(parent_id) is not None
+
+
+def test_sequences_follow_seal_order_and_parent_records_the_span(case):
+    pipe, service, llm = case
+    now = datetime(2026, 1, 1)
+    first = small(pipe, "Lee likes Bach.", now - timedelta(days=100))
+    second = small(pipe, "Lee plays Mozart.", now - timedelta(days=99))
+    assert (first.memory_sequence, second.memory_sequence) == (1, 2)
+    responses(llm, 2)
+    parent = pipe.event_repo.get(service.refine_once("stone", 1, now)["parent_ids"][0])
+    assert (parent.memory_sequence_start, parent.memory_sequence_end) == (1, 2)
+    assert [unit["memory_sequence"] for unit in parent.refinement_source_units] == [1, 2]
+    assert pipe.event_repo.get(first.event_id).memory_sequence == 1
+
+
+def test_interleaved_sentences_stay_verbatim_in_two_events(case):
+    pipe, _, llm = case
+    llm.push_response({"events": [{"indices": [1, 3]}, {"indices": [2, 4]}], "residual": []})
+    result = pipe.ingest_batch(MemoryBatch(subject_id="stone", experiences=(
+        MemoryExperience(subject_id="stone", text=(
+            "甲喜欢苹果" + "果" * 90 + "。乙去公园" + "园" * 90
+            + "。甲买了水果" + "果" * 90 + "。乙看见湖" + "湖" * 90 + "。"
+        ),
+            objects={"甲": "jia"}, source_ids=("D1",), segment_id="turn",
+            occurred_at=datetime(2026, 1, 1)),)))
+    assert not result.errors and len(result.sealed_event_ids) == 2
+    events = [pipe.event_repo.get(event_id) for event_id in result.sealed_event_ids]
+    events.sort(key=lambda event: event.memory_sequence)
+    assert events[0].content_raw == "甲喜欢苹果" + "果" * 90 + "。\n甲买了水果" + "果" * 90 + "。"
+    assert events[1].content_raw == "乙去公园" + "园" * 90 + "。\n乙看见湖" + "湖" * 90 + "。"
+    assert events[0].summaries == {} and events[1].summaries == {}
+
+
+def test_first_layer_targets_300_and_splits_only_above_500(case):
+    pipe, _, llm = case
+    long_sentence = "甲" * 399 + "。"
+    llm.push_response({"events": [{"indices": [1]}], "residual": []})
+    kept = pipe.ingest_batch(MemoryBatch(subject_id="stone", experiences=(
+        MemoryExperience(subject_id="stone", text=long_sentence, objects={"甲": "jia"},
+            source_ids=("long",), segment_id="long", occurred_at=datetime(2026, 1, 1)),)))
+    assert len(kept.sealed_event_ids) == 1
+    assert pipe.event_repo.get(kept.sealed_event_ids[0]).content_raw == long_sentence.strip()
+    prompt = llm.calls[0]["messages"][0]["content"]
+    assert "100" in prompt and "300" in prompt and "500" in prompt
+    parts = [f"句{i}" + ("乙" * 170) + "。" for i in range(4)]
+    llm.push_response({"events": [{"indices": [1, 2, 3, 4]}], "residual": []})
+    llm.push_response({"prefix_text": "\n".join(parts[:2]), "tail_text": "\n".join(parts[2:])})
+    split = pipe.ingest_batch(MemoryBatch(subject_id="other", experiences=(
+        MemoryExperience(subject_id="other", text="".join(parts), objects={"乙": "yi"},
+            source_ids=("split",), segment_id="split", occurred_at=datetime(2026, 1, 2)),)))
+    assert len(split.sealed_event_ids) == 1
+    stored = pipe.event_repo.get(split.sealed_event_ids[0])
+    assert stored.content_raw == "\n".join(parts[:2]) and len(stored.content_raw) <= 500
+    residual = pipe.meta_repo.get_unclosed_events()
+    assert len(residual) == 1 and parts[2] in residual[0].merged_content and parts[3] in residual[0].merged_content
+
+
+def test_summary_keeps_a_query_term_without_attaching_raw(case):
+    pipe, service, llm = case
+    now = datetime(2026, 1, 1)
+    small(pipe, "The mentor is Dana.", now - timedelta(days=100))
+    responses(llm, summary="Dana.")
+    parent_id = service.refine_once("stone", 1, now)["parent_ids"][0]
+    # 把摘要改成已经包含查询词，用来检查“摘要够用就不再附原文”。
+    parent = pipe.event_repo.get(parent_id)
+    parent.summaries = {"L1": "The mentor is Dana."}
+    pipe.event_repo.save(parent)
+    pipe.recall_pipeline.index_event(parent)
+    found = [item for item in pipe.recall_pipeline.recall(
+        "stone", "mentor Dana", channels=("lexical",), reinforce=True) if item.type == "event"]
+    assert len(found) == 1 and found[0].event_id == parent_id and not found[0].detail_event_ids
+    assert "原文" not in found[0].content
+    hidden = next(event for event in pipe.event_repo.list_all() if event.memory_stage == 0)
+    assert hidden.forgetting_factor == 1.0
+    assert pipe.event_repo.get(parent_id).forgetting_factor > 1.0
+
+
+def test_raw_term_missing_from_summary_is_attached_inside_the_same_result(case):
+    pipe, service, llm = case
+    now = datetime(2026, 1, 1)
+    leaf = small(pipe, "The mentor is Dana.", now - timedelta(days=100))
+    responses(llm, summary="Dana.")
+    parent_id = service.refine_once("stone", 1, now)["parent_ids"][0]
+    pipe.recall_pipeline._detail_min_similarity = 0
+    found = [item for item in pipe.recall_pipeline.recall(
+        "stone", "mentor Dana", reinforce=False, level=9) if item.type == "event"]
+    assert [item.event_id for item in found] == [parent_id]
+    assert found[0].detail_event_ids == [leaf.event_id]
+    assert found[0].detail_levels == ["raw"]
+    assert "原文 #1" in found[0].content and "The mentor is Dana." in found[0].content
+    assert pipe.event_repo.get(leaf.event_id).forgetting_factor == 1.0
+
+
+def test_detail_that_does_not_fit_is_left_out_whole(case):
+    pipe, service, llm = case
+    now = datetime(2026, 1, 1)
+    leaf = small(pipe, "The mentor is Dana.", now - timedelta(days=100))
+    responses(llm, summary="Dana.")
+    parent_id = service.refine_once("stone", 1, now)["parent_ids"][0]
+    leaf.content_raw = "The mentor is Dana. " + ("x" * 800)
+    pipe.event_repo.save(leaf)
+    pipe.recall_pipeline._detail_min_similarity = 0
+    found = [item for item in pipe.recall_pipeline.recall(
+        "stone", "mentor Dana", reinforce=False, budget_chars=160)
+        if item.type == "event"]
+    assert [item.event_id for item in found] == [parent_id]
+    assert not found[0].detail_event_ids
+    assert found[0].detail_content_start is None
+    assert "xxxx" not in found[0].content
+
+
+def test_second_stage_raw_vector_finds_parent_without_becoming_a_candidate(case):
+    pipe, _, _ = case
+    when = datetime(2024, 6, 1)
+    leaf = Event(event_id="leaf", subject_id="stone", content_raw="甲：公园里有一座恐龙模型。",
+                 memory_stage=0, memory_sequence=4, occurred_at=when, source_dates=["2024-06-01"],
+                 refinement_hidden_by=["mid"])
+    mid = Event(event_id="mid", subject_id="stone", content_raw="孩子喜欢出门。", memory_stage=1,
+                memory_sequence_start=4, memory_sequence_end=4, occurred_at=when,
+                summaries={"L1": "孩子喜欢出门。"}, source_events=["leaf"],
+                refinement_hidden_by=["top"])
+    top = Event(event_id="top", subject_id="stone", content_raw="孩子喜欢出门。",
+                memory_stage=2, memory_sequence_start=4, memory_sequence_end=4, occurred_at=when,
+                summaries={"L1": "孩子喜欢出门。"}, source_events=["mid"], source_dates=["2024-06-01"])
+    for event in (leaf, mid, top):
+        pipe.event_repo.save(event)
+
+    class Scripted:
+        def _vec(self, kind):
+            if kind == "raw":
+                return [1.0, 0.0] + [0.0] * 62
+            if kind == "query":
+                return [1.0, 0.0] + [0.0] * 62
+            return [0.0, 1.0] + [0.0] * 62
+
+        def embed_documents(self, texts):
+            return [self._vec("raw" if "恐龙" in text else "summary") for text in texts]
+
+        def embed_query(self, text):
+            return self._vec("query")
+
+    pipe.recall_pipeline._embedding = Scripted()
+    pipe.recall_pipeline.index_event(top)
+    pipe.recall_pipeline._detail_min_similarity = 0.35
+    sink = []
+    found = pipe.recall_pipeline.recall(
+        "stone", "他们上次看的是什么模型", channels=("semantic",), reinforce=False,
+        candidate_sink=sink)
+    assert [item.event_id for item in found] == ["top"]
+    assert found[0].detail_event_ids == ["leaf"]
+    assert "甲：公园里有一座恐龙模型。" in found[0].content
+    assert "来源日期：2024-06-01" in found[0].content
+    assert any(item.event_id == "leaf" and item.reason == "detail_attached" and item.similarity for item in sink)
+    point = pipe.recall_pipeline._vector_store.get("top#detail#leaf")
+    assert point["type"] == "event_detail" and point["source_event_id"] == "leaf"
+
+    pipe.recall_pipeline._embedding.embed_documents = lambda texts: [
+        [1.0, 0.0] + [0.0] * 62 if "恐龙" in text else [0.0, 1.0] + [0.0] * 62
+        for text in texts
+    ]
+    pipe.recall_pipeline._embedding.embed_query = lambda text: [0.0, 1.0] + [0.0] * 62
+    pipe.recall_pipeline.index_event(top)
+    sink = []
+    blocked = pipe.recall_pipeline.recall(
+        "stone", "他们上次看的是什么模型", channels=("semantic",), reinforce=False,
+        candidate_sink=sink)
+    assert [item.event_id for item in blocked] == ["top"]
+    assert not blocked[0].detail_event_ids
+    logged = [item for item in sink if item.event_id == "leaf"]
+    assert logged and logged[0].reason == "detail_below_threshold" and logged[0].similarity is not None
+
+
+def test_level_does_not_increase_the_detail_count(case):
+    pipe, service, llm = case
+    now = datetime(2026, 1, 1)
+    small(pipe, "The mentor is Dana.", now - timedelta(days=100))
+    small(pipe, "The gift was a watch.", now - timedelta(days=99))
+    responses(llm, 2, summary="Lee had a day.")
+    parent_id = service.refine_once("stone", 1, now)["parent_ids"][0]
+    pipe.recall_pipeline._detail_min_similarity = 0
+    found = [item for item in pipe.recall_pipeline.recall(
+        "stone", "mentor watch day", reinforce=False, level=9)
+        if item.type == "event"]
+    assert [item.event_id for item in found] == [parent_id]
+    assert len(found[0].detail_event_ids) == 1
+
+
+def test_under_minimum_waits_in_residual(case):
+    pipe, _, llm = case
+    llm.push_response({"events": [{"indices": [1]}], "residual": []})
+    text = "我们去湖边散步，聊得很开心。"
+    result = pipe.ingest_batch(MemoryBatch(subject_id="stone", experiences=(
+        MemoryExperience(subject_id="stone", text=text, objects={"甲": "jia"},
+            source_ids=("walk",), segment_id="walk", occurred_at=datetime(2026, 1, 1)),)))
+    assert not result.errors and not result.sealed_event_ids
+    leftover = pipe.meta_repo.get_unclosed_events()
+    assert len(leftover) == 1 and text in leftover[0].merged_content
+
+
+def test_split_keeps_speaker_prefixes_on_both_sides(case):
+    pipe, _, llm = case
+    first = "甲：" + "啊" * 280 + "。"
+    second = "乙：" + "哦" * 280 + "。"
+    llm.push_response({"events": [{"indices": [1, 2]}], "residual": []})
+    llm.push_response({"prefix_text": first, "tail_text": second})
+    result = pipe.ingest_batch(MemoryBatch(subject_id="stone", experiences=(
+        MemoryExperience(subject_id="stone", text=first + second, objects={"甲": "jia", "乙": "yi"},
+            source_ids=("talk",), segment_id="talk", occurred_at=datetime(2026, 1, 1)),)))
+    assert len(result.sealed_event_ids) == 1
+    stored = pipe.event_repo.get(result.sealed_event_ids[0])
+    assert stored.content_raw == first and stored.content_raw.startswith("甲：")
+    residual = pipe.meta_repo.get_unclosed_events()
+    assert len(residual) == 1 and residual[0].merged_content.startswith("乙：")
+
+
+def test_unsplittable_event_is_sealed_whole(case):
+    pipe, _, llm = case
+    first = "甲：" + "啊" * 250 + "。"
+    second = "乙：" + "哦" * 250 + "。"
+    llm.push_response({"events": [{"indices": [1, 2]}], "residual": []})
+    llm.push_response({"abort": True})
+    result = pipe.ingest_batch(MemoryBatch(subject_id="stone", experiences=(
+        MemoryExperience(subject_id="stone", text=first + second, objects={"甲": "jia", "乙": "yi"},
+            source_ids=("whole",), segment_id="whole", occurred_at=datetime(2026, 1, 1)),)))
+    assert len(result.sealed_event_ids) == 1
+    stored = pipe.event_repo.get(result.sealed_event_ids[0])
+    assert stored.seal_reason == "closed"
+    assert stored.content_raw.startswith("甲：") and "乙：" in stored.content_raw
+    assert not pipe.meta_repo.get_unclosed_events()
+
+
+def test_cut_inside_one_turn_is_rejected(case):
+    pipe, _, llm = case
+    first = "甲：" + "啊" * 250 + "。"
+    second = "乙：" + "哦" * 250 + "。"
+    prefix = first[:120]
+    tail = first[120:] + "\n" + second
+    llm.push_response({"events": [{"indices": [1, 2]}], "residual": []})
+    llm.push_response({"prefix_text": prefix, "tail_text": tail})
+    result = pipe.ingest_batch(MemoryBatch(subject_id="stone", experiences=(
+        MemoryExperience(subject_id="stone", text=first + second, objects={"甲": "jia", "乙": "yi"},
+            source_ids=("mid",), segment_id="mid", occurred_at=datetime(2026, 1, 1)),)))
+    assert len(result.sealed_event_ids) == 1
+    stored = pipe.event_repo.get(result.sealed_event_ids[0])
+    assert stored.content_raw.startswith("甲：") and "乙：" in stored.content_raw
+    assert not pipe.meta_repo.get_unclosed_events()
+
+
+def _seed_residual(pipe, text, *, when, identity):
+    pipe.meta_repo.save_unclosed_event(UnclosedEvent(
+        id=identity, subject_id="stone", content_fragments=[text],
+        buffer_items=[BufferSentence(text=text, residual_id=identity)],
+        created_at=when, updated_at=when, last_hit_time=when,
+    ))
+
+
+def test_short_residual_waits_three_days_and_seals_at_seven(case):
+    pipe, _, llm = case
+    now = datetime(2026, 6, 1, 12, 0, 0)
+    short = "我们去湖边散步，聊得很开心。"
+    _seed_residual(pipe, short, when=now - timedelta(days=4), identity="UC-short")
+    llm.push_response({"events": [{"indices": [1]}], "residual": [{"indices": [2]}]})
+    memory = MemoryExperience(subject_id="stone", text="然后呢。", objects={"甲": "jia"},
+        source_ids=("next",), segment_id="next", occurred_at=now)
+    waiting = pipe.metabolism_service.process_input("然后呢。", memory=memory)
+    assert waiting == []
+    held = "\n".join(item.merged_content for item in pipe.meta_repo.get_unclosed_events())
+    assert short in held and "然后呢" in held
+
+    pipe.meta_repo.delete_unclosed_event("UC-short")
+    for item in pipe.meta_repo.get_unclosed_events():
+        pipe.meta_repo.delete_unclosed_event(item.id)
+    _seed_residual(pipe, short, when=now - timedelta(days=8), identity="UC-week")
+    llm.push_response({"events": [{"indices": [1]}], "residual": []})
+    llm.push_response({"events": [], "residual": [{"indices": [1]}]})
+    sealed = pipe.metabolism_service.process_input("接着说。", memory=memory.model_copy(
+        update={"text": "接着说。", "occurred_at": now}))
+    assert [event.content_raw for event in sealed] == [short]
+    assert sealed[0].seal_reason == "truncated"
+    leftover = "\n".join(item.merged_content for item in pipe.meta_repo.get_unclosed_events())
+    assert short not in leftover and "接着说" in leftover
+
+
+def test_unsplittable_residual_over_check_line_seals_after_three_idle_days(case):
+    pipe, _, llm = case
+    now = datetime(2026, 6, 1, 12, 0, 0)
+    long = "丙：" + "嗯" * 600 + "。"
+    _seed_residual(pipe, long, when=now - timedelta(days=4), identity="UC-long")
+    llm.push_response({"events": [], "residual": [{"indices": [1]}]})
+    memory = MemoryExperience(subject_id="stone", text="然后呢。", objects={"丙": "bing"},
+        source_ids=("later",), segment_id="later", occurred_at=now)
+    sealed = pipe.metabolism_service.process_input("然后呢。", memory=memory)
+    assert len(sealed) == 1 and sealed[0].content_raw == long
+    assert sealed[0].seal_reason == "truncated" and sealed[0].content_raw.startswith("丙：")
+    leftover = pipe.meta_repo.get_unclosed_events()
+    assert len(leftover) == 1 and leftover[0].merged_content == "然后呢。"
+
+
+def test_resave_reads_sequence_from_storage(case):
+    pipe, _, _ = case
+    event = small(pipe, "甲说完了这件事。", datetime(2026, 1, 1))
+    assert event.memory_sequence == 1
+    event.memory_sequence = None
+    pipe.event_repo.save(event)
+    assert pipe.event_repo.get(event.event_id).memory_sequence == 1
+    other = small(pipe, "乙又说了另一件事。", datetime(2026, 1, 2))
+    assert other.memory_sequence == 2
+
+
+def test_sequence_counter_initializes_from_existing_maximum(case):
+    pipe, _, _ = case
+    preset = Event(subject_id="stone", content_raw="库里已有的事。", memory_stage=0,
+                   memory_sequence=7, occurred_at=datetime(2026, 1, 1))
+    pipe.event_repo.save(preset)
+    assert pipe.event_repo.get(preset.event_id).memory_sequence == 7
+    preset.memory_sequence = 1
+    pipe.event_repo.save(preset)
+    assert pipe.event_repo.get(preset.event_id).memory_sequence == 7
+    nxt = Event(subject_id="stone", content_raw="后写入的事。", memory_stage=0,
+                occurred_at=datetime(2026, 1, 2))
+    pipe.event_repo.save(nxt)
+    assert nxt.memory_sequence == 8
+
+
+def test_representative_marks_every_child_including_one_without_names(case):
+    pipe, service, llm = case
+    now = datetime(2026, 1, 1)
+    walk = pipe.event_service.seal_event(
+        "我们去湖边散步，聊得很开心。", objects={}, subject_id="stone",
+        source_ids=("walk",), occurred_at=now - timedelta(days=100))
+    long = "我们走了" + "很" * 70 + "远，一共12公里。"
+    distance = pipe.event_service.seal_event(
+        long, objects={}, subject_id="stone", source_ids=("distance",),
+        occurred_at=now - timedelta(days=99))
+    responses(llm, 2, summary="出去了。")
+    parent = pipe.event_repo.get(service.refine_once("stone", 1, now)["parent_ids"][0])
+    summary = parent.summaries["L1"]
+    assert f"〔#{walk.memory_sequence}〕" in summary
+    assert f"〔#{distance.memory_sequence}〕" in summary
+    assert "湖边" in summary and "出去了。" in summary
+    units = {unit["event_id"]: unit for unit in parent.refinement_source_units}
+    assert units[walk.event_id]["representative"] == "我们去湖边散步，聊得很开心。"
+    assert len(units[distance.event_id]["representative"]) <= 60
+    assert "12" in units[distance.event_id]["representative"]
+    assert parent.refinement_policy["representative_overflow"] is True
+
+
+def test_budget_clip_keeps_or_drops_attached_raw_as_a_whole():
+    body = "摘要。"
+    raw = "甲：" + "啊" * 40
+    content = body + "\n\n原文 #1" + raw
+    start = len(body) + 2
+    fragment = RecalledFragment(
+        event_id="parent", text=body, content=content, detail_content_start=start,
+        detail_event_ids=["leaf"], detail_levels=["raw"],
+    )
+    whole, ids, levels = clip_fragment_content(fragment, len(content))
+    assert whole == content and ids == ["leaf"] and levels == ["raw"]
+    dropped, ids, levels = clip_fragment_content(fragment, start + 4)
+    assert dropped == body and ids == [] and levels == []
+    assert "啊" not in dropped
+    earlier, ids, levels = clip_fragment_content(fragment, len(body))
+    assert earlier == body and ids == [] and levels == []
+
+
+def test_date_anchor_locale_is_consistent():
+    from rems.recall.pipeline import source_date_anchor
+    from rems.config import RecallDetailConfig
+    assert RecallDetailConfig().date_anchor_locale == "zh"
+    assert RecallDetailConfig().min_similarity is None
+    assert "来源日期：2024-06-01" in source_date_anchor(["2024-06-01"], "zh")
+    assert "Source statement date: 2024-06-01" in source_date_anchor(["2024-06-01"], "en")
+    assert "不能折算" in source_date_anchor(["2024-06-01", "2024-06-03"], "zh")
+    assert "ambiguous" in source_date_anchor(["2024-06-01", "2024-06-03"], "en")

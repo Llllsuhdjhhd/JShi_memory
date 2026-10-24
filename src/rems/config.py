@@ -25,12 +25,17 @@ class MemoryRefinementConfig(BaseModel):
     enabled: bool = True
     stages: list[RefinementStage] = Field(default_factory=lambda: [
         RefinementStage(age_days=90), RefinementStage(age_days=365),
-        RefinementStage(age_days=1095),
     ])
     candidate_chars: int = Field(default=5000, gt=0)
     batch_chars: int = Field(default=2000, gt=0)
     direction: Literal["backward", "forward"] = "backward"
-    small_event_max_chars: int = Field(default=2000, gt=0)
+    # 第一层只使用这三个字数。下限以下先等待；参考长度写进提示词；
+    # 超过检查线时按逻辑闭合切一刀，切不开的显式兜底可以整段保存。
+    small_event_min_chars: int = Field(default=100, gt=0)
+    small_event_target_chars: int = Field(default=300, gt=0)
+    small_event_max_chars: int = Field(default=500, gt=0)
+    # 提炼时每条直接子事件补进 L1 的代表句上限。
+    representative_max_chars: int = Field(default=60, gt=0)
     max_batches_per_stage: int = Field(default=1, gt=0)
     interval_seconds: int = Field(default=3600, gt=0)
 
@@ -41,7 +46,25 @@ class MemoryRefinementConfig(BaseModel):
             raise ValueError("Refinement ages must be nonempty and strictly increasing")
         if self.batch_chars > self.candidate_chars:
             raise ValueError("batch_chars cannot exceed candidate_chars")
+        if not (self.small_event_min_chars
+                <= self.small_event_target_chars
+                <= self.small_event_max_chars):
+            raise ValueError("small event lengths must satisfy minimum <= target <= maximum")
         return self
+
+
+class RecallDetailConfig(BaseModel):
+    """命中上层事件后，是否在同一条结果里附上下层材料。
+
+    条数是固定上限。不读取回忆档位，避免调用方的自动升降改变细节量。
+    """
+
+    enabled: bool = True
+    max_count: int = Field(default=1, ge=1)
+    # 为空时使用 recall_semantic_min。回放记录每条原文的相似度，便于离线比较门槛。
+    min_similarity: float | None = Field(default=None, ge=0, le=1)
+    # 上层事件和附上的原文使用同一种日期锚点。zh 为真实使用的默认写法，en 供英文评测。
+    date_anchor_locale: Literal["zh", "en"] = "zh"
 
 
 class UserMode(str, Enum):
@@ -93,6 +116,8 @@ class LLMConfig(BaseModel):
     task_models: TaskModelMapping = Field(default_factory=TaskModelMapping)
     temperature: float = 0.3
     max_retries: int = 3
+    # Provider-specific request options; empty preserves the existing request.
+    extra_body: dict = Field(default_factory=dict)
 
 
 class EmbeddingConfig(BaseModel):
@@ -250,6 +275,8 @@ class REMSConfig(BaseSettings):
     recall_embedding_version: int = 1
     # 原文用于寻找事件；压缩层仍用于取回后的预算选级。L1 保留作对照。
     recall_event_index_level: Literal["L0", "L1"] = "L0"
+    # 上层事件被选中后，摘要缺少的查询词才附到同一条结果。档位不参与。
+    recall_detail: RecallDetailConfig = Field(default_factory=RecallDetailConfig)
 
     # ---- Recall: 并发人物提取与多路检索（本轮新增）----
     # 回忆是否等待回忆前的人物提取结果。默认 False：人物提取并发跑，回忆用即时启发式 focus，不阻塞。
@@ -491,6 +518,7 @@ class REMSConfig(BaseSettings):
     # 回忆命中强化：温和增长（1.15x），避免指数累积把事件推向"永生"；
     # 上限 3.0 保持强度可区分但有限（原 1.5x/300 会让高频命中事件永不遗忘）。
     recall_reinforce_multiplier: float = 1.15
+    recall_reinforce_enabled: bool = True
     recall_forgetting_factor_cap: float = 3.0
 
     # ---- White-painting collection tier (白皮书 2.3 动态粒度路由·收集端) ----

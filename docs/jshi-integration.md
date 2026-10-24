@@ -24,7 +24,7 @@ REMS 的 `recall` 接口支持：
 | `interlocutor_object_id` | 本轮查询对话人对象 ID；会用于区分历史对话对象和其他涉及对象 |
 | `time_range` | 起止时间元组；与 `/api/recall` 同名的文本字段映射略有不同 |
 | `budget_chars`, `expand_raw`, `limit` | 字符预算、是否展开原文和片段数量 |
-| `level`, `anchor_event_ids` | 为兼容端口而接收；当前回忆实现尚未使用 |
+| `level`, `anchor_event_ids` | 为兼容端口而接收。细节条数不随 `level` 变化；原文附在同一条 `content` 里。`detail_event_ids` 随结果返回；预算放不下时整段去掉，不从原文中间截断 |
 
 对象角色权重当前是：历史事件的对话对象 0.7，其他涉及对象 0.3。历史对话对象归属从事件来源子段写入 `interlocutor_attributions`，返回标签表示事件的历史互动关系，不表示该对象一定在回忆材料中亲自说过某句文本。
 

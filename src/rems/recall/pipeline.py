@@ -89,6 +89,7 @@ class _Candidate:
     object_role_weight: float = 1.0
     interlocutor_attributions: list[InterlocutorAttribution] = field(default_factory=list)
     is_recent_lane: bool = False
+    detail_scores: dict[str, float] | None = None
 
     @property
     def relevance(self) -> float:
@@ -101,6 +102,92 @@ class _Candidate:
     @property
     def rank_score(self) -> float:
         return self.relevance * self.object_role_weight
+
+
+@dataclass
+class RecallCandidate:
+    """一次 recall 中候选材料的去向（仅诊断；不参与排序、不占预算、不影响结果）。
+
+    ``_fill_budget`` 按最终顺序访问候选，选中的与被淘汰的都记一条，因此可以离线回答
+    「正确材料排第几、有多大、为什么没交付」。``reason`` 取 ``selected`` / ``limit`` /
+    ``duplicate`` / ``no_room`` 四值：``limit`` 是条数上限截断，``duplicate`` 是同一事件
+    的同一材料类型重复占位，``no_room`` 是剩余预算放不下任何一级表示。
+    """
+
+    call: int
+    rank: int
+    material_type: str
+    event_id: str
+    object_id: str | None
+    score: float
+    selected: bool
+    reason: str
+    representation_level: str | None = None
+    chars: int = 0
+    budget_remaining: int = 0
+    similarity: float | None = None
+
+    def as_dict(self) -> dict:
+        return {
+            "call": self.call,
+            "rank": self.rank,
+            "material_type": self.material_type,
+            "event_id": self.event_id,
+            "object_id": self.object_id,
+            "score": self.score,
+            "selected": self.selected,
+            "reason": self.reason,
+            "representation_level": self.representation_level,
+            "chars": self.chars,
+            "budget_remaining": self.budget_remaining,
+            "similarity": self.similarity,
+        }
+
+
+CANDIDATE_REASONS = (
+    "selected", "limit", "duplicate", "no_room",
+    "detail_attached", "detail_no_room", "detail_limit",
+    "detail_below_threshold",
+)
+
+
+def source_date_anchor(dates: list[str], locale: str = "zh") -> str:
+    """同一条结果里的日期锚点使用同一种写法。相对日期以来源日期为准。"""
+    shown = [value[:10] for value in dates if value]
+    if not shown:
+        return ""
+    if locale == "en":
+        if len(shown) == 1:
+            return f"[Source statement date: {shown[0]}; relative dates refer to this date.] "
+        return (
+            f"[Source statements span {shown[0]} to {shown[-1]}; "
+            "relative-date anchor is ambiguous.] "
+        )
+    if len(shown) == 1:
+        return f"[来源日期：{shown[0]}；文中的相对日期以这一天为准。] "
+    return f"[来源日期从 {shown[0]} 到 {shown[-1]}；相对日期不能折算到同一天。] "
+
+
+def query_terms_for_detail(query: str) -> tuple[str, set[str]]:
+    """查询词：纯英文走现有词面词；否则按标点切开，至少两个字。"""
+    if re.search(r"[A-Za-z]", query) and not re.search(r"[\u3400-\u9fff]", query):
+        return "en", _english_terms(query)
+    return "text", {piece.casefold() for piece in _ENGLISH_WORDS.findall(query) if len(piece) >= 2}
+
+
+def terms_present(kind: str, terms: set[str], text: str) -> set[str]:
+    if not terms or not text:
+        return set()
+    if kind == "en":
+        return terms & _english_terms(text)
+    folded = text.casefold()
+    return {term for term in terms if term in folded}
+
+
+def missing_query_terms(query: str, summary: str, detail: str) -> set[str]:
+    """下层里有、已交付摘要里没有的查询词。没有这种词就不附细节。"""
+    kind, terms = query_terms_for_detail(query)
+    return terms_present(kind, terms, detail) - terms_present(kind, terms, summary)
 
 
 def order_by_relevance(items: list[_Candidate], close: float) -> list[_Candidate]:
@@ -287,6 +374,10 @@ class RecallPipeline:
         embedding_version: int = 1,
         english_word_lexical: bool = False,
         event_index_level: str = "L1",
+        detail_enabled: bool = True,
+        detail_max_count: int = 1,
+        detail_min_similarity: float | None = None,
+        date_anchor_locale: str = "zh",
     ):
         self._embedding = embedding
         self._vector_store = vector_store
@@ -327,6 +418,12 @@ class RecallPipeline:
         if event_index_level not in {"L0", "L1"}:
             raise ValueError("event_index_level must be L0 or L1")
         self._event_index_level = event_index_level
+        self._detail_enabled = detail_enabled
+        self._detail_max_count = max(1, int(detail_max_count))
+        self._detail_min_similarity = (
+            self._semantic_min if detail_min_similarity is None else float(detail_min_similarity)
+        )
+        self._date_anchor_locale = date_anchor_locale if date_anchor_locale in {"zh", "en"} else "zh"
 
     # ------------------------------------------------------------------
     def recall(
@@ -345,9 +442,15 @@ class RecallPipeline:
         anchor_event_ids: tuple[str, ...] = (),
         channels: tuple[str, ...] | None = None,
         reinforce: bool = True,
+        candidate_sink: list[RecallCandidate] | None = None,
+        candidate_call: int = 0,
     ) -> tuple[RecalledFragment, ...]:
-        """交回事件摘要和对象事件事实；对象角色权重只参与排序。"""
-        del level, anchor_event_ids  # 档位由预算决定；锚点不作为这一版的检索路
+        """交回事件摘要和对象事件事实；对象角色权重只参与排序。
+
+        ``candidate_sink`` 非空时把本次按序访问到的候选追加进去（仅诊断用途）。
+        """
+        # 档位不改变细节条数，避免调用方自动升降把明细带多。锚点不参与检索。
+        del level, anchor_event_ids
         q = (query or "").strip()
         if not _norm(q):
             return ()
@@ -374,7 +477,7 @@ class RecallPipeline:
                     subject_id, q, wanted, time_range,
                     query_vector=query_vector,
                     event_ids=tuple(event.event_id for event in events),
-                    top_k=max(self._top_k, len(events) * 4),
+                    top_k=max(self._top_k, len(events) * 32),
                 )
                 if self._recency_enabled:
                     recent_event_ids = {
@@ -424,7 +527,11 @@ class RecallPipeline:
         ordered = self._arrange(admitted, wanted, close=0.0 if small_library else None)
         if recent_event_ids and not small_library:
             ordered = self._reserve_recent_candidate(ordered, wanted)
-        fragments = self._fill_budget(ordered, budget, expand_raw=expand_raw, limit=limit)
+        fragments = self._fill_budget(
+            ordered, budget, expand_raw=expand_raw, limit=limit,
+            candidate_sink=candidate_sink, candidate_call=candidate_call,
+            query=q, query_vector=query_vector if use_semantic else None,
+        )
         if reinforce:
             seen: set[str] = set()
             for frag in fragments:
@@ -497,6 +604,18 @@ class RecallPipeline:
                 )
                 if not self._index_unchanged(logical_id, payload):
                     pending.append((logical_id, fact, payload))
+        if event.memory_stage and event.source_events:
+            for leaf_id, leaf_text in self._source_raw_texts(event):
+                logical_id = f"{event.event_id}#detail#{leaf_id}"
+                desired.add(logical_id)
+                payload = self._index_payload(
+                    event, material_type="event_detail", object_id=None,
+                    object_ids=event_object_ids, text=leaf_text,
+                )
+                payload["source_event_id"] = leaf_id
+                payload["representation_level"] = "raw"
+                if not self._index_unchanged(logical_id, payload):
+                    pending.append((logical_id, leaf_text, payload))
         lister = getattr(self._vector_store, "list_event_logical_ids", None)
         if lister is not None:
             for stale_id in set(lister(event.event_id)) - desired:
@@ -646,7 +765,10 @@ class RecallPipeline:
                 continue
             material = payload.get("type") or "event"
             object_id = payload.get("object_id") or ""
-            if material != "object_event_fact":
+            if material == "event_detail":
+                # 原文向量只给所属上层事件加分，第三段是子事件编号，不单独成为候选。
+                object_id = str(payload.get("source_event_id") or "")
+            elif material != "object_event_fact":
                 material = "event"
                 object_id = ""
             key = (material, str(event_id), str(object_id))
@@ -686,13 +808,32 @@ class RecallPipeline:
             for key, text in (ev.summaries or {}).items()
             if text and str(text).strip()
         }
-        event_text = ev.content_raw if ev.memory_stage == 0 else "\n".join(levels.values())
+        raws = self._source_raw_texts(ev) if ev.memory_stage else []
+        lexical_parts = [ev.content_raw or ""] if ev.memory_stage == 0 else [
+            "\n".join(levels.values()), *[text for _leaf_id, text in raws],
+        ]
+        lexical = 0.0
+        if use_lexical:
+            lexical = max(
+                (lexical_score(query, text, english_words=self._english_word_lexical)
+                 for text in lexical_parts if text and text.strip()),
+                default=0.0,
+            )
+        own_semantic = semantic.get(("event", ev.event_id, ""), 0.0) if use_semantic else 0.0
+        detail_scores = {
+            key[2]: score for key, score in semantic.items()
+            if key[0] == "event_detail" and key[1] == ev.event_id
+        } if use_semantic else None
+        event_semantic = max(
+            [own_semantic, *(detail_scores or {}).values()],
+            default=0.0,
+        )
         out = [_Candidate(
             material_type="event",
             event_id=ev.event_id,
             object_id=_shown_object_id(ev, wanted),
-            semantic=semantic.get(("event", ev.event_id, ""), 0.0) if use_semantic else 0.0,
-            lexical=lexical_score(query, event_text, english_words=self._english_word_lexical) if use_lexical else 0.0,
+            semantic=event_semantic,
+            lexical=lexical,
             object_hit=object_hit,
             temporal=temporal,
             accessibility=access,
@@ -704,6 +845,7 @@ class RecallPipeline:
             event=ev,
             object_role_weight=event_object_role_weight,
             is_recent_lane=ev.event_id in recent_event_ids,
+            detail_scores=detail_scores,
         )]
         for role in ev.role_list:
             if role.is_subject:
@@ -850,23 +992,52 @@ class RecallPipeline:
         *,
         expand_raw: bool,
         limit: int | None,
+        candidate_sink: list[RecallCandidate] | None = None,
+        candidate_call: int = 0,
+        query: str = "",
+        query_vector: list[float] | None = None,
     ) -> list[RecalledFragment]:
         remaining = budget
         seen: set[tuple[str, str, str]] = set()
         out: list[RecalledFragment] = []
-        for cand in ordered:
+
+        def record(
+            rank: int,
+            cand: _Candidate,
+            *,
+            selected: bool,
+            reason: str,
+            level_name: str | None = None,
+            chars: int = 0,
+        ) -> None:
+            """每条被访问到的候选都留痕，选中的与淘汰的都记（诊断用，不改结果）。"""
+            if candidate_sink is None:
+                return
+            candidate_sink.append(RecallCandidate(
+                call=candidate_call,
+                rank=rank,
+                material_type=cand.material_type,
+                event_id=cand.event_id,
+                object_id=cand.object_id,
+                score=round(cand.rank_score, 6),
+                selected=selected,
+                reason=reason,
+                representation_level=level_name,
+                chars=chars,
+                budget_remaining=remaining,
+            ))
+
+        for rank, cand in enumerate(ordered, 1):
             if limit is not None and len(out) >= limit:
+                record(rank, cand, selected=False, reason="limit")
                 break
             key = (cand.material_type, cand.event_id, cand.object_id or "")
             if key in seen:
+                record(rank, cand, selected=False, reason="duplicate")
                 continue
             seen.add(key)
             dates = sorted({value[:10] for value in (cand.event.source_dates if cand.event else [])})
-            date_note = ""
-            if len(dates) == 1:
-                date_note = f"[Source statement date: {dates[0]}; relative dates refer to this date.] "
-            elif dates:
-                date_note = f"[Source statements span {dates[0]} to {dates[-1]}; relative-date anchor is ambiguous.] "
+            date_note = source_date_anchor(dates, self._date_anchor_locale)
             if cand.material_type == "unclosed":
                 picked = (cand.raw, "raw") if len(cand.raw) <= remaining else None
             else:
@@ -875,10 +1046,26 @@ class RecallPipeline:
                     expand_raw=expand_raw or bool(cand.event and cand.event.memory_stage == 0),
                 )
             if picked is None:
+                record(rank, cand, selected=False, reason="no_room")
                 continue
-            content, level_name = picked
-            content = date_note + content
+            body, level_name = picked
+            detail_ids: list[str] = []
+            detail_levels: list[str] = []
+            detail_text = ""
+            if cand.material_type == "event" and cand.event is not None and cand.event.memory_stage:
+                detail_budget = remaining - len(date_note) - len(body) - 2
+                detail_text, detail_ids, detail_levels = self._attach_details(
+                    cand.event, query, detail_budget,
+                    scores=cand.detail_scores,
+                    rank=rank, parent=cand, candidate_sink=candidate_sink,
+                    candidate_call=candidate_call,
+                )
+            head = date_note + body
+            detail_content_start = (len(head) + 2) if detail_text else None
+            content = head + (("\n\n" + detail_text) if detail_text else "")
             remaining -= len(content)
+            record(rank, cand, selected=True, reason="selected",
+                   level_name=level_name, chars=len(content))
             signals = {
                 "semantic": round(cand.semantic, 6),
                 "lexical": round(cand.lexical, 6),
@@ -910,10 +1097,158 @@ class RecallPipeline:
                 score=round(cand.rank_score, 6),
                 summary_level=level_name,
                 representation_level=level_name,
+                detail_event_ids=detail_ids,
+                detail_levels=detail_levels,
+                detail_content_start=detail_content_start,
                 signals=signals,
                 occurred_at=cand.occurred_at,
             ))
         return out
+
+    def _attach_details(
+        self,
+        event: Event,
+        query: str,
+        budget: int,
+        *,
+        scores: dict[str, float] | None,
+        rank: int,
+        parent: _Candidate,
+        candidate_sink: list[RecallCandidate] | None,
+        candidate_call: int,
+    ) -> tuple[str, list[str], list[str]]:
+        """相似度达到门槛的第一层原文才附上。没有语义分时不现算向量。放不下的整条不附。"""
+        if not self._detail_enabled or budget < 0 or scores is None:
+            return "", [], []
+        materials = [
+            (child, level_name, text)
+            for child, level_name, text in self._detail_materials(event)
+            if level_name == "raw"
+        ]
+        if not materials:
+            return "", [], []
+        ranked = sorted(materials, key=lambda item: (
+            scores.get(item[0].event_id, 0.0),
+            lexical_score(query, item[2], english_words=self._english_word_lexical),
+        ), reverse=True)
+        chosen: list[tuple[Event, str, str]] = []
+        room = budget
+        for child, level_name, text in ranked:
+            similarity = scores.get(child.event_id, 0.0)
+            if similarity < self._detail_min_similarity:
+                self._record_detail(candidate_sink, candidate_call, rank, parent, child,
+                                    reason="detail_below_threshold", level_name=level_name,
+                                    similarity=similarity)
+                continue
+            if len(chosen) >= self._detail_max_count:
+                self._record_detail(candidate_sink, candidate_call, rank, parent, child,
+                                    reason="detail_limit", level_name=level_name,
+                                    similarity=similarity)
+                continue
+            block = self._detail_block(child, level_name, text)
+            separator = 2 if chosen else 0
+            if separator + len(block) > room:
+                self._record_detail(candidate_sink, candidate_call, rank, parent, child,
+                                    reason="detail_no_room", level_name=level_name,
+                                    budget_remaining=room, similarity=similarity)
+                continue
+            room -= separator + len(block)
+            chosen.append((child, level_name, block))
+            self._record_detail(candidate_sink, candidate_call, rank, parent, child,
+                                reason="detail_attached", level_name=level_name,
+                                chars=len(block), budget_remaining=room, similarity=similarity)
+        chosen.sort(key=lambda item: self._detail_order(item[0]))
+        return ("\n\n".join(block for _child, _level, block in chosen),
+                [child.event_id for child, _level, _block in chosen],
+                [level for _child, level, _block in chosen])
+
+    def _source_raw_texts(self, event: Event, seen: set[str] | None = None) -> list[tuple[str, str]]:
+        """上层事件名下每一条第一层原文。中间层摘要不在这里返回。"""
+        seen = set() if seen is None else seen
+        found: list[tuple[str, str]] = []
+        for event_id in event.source_events or []:
+            if event_id in seen:
+                continue
+            seen.add(event_id)
+            child = self._event_repo.get(event_id)
+            if child is None:
+                continue
+            if child.memory_stage == 0 or not child.source_events:
+                text = (child.content_raw or "").strip()
+                if text:
+                    found.append((child.event_id, text))
+                continue
+            found.extend(self._source_raw_texts(child, seen))
+        return found
+
+    def _detail_materials(self, event: Event, seen: set[str] | None = None) -> list[tuple[Event, str, str]]:
+        seen = set() if seen is None else seen
+        found: list[tuple[Event, str, str]] = []
+        for event_id in event.source_events or []:
+            if event_id in seen:
+                continue
+            seen.add(event_id)
+            child = self._event_repo.get(event_id)
+            if child is None:
+                continue
+            if child.memory_stage == 0:
+                text = (child.content_raw or "").strip()
+                if text:
+                    found.append((child, "raw", text))
+                continue
+            summary = (child.summaries or {}).get("L1") or ""
+            if summary.strip():
+                found.append((child, "L1", summary.strip()))
+            found.extend(self._detail_materials(child, seen))
+        return found
+
+    @staticmethod
+    def _detail_order(event: Event) -> tuple[int, int, str]:
+        if event.memory_sequence is not None:
+            return event.memory_sequence, event.memory_sequence, event.event_id
+        if event.memory_sequence_start is not None:
+            return event.memory_sequence_start, event.memory_sequence_end or 0, event.event_id
+        moment = event.event_time_start or event.occurred_at or event.create_time
+        return 10**12, int(moment.timestamp()) if moment else 0, event.event_id
+
+    def _detail_block(self, event: Event, level_name: str, text: str) -> str:
+        kind = "原文" if level_name == "raw" else "摘要"
+        if event.memory_sequence is not None:
+            number = f"#{event.memory_sequence}"
+        elif event.memory_sequence_start is not None and event.memory_sequence_end is not None:
+            number = f"#{event.memory_sequence_start}–{event.memory_sequence_end}"
+        else:
+            number = ""
+        dates = list(event.source_dates or [])
+        if not dates and event.occurred_at is not None:
+            dates = [event.occurred_at.date().isoformat()]
+        anchor = source_date_anchor(dates, self._date_anchor_locale)
+        label = f"{kind} {number}" if number else kind
+        return f"{label}{anchor}{text}"
+
+    def _record_detail(
+        self,
+        sink: list[RecallCandidate] | None,
+        call: int,
+        rank: int,
+        parent: _Candidate,
+        child: Event,
+        *,
+        reason: str,
+        level_name: str,
+        chars: int = 0,
+        budget_remaining: int = 0,
+        similarity: float | None = None,
+    ) -> None:
+        if sink is None:
+            return
+        sink.append(RecallCandidate(
+            call=call, rank=rank, material_type="event", event_id=child.event_id,
+            object_id=parent.object_id, score=round(parent.rank_score, 6),
+            selected=reason == "detail_attached", reason=reason,
+            representation_level=level_name, chars=chars, budget_remaining=budget_remaining,
+            similarity=None if similarity is None else round(similarity, 6),
+        ))
 
     def _fact_l1(self, role_id: str, event_id: str) -> str:
         levels = self._fact_levels(role_id, event_id)

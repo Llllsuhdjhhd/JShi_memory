@@ -3,16 +3,27 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 from datetime import datetime, timedelta, timezone
 
 from ..models.event import Event
 from ..skills.boundary_detection import BoundaryDetectionSkill
-from ..utils.text import normalize_indices
+from ..utils.text import normalize_indices, segment_sentences
+
+_CLUE = re.compile(r"\d{4}-\d{2}-\d{2}|\d+年|\d+月\d*日?|\d+(?:\.\d+)?")
 
 
 def utc(value: datetime) -> datetime:
     # Explicit and host-independent for legacy timestamps without offsets.
     return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+
+
+def sequence_span(event: Event) -> tuple[int, int] | None:
+    if event.memory_sequence is not None:
+        return event.memory_sequence, event.memory_sequence
+    if event.memory_sequence_start is not None and event.memory_sequence_end is not None:
+        return event.memory_sequence_start, event.memory_sequence_end
+    return None
 
 
 def time_span(event: Event) -> tuple[datetime, datetime]:
@@ -33,6 +44,82 @@ class RefinementService:
         if not text.strip():
             raise ValueError(f"Missing prior L1: {event.event_id}; source remains visible")
         return text
+
+    def _keep_representatives(self, parent: Event, group: list[Event], units: list[dict], stage) -> bool:
+        """每条直接子事件在 L1 里有序号。来源记录另存代表句，只供审计。"""
+        limit = self.config.memory_refinement.representative_max_chars
+        source_length = len("\n\n".join(self.source_text(event) for event in group))
+        budget = max(1, int(source_length * stage.l1_retention_ratio))
+        narrative = parent.summaries.get("L1", "")
+        additions: list[str] = []
+        for event, unit in zip(group, units):
+            label = self._sequence_label(event, unit)
+            marker = f"〔#{label}〕"
+            sentence = self._representative_sentence(event, limit)
+            unit["representative"] = sentence
+            if marker not in narrative and all(not line.startswith(marker) for line in additions):
+                additions.append(f"{marker}{sentence}")
+        if not additions:
+            missing = [f"〔#{self._sequence_label(event, unit)}〕" for event, unit in zip(group, units)]
+            if any(marker not in narrative for marker in missing):
+                raise ValueError("Refinement L1 is missing a child sequence marker")
+            return len(narrative) > budget
+        extra = "\n".join(additions)
+        room = budget - len(extra) - 1
+        trimmed = self._trim_narrative(narrative, room) if room > 0 else ""
+        if trimmed:
+            text = trimmed.rstrip() + "\n" + extra
+            overflow = False
+        else:
+            # 代表句放不进剩余预算时，保留原摘要和代表句，并记下超出。
+            text = (narrative.rstrip() + "\n" + extra) if narrative.strip() else extra
+            overflow = len(text) > budget
+        parent.summaries = {**parent.summaries, "L1": text}
+        parent.summary_lengths = {**parent.summary_lengths, "L1": len(text)}
+        return overflow
+
+    @staticmethod
+    def _sequence_label(event: Event, unit: dict) -> str:
+        if unit.get("memory_sequence") is not None:
+            return str(unit["memory_sequence"])
+        start, end = unit.get("memory_sequence_start"), unit.get("memory_sequence_end")
+        if start is not None and end is not None:
+            return str(start) if start == end else f"{start}–{end}"
+        if event.memory_sequence is not None:
+            return str(event.memory_sequence)
+        return event.event_id
+
+    def _representative_sentence(self, event: Event, limit: int) -> str:
+        text = self.source_text(event).strip()
+        sentences = segment_sentences(text) or [text]
+        names = [name for name in event.refinement_objects if name]
+
+        def clues(sentence: str) -> list[str]:
+            found = [name for name in names if name in sentence]
+            found.extend(_CLUE.findall(sentence))
+            return found
+
+        chosen = max(sentences, key=lambda sentence: (bool(clues(sentence)), len(clues(sentence)), -len(sentence)))
+        if not clues(chosen):
+            chosen = sentences[0]
+        found = clues(chosen)
+        if len(chosen) <= limit:
+            return chosen
+        if found:
+            index = chosen.find(found[0])
+            start = max(0, min(index, len(chosen) - limit))
+            return chosen[start:start + limit]
+        return chosen[:limit]
+
+    @staticmethod
+    def _trim_narrative(text: str, limit: int) -> str:
+        if len(text) <= limit:
+            return text
+        cut = text[:limit]
+        index = max(cut.rfind(mark) for mark in ("。", "！", "？", ".", "!", "?", "\n"))
+        if index > 0:
+            return cut[:index + 1].rstrip()
+        return ""
 
     def select(self, subject_id: str, target: int, now: datetime) -> list[Event]:
         policy = self.config.memory_refinement
@@ -151,7 +238,10 @@ class RefinementService:
                         "input_level": "L0" if event.memory_stage == 0 else "L1",
                         "start_char": cursor, "end_char": cursor + len(text),
                         "event_time_start": unit_start.isoformat(), "event_time_end": unit_end.isoformat(),
-                        "source_dates": event.source_dates})
+                        "source_dates": event.source_dates,
+                        "memory_sequence": event.memory_sequence,
+                        "memory_sequence_start": event.memory_sequence_start,
+                        "memory_sequence_end": event.memory_sequence_end})
                     cursor += len(text) + 2
                     for attr in event.interlocutor_attributions:
                         attrs[(attr.segment_id, attr.object_id)] = attr
@@ -164,15 +254,21 @@ class RefinementService:
                     source_context=json.dumps(units, ensure_ascii=False))
                 if not parent.summaries.get("L1", "").strip():
                     raise ValueError("Refinement produced no L1; sources remain visible")
+                overflow = self._keep_representatives(parent, group, units, stage)
                 # Keep the fresh ID assigned by EventService. Competing attempts
                 # must not share vector IDs: a losing worker cleans only its own
                 # unpublished points. SQL source ownership provides idempotency.
                 parent.source_events = [event.event_id for event in group]
+                spans = [span for event in group if (span := sequence_span(event)) is not None]
+                if len(spans) == len(group):
+                    parent.memory_sequence_start = min(span[0] for span in spans)
+                    parent.memory_sequence_end = max(span[1] for span in spans)
                 parent.event_time_start, parent.event_time_end = start, end
                 parent.create_time, parent.refined_at = now, now
                 parent.refinement_policy = {"age_days": stage.age_days,
                     "l1_retention_ratio": stage.l1_retention_ratio,
-                    "input_level": "L0" if target == 1 else "L1"}
+                    "input_level": "L0" if target == 1 else "L1",
+                    "representative_overflow": overflow}
                 parent.refinement_source_units = units
                 parents.append(parent)
                 consumed.extend(group)

@@ -28,7 +28,11 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 from ..config import REMSConfig
-from ..llm.prompts import OVERLONG_UC_SPLIT_SYSTEM, OVERLONG_UC_SPLIT_USER
+from ..llm.prompts import (
+    OVERLONG_UC_SPLIT_SYSTEM,
+    OVERLONG_UC_SPLIT_USER,
+    overlong_length_split_messages,
+)
 from ..llm.provider import LLMProvider
 from ..models.metabolism import UnclosedEvent
 from .boundary_detection import BoundaryResult, CompletedFragment, NewUnclosed
@@ -183,7 +187,34 @@ class OverlongUCSplitSkill:
     def split(self, content: str) -> SplitOutcome:
         if not content:
             return SplitOutcome("", "", aborted=True)
+        if self._config.memory_refinement.enabled:
+            return self._split_by_length(content)
+        return self._split_by_ratio(content)
 
+    def _split_by_length(self, content: str) -> SplitOutcome:
+        """前段落在下限和检查线之间即接受。不使用 70%–90% 的比例防线。"""
+        policy = self._config.memory_refinement
+        system, user = overlong_length_split_messages(
+            content,
+            minimum=policy.small_event_min_chars,
+            target=min(policy.small_event_target_chars, policy.small_event_max_chars),
+            maximum=policy.small_event_max_chars,
+        )
+        split = self._request_split(system, user, content)
+        if split is None:
+            return SplitOutcome("", "", aborted=True)
+        prefix, tail = split
+        if prefix is None or tail is None:
+            return SplitOutcome("", "", aborted=True)
+        if not (policy.small_event_min_chars <= len(prefix) <= policy.small_event_max_chars):
+            logger.info(
+                "Length split prefix_len=%d outside [%d, %d]; aborting",
+                len(prefix), policy.small_event_min_chars, policy.small_event_max_chars,
+            )
+            return SplitOutcome("", "", aborted=True)
+        return SplitOutcome(prefix_text=prefix, tail_text=tail, aborted=False)
+
+    def _split_by_ratio(self, content: str) -> SplitOutcome:
         cfg = self._config
         user_msg = OVERLONG_UC_SPLIT_USER.format(
             content=content,
@@ -191,40 +222,12 @@ class OverlongUCSplitSkill:
             ratio_lo=cfg.boundary_split_ratio_min,
             ratio_hi=cfg.boundary_split_ratio_max,
         )
-        try:
-            data = self._llm.complete_json(
-                "overlong_uc_split",
-                [
-                    {"role": "system", "content": OVERLONG_UC_SPLIT_SYSTEM},
-                    {"role": "user", "content": user_msg},
-                ],
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("OverlongUCSplitSkill LLM call failed: %s", exc)
+        split = self._request_split(OVERLONG_UC_SPLIT_SYSTEM, user_msg, content)
+        if split is None:
             return SplitOutcome("", "", aborted=True)
-
-        if data.get("abort") is True:
+        prefix, tail = split
+        if prefix is None or tail is None:
             return SplitOutcome("", "", aborted=True)
-
-        prefix = (data.get("prefix_text") or "").strip()
-        tail = (data.get("tail_text") or "").strip()
-
-        if not prefix or not tail:
-            return SplitOutcome("", "", aborted=True)
-
-        # 字符等价校验：允许首尾空白差异，但不允许内容增减（防止 LLM 改写）。
-        if self._canonical(prefix + tail) != self._canonical(content):
-            # 小概率：模型把分隔符吞了或重复了一下。做一次宽容处理：用 prefix 在原文里定位切点。
-            joined = prefix + tail
-            if self._canonical(joined).replace("\n", "") != self._canonical(content).replace("\n", ""):
-                logger.warning(
-                    "OverlongUCSplitSkill content mismatch; aborting remediation. "
-                    "prefix_len=%d tail_len=%d orig_len=%d",
-                    len(prefix), len(tail), len(content),
-                )
-                return SplitOutcome("", "", aborted=True)
-
-        # 比例硬防线（区间外直接放弃；不再二次评估）。
         total = len(prefix) + len(tail)
         ratio = len(prefix) / total if total else 0.0
         if ratio < cfg.boundary_split_ratio_min - 0.05 or ratio > cfg.boundary_split_ratio_max + 0.05:
@@ -233,8 +236,37 @@ class OverlongUCSplitSkill:
                 ratio,
             )
             return SplitOutcome("", "", aborted=True)
-
         return SplitOutcome(prefix_text=prefix, tail_text=tail, aborted=False)
+
+    def _request_split(self, system: str, user: str, content: str) -> tuple[str, str] | None:
+        """返回与原文等价的前后段。模型放弃、调用失败或改写原文时返回 None。"""
+        try:
+            data = self._llm.complete_json(
+                "overlong_uc_split",
+                [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("OverlongUCSplitSkill LLM call failed: %s", exc)
+            return None
+        if data.get("abort") is True:
+            return None
+        prefix = (data.get("prefix_text") or "").strip()
+        tail = (data.get("tail_text") or "").strip()
+        if not prefix or not tail:
+            return None
+        if self._canonical(prefix + tail) != self._canonical(content):
+            joined = prefix + tail
+            if self._canonical(joined).replace("\n", "") != self._canonical(content).replace("\n", ""):
+                logger.warning(
+                    "OverlongUCSplitSkill content mismatch; aborting remediation. "
+                    "prefix_len=%d tail_len=%d orig_len=%d",
+                    len(prefix), len(tail), len(content),
+                )
+                return None
+        return prefix, tail
 
     @staticmethod
     def _canonical(s: str) -> str:

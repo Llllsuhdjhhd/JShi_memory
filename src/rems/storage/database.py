@@ -71,6 +71,15 @@ class EventRecord(Base):
     recall_metadata = Column(JSON, default=dict)
 
 
+class SubjectSequenceRecord(Base):
+    """每个主体一行的第一层序号计数。旧库由 create_all 补建，不改已有事件表。"""
+
+    __tablename__ = "subject_memory_sequences"
+
+    subject_id = Column(String, primary_key=True)
+    next_value = Column(Integer, nullable=False, default=1)
+
+
 class EventTier1Record(Base):
     """Tier-1 active pool metadata: A-Res sample_key + ASF (§4.5)."""
 

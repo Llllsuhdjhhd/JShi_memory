@@ -202,4 +202,13 @@ def aggregate(records):
     result["adversarial_questions"] = sum(r["category"] == 5 for r in valid)
     result["adversarial_accuracy"] = mean([r["grade"]["answer_verdict"] == "correct"
                                            for r in valid if r["category"] == 5])
+    diagnostics = [r["retrieval_evidence"] for r in valid
+                   if r.get("retrieval_evidence", {}).get("evidence")]
+    result["retrieval_evidence"] = {"questions": len(diagnostics),
+        **{level + "_hit_rate": mean([r[level + "_hit"] for r in diagnostics])
+           for level in ("session", "chunk", "turn")},
+        **{level + "_recall": mean([r[level + "_recall"] for r in diagnostics])
+           for level in ("session", "chunk", "turn")},
+        "cross_conversation_events": sum(r["cross_conversation_events"] for r in diagnostics),
+        "unmatched_events": sum(r["unmatched_events"] for r in diagnostics)}
     return result
