@@ -22,7 +22,7 @@ class EvaluationLLM(LLMProvider):
         self._client.max_retries = 0
         self.ledger, self.audit_path, self.max_output = ledger, audit_path, max_output
 
-    def complete(self, task_type, messages, *, temperature=None, model=None):
+    def complete(self, task_type, messages, *, temperature=None, model=None, json_output=False):
         import json
         messages = [dict(m) for m in messages]
         if task_type not in {"judge", "atoms", "core"}:
@@ -31,12 +31,16 @@ class EvaluationLLM(LLMProvider):
         resolved = model or self._get_model(task_type)
         if resolved != "deepseek-flash":
             raise ValueError("This price ledger is only valid for deepseek-flash")
+        options = {}
+        if json_output:
+            options['response_format'] = {'type': 'json_object'}
+            messages.append({'role': 'user', 'content': 'Return one JSON object only.'})
         output_limit = max(self.max_output, 16384) if task_type == "event_enrichment" else self.max_output
         reservation = self.ledger.reserve(messages, output_limit, task_type)
         began = time.perf_counter()
         response = self._client.chat.completions.create(
             model=resolved, messages=messages, temperature=temperature if temperature is not None else 0,
-            max_tokens=output_limit, extra_body={"thinking": {"type": "disabled"}}, timeout=60,
+            **options, max_tokens=output_limit, extra_body={"thinking": {"type": "disabled"}}, timeout=60,
         )
         self.ledger.settle(reservation, response.usage)
         choice = response.choices[0]

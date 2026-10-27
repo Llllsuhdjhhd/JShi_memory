@@ -7,6 +7,8 @@
 再回答固定题目。`--memory-lifecycle legacy` 保留旧完整事件路径。
 `--reuse-baseline` 可复用封存库；staged 模式会继续其尚未完成的到龄提炼，来源与新旧校验值单独记录。
 最新实际结果见[取消全部聚合对照](locomo-round6-small-only.md)；聚合版见[来源重投修复复测](locomo-round5-replay-fix.md)，前序机制实现见[第五轮报告](locomo-round5-staged.md)；以下第一轮范围为历史基线说明。
+分阶段升级（100–500 字小事件、L1 代表句、附加第一层原文）的验证设计见[第七轮方案](locomo-round7-upgrade-plan.md)，
+实测结果见[第七轮结果](locomo-round7-upgrade-results.md)。
 
 ## 第一轮范围
 
@@ -92,11 +94,15 @@ LoCoMo 官方题型 F1（词干处理、逗号列表、拒答短语规则），�
 
 ```powershell
 python scripts/prepare_english_eval.py
-python scripts/locomo_jshi_eval.py --out runs/locomo_first --questions 30 --budget 10
+python scripts/locomo_jshi_eval.py --out runs/locomo_first --questions 30 --budget 30
 ```
 
 默认读取相邻 `../Locomo-Plus/data/locomo10.json`，使用第一组完整对话，抽样覆盖五种题型。
 默认增加前三题的关闭回忆对照。固定 seed=42。不会修改 JShi 仓库。
+
+`--budget` 是 `runs/locomo_budget.jsonl` 的累计提交上限，不是本轮新增额度。
+账本已有结算金额时，必须传大于已用累计的值；例如累计 ¥12.74 后应使用 `--budget 30`，
+继续传 `--budget 10` 会在第一次付费调用时被账本拒绝。该上限不是供应商账单金额。
 
 第三轮使用 `--default-memory-triggers`：采用 JShi 默认字数、段数、时间及夜间触发条件，
 每条真实历史发言入账后检查；采用同步投递保证确定顺序，没有模拟后台并发积压。

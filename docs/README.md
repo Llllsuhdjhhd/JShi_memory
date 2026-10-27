@@ -19,6 +19,8 @@
 | [第五轮实现与评测](locomo-round5-staged.md) | 同一 30 题重新评测、完整到龄提炼、8 例阅读与遗留问题 |
 | [来源重投修复复测](locomo-round5-replay-fix.md) | 最新空库重跑、重复清除、成绩退步及细节丢失定位 |
 | [取消聚合对照](locomo-round6-small-only.md) | 分别恢复197/179个原小事件，同题测试与聚合前后对照 |
+| [第七轮升级验证方案](locomo-round7-upgrade-plan.md) | 新空库 staged、同库 small-only 对照、附加原文与 L1 代表句检查 |
+| [第七轮升级验证结果](locomo-round7-upgrade-results.md) | 7A/7B 配对、附加原文正例、500 字上限未生效的证据与费用 |
 | [草稿箱](drafts/README.md) | 方案讨论、实施计划和调试记录 |
 
 ## 文档与代码的优先级
@@ -37,3 +39,8 @@
 - 回忆文档说明实际检索路径及概率行为；参数默认值以代码配置为准。
 - 匠石交互文档说明两侧端口和字段映射，不把查询对象误写成历史说话人。
 - 草稿箱是过程材料；已完成方案要把稳定结论同步到模块文档。
+
+
+## 结构化模型输出（2026-10-26）
+
+LLMProvider.complete_json 和 complete_json_continue 在选用 DeepSeek 时发送 response_format={"type":"json_object"}，并在实际请求末尾追加一条 user：只输出一个JSON对象。业务消息不原地追加该控制消息。complete 的默认输出仍是普通文字；调用者可用 json_output=True 显式声明 JSON 契约。评测子类及 JShi 评测桥接接受同一契约。已有 Schema、本地解析校验及用量记录保留；JSON 模式不保证字段类型与业务语义。相关离线测试：tests/unit/test_llm_json_mode.py。

@@ -33,14 +33,17 @@ def main():
             for p in (first, second)]})
     provenance = read_json(second / "baseline_provenance.json") if (second / "baseline_provenance.json").exists() else {}
     source_run = Path(provenance["source"]).parents[1].resolve() if provenance.get("source") else None
+    small_only = (source_run == first.resolve()
+                  and provenance.get("view") == "small_events_only")
     reused = (source_run == first.resolve() and provenance.get("reingested") is False
-              and not provenance.get("additional_age_refinement")
-              and provenance.get("view") != "small_events_only")
+              and not provenance.get("additional_age_refinement") and not small_only)
     result = {"summaries": summaries, "paired_questions": pairs, "samples": samples,
         "limitations": "Same development questions; stochastic model answers and grades, not independent human adjudication.",
-        "same_sealed_memory_reindexed": reused}
+        "same_sealed_memory_reindexed": reused, "same_small_events_refinement_toggled": small_only}
     write_json(second / "comparison.json", result)
     lineage = ("复用同一封存事件数据库，仅重建索引；未重新提取或压缩事件。" if reused else
+               "从第一轮恢复同一批阶段 0 小事件，第二轮关闭后续提炼；事件切分相同，"
+               "差异只在提炼和交付。" if small_only else
                "事件形成或后续提炼有变化，并非固定封存库的单变量对照；具体来源见各轮 manifest 与 baseline_provenance。")
     lines = ["# 两轮逐题自动结果与实际回忆", "", "同一完整历史、同一 30 题及固定评分条目；" + lineage, "",
         "| 指标 | 第一轮 | 第二轮 |", "|---|---:|---:|"]

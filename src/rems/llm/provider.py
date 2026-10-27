@@ -142,16 +142,23 @@ class LLMProvider:
         *,
         temperature: float | None = None,
         model: str | None = None,
+        json_output: bool = False,
     ) -> str:
         resolved_model = model or self._get_model(task_type)
         temp = temperature if temperature is not None else self.config.llm.temperature
 
+        options = {}
+        if json_output and resolved_model.lower().startswith('deepseek'):
+            options['response_format'] = {'type': 'json_object'}
+            # The API requires an explicit JSON instruction in addition to the flag.
+            messages = [*messages, {'role': 'user', 'content': '只输出一个JSON对象。'}]
         t0 = time.perf_counter()
         response = self._client.chat.completions.create(
             model=resolved_model,
             messages=messages,
             temperature=temp,
             timeout=300.0,
+            **options,
             **({"extra_body": dict(self.config.llm.extra_body)} if self.config.llm.extra_body else {}),
         )
         latency_ms = (time.perf_counter() - t0) * 1000.0
@@ -213,7 +220,7 @@ class LLMProvider:
         temperature: float | None = None,
         model: str | None = None,
     ) -> dict[str, Any]:
-        raw = self.complete(task_type, messages, temperature=temperature or 0.1, model=model)
+        raw = self.complete(task_type, messages, temperature=temperature if temperature is not None else 0.1, model=model, json_output=True)
         return self._extract_json(raw)
 
     def complete_json_continue(
@@ -227,7 +234,7 @@ class LLMProvider:
     ) -> tuple[dict[str, Any], list[dict[str, str]]]:
         """Append *new_user_content*, call LLM, append assistant reply; return (json, messages)."""
         messages.append({"role": "user", "content": new_user_content})
-        raw = self.complete(task_type, messages, temperature=temperature or 0.1, model=model)
+        raw = self.complete(task_type, messages, temperature=temperature if temperature is not None else 0.1, model=model, json_output=True)
         messages.append({"role": "assistant", "content": raw})
         return self._extract_json(raw), messages
 

@@ -85,7 +85,8 @@ class CoreTransport:
                    "as_of": request.now.isoformat() if request.now else None,
                    "delivered_memory": delivered_memory(user), "context": list(request.context)}
         self.captures.append(capture)
-        raw = self.llm.complete("core", messages)
+        raw = self.llm.complete("core", messages, json_output=bool(
+            getattr(request, "json_output", False) or getattr(request, "persona_schema", None)))
         return ModelResponse(text=raw, model=self.name)
 
 

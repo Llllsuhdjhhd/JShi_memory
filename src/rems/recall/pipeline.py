@@ -255,12 +255,12 @@ def english_word_coverage(query: str, text: str) -> float:
     return len(terms & _english_terms(text)) / len(terms) if terms else 0.0
 
 
-def lexical_score(query: str, text: str, *, english_words: bool = False) -> float:
+def lexical_score(query: str, text: str, *, english_words: bool = False, normalizer=_norm) -> float:
     """词面分：完整命中、最长片段和查询双字片段覆盖率。"""
     if english_words and re.search(r"[A-Za-z]", query) and not re.search(r"[\u3400-\u9fff]", query):
         return english_word_coverage(query, text)
-    q = "".join(ch for ch in _norm(query) if ch.isalnum() or ch in "℃°%+-")
-    t = "".join(ch for ch in _norm(text) if ch.isalnum() or ch in "℃°%+-")
+    q = "".join(ch for ch in normalizer(query) if ch.isalnum() or ch in "℃°%+-")
+    t = "".join(ch for ch in normalizer(text) if ch.isalnum() or ch in "℃°%+-")
     if not q or not t:
         return 0.0
     if len(q) >= 2 and q in t:
@@ -279,8 +279,9 @@ def lexical_score(query: str, text: str, *, english_words: bool = False) -> floa
                 break
         if hit:
             break
-    query_bigrams = _bigrams(q)
-    text_bigrams = _bigrams(t)
+    # q and t are already simplified and normalized; do not convert twice.
+    query_bigrams = {q[i:i + 2] for i in range(max(0, len(q) - 1))}
+    text_bigrams = {t[i:i + 2] for i in range(max(0, len(t) - 1))}
     coverage = (
         len(query_bigrams & text_bigrams) / len(query_bigrams)
         if query_bigrams else 0.0
@@ -292,8 +293,8 @@ def lexical_score(query: str, text: str, *, english_words: bool = False) -> floa
     )
 
 
-def _bigrams(text: str) -> set[str]:
-    t = _norm(text)
+def _bigrams(text: str, *, normalizer=_norm) -> set[str]:
+    t = normalizer(text)
     return {t[i : i + 2] for i in range(max(0, len(t) - 1))}
 
 
@@ -510,13 +511,25 @@ class RecallPipeline:
                 semantic = self._semantic_signals(
                     subject_id, q, wanted, time_range, query_vector=query_vector,
                 )
+        # Reuse the loaded events and fetch fallback facts once per recall.
+        # Local state only: concurrent recalls and later writes cannot reuse stale facts.
+        fact_entries = None
+        if self._role_repo is not None and hasattr(self._role_repo, 'white_paintings_for_events'):
+            needed = [ev.event_id for ev in events if any(
+                not role.is_subject and (not wanted or role.role_id in wanted)
+                and role.role_id not in ev.refinement_object_levels for role in ev.role_list)]
+            fact_entries = self._role_repo.white_paintings_for_events(needed)
+        from functools import lru_cache, partial
+        # Text-only memoization dies with this recall. No event/identity cache survives.
+        normalizer = lru_cache(maxsize=4096)(_norm)
+        lexical = partial(lexical_score, normalizer=normalizer)
         candidates: list[_Candidate] = []
         for ev in events:
             candidates.extend(self._event_candidates(
                 ev, q, wanted, semantic, time_range, now,
                 interlocutor_object_id=interlocutor_object_id,
                 use_semantic=use_semantic, use_lexical=use_lexical,
-                recent_event_ids=recent_event_ids,
+                recent_event_ids=recent_event_ids, fact_entries=fact_entries, lexical_fn=lexical,
             ))
         candidates.extend(self._unclosed_candidates(
             subject_id, q, wanted, time_range,
@@ -790,6 +803,8 @@ class RecallPipeline:
         use_semantic: bool,
         use_lexical: bool,
         recent_event_ids: set[str],
+        fact_entries=None,
+        lexical_fn=lexical_score,
     ) -> list[_Candidate]:
         access = self._effective_factor(ev, now)
         temporal = 1.0 if time_range is not None else None
@@ -815,7 +830,7 @@ class RecallPipeline:
         lexical = 0.0
         if use_lexical:
             lexical = max(
-                (lexical_score(query, text, english_words=self._english_word_lexical)
+                (lexical_fn(query, text, english_words=self._english_word_lexical)
                  for text in lexical_parts if text and text.strip()),
                 default=0.0,
             )
@@ -852,7 +867,7 @@ class RecallPipeline:
                 continue
             if wanted and role.role_id not in wanted:
                 continue
-            fact_levels = self._fact_levels(role.role_id, ev.event_id)
+            fact_levels = self._fact_levels(role.role_id, ev.event_id, event=ev, entries=fact_entries)
             if not fact_levels:
                 continue
             fact_text = "\n".join(fact_levels.values())
@@ -861,7 +876,7 @@ class RecallPipeline:
                 event_id=ev.event_id,
                 object_id=role.role_id,
                 semantic=semantic.get(("object_event_fact", ev.event_id, role.role_id), 0.0) if use_semantic else 0.0,
-                lexical=lexical_score(query, fact_text, english_words=self._english_word_lexical) if use_lexical else 0.0,
+                lexical=lexical_fn(query, fact_text, english_words=self._english_word_lexical) if use_lexical else 0.0,
                 object_hit=object_hit,
                 temporal=temporal,
                 accessibility=access,
@@ -1254,13 +1269,15 @@ class RecallPipeline:
         levels = self._fact_levels(role_id, event_id)
         return levels.get("L1") or ""
 
-    def _fact_levels(self, role_id: str, event_id: str) -> dict[str, str]:
-        event = self._event_repo.get(event_id)
+    def _fact_levels(self, role_id: str, event_id: str, *, event=None, entries=None) -> dict[str, str]:
+        if event is None:
+            event = self._event_repo.get(event_id)
         if event and role_id in event.refinement_object_levels:
             return dict(event.refinement_object_levels[role_id])
         if self._role_repo is None:
             return {}
-        entry = self._role_repo.get_white_painting_by_event(role_id, event_id)
+        entry = (entries.get((role_id, event_id)) if entries is not None
+                 else self._role_repo.get_white_painting_by_event(role_id, event_id))
         if entry is None:
             return {}
         levels: dict[str, str] = {}

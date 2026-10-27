@@ -534,6 +534,19 @@ class RoleRepository:
             )
             return tuple(row[0] for row in rows)
 
+    def white_paintings_for_events(self, event_ids):
+        """One request-local snapshot, bounded batches; first row matches legacy lookup."""
+        ids = tuple(dict.fromkeys(event_ids))
+        result = {}
+        with self._db.session() as session:
+            for offset in range(0, len(ids), 500):
+                records = (session.query(WhitePaintingRecord)
+                    .filter(WhitePaintingRecord.event_id.in_(ids[offset:offset + 500]))
+                    .order_by(WhitePaintingRecord.id).all())
+                for record in records:
+                    result.setdefault((record.role_id, record.event_id), self._to_wp_entry(record))
+        return result
+
     def get_white_painting_by_event(self, role_id: str, event_id: str) -> WhitePaintingEntry | None:
         with self._db.session() as s:
             record = (
